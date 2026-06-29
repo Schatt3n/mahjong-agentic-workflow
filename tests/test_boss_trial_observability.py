@@ -2462,6 +2462,202 @@ def test_short_followup_uses_previous_agent_reply_in_llm_context() -> None:
         restore_env(saved_env)
 
 
+def test_llm_slots_materialize_previous_game_context_for_followup_completion() -> None:
+    saved_env = without_llm_env()
+    os.environ.update(
+        {
+            "MAHJONG_LLM_API_KEY": "test-key",
+            "MAHJONG_LLM_PROVIDER": "openai",
+            "MAHJONG_LLM_MODEL": "test-model",
+            "MAHJONG_LLM_BASE_URL": "https://example.invalid/v1",
+        }
+    )
+    module = load_boss_trial_module()
+
+    class FakeCache:
+        def __init__(self) -> None:
+            self.data = {}
+
+        def get_json(self, key, default):
+            return self.data.get(key, default)
+
+        def set_json(self, key, value, ttl_seconds):
+            self.data[key] = value
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            system_prompt = self.payload["messages"][0]["content"]
+            if "语义解析器" in system_prompt:
+                content = {
+                    "is_mahjong_related": True,
+                    "intent": "find_players",
+                    "proposed_action": "create_game",
+                    "confidence": 0.85,
+                    "normalized_text": "人齐开吧，有烟无烟都行",
+                    "reply_text": "好的，我帮你问问。",
+                    "needs_human_review": False,
+                    "reasoning_summary": "用户补充人齐开和烟况，结合上一轮组局上下文可以继续创建组局。",
+                    "slots": {
+                        "game_type": {"value": "hangzhou_mahjong", "confidence": 0.9, "source": "profile"},
+                        "variant": {"value": "caiqiao", "confidence": 0.7, "source": "profile"},
+                        "level": {"value": "0.5", "confidence": 0.95, "source": "explicit"},
+                        "start_time_mode": {"value": "people_ready", "confidence": 0.95, "source": "explicit"},
+                        "duration_mode": {"value": "overnight", "confidence": 0.95, "source": "explicit"},
+                        "smoke": {"value": "any", "confidence": 0.95, "source": "explicit"},
+                        "known_players": {"value": 1, "confidence": 0.7, "source": "profile"},
+                        "missing_count": {"value": 3, "confidence": 0.7, "source": "inferred"},
+                    },
+                    "facts": {"reason": "测试"},
+                }
+            elif "工具规划器" in system_prompt:
+                prompt = json.loads(self.payload["messages"][1]["content"])
+                if prompt["stage"] == "after_open_game_search":
+                    content = {
+                        "tool_calls": [
+                            {"tool_name": "search_candidate_customers", "arguments": {}, "reason": "组局信息已补齐，搜索候选人。"},
+                            {
+                                "tool_name": "send_message",
+                                "arguments": {"execution_mode": "create_pending_outbox"},
+                                "reason": "生成待审批邀约。",
+                            },
+                        ],
+                        "reasoning_summary": "多轮槽位已补齐，进入候选人和 outbox。",
+                    }
+                else:
+                    content = {"tool_calls": [], "reasoning_summary": "本阶段无需额外工具。"}
+            elif "私聊邀约起草助手" in system_prompt:
+                prompt = json.loads(self.payload["messages"][1]["content"])
+                content = {
+                    "drafts": [
+                        {
+                            "customer_id": item["customer_id"],
+                            "message_text": f"{item['display_name']}，人齐开，通宵0.5，打吗？",
+                            "reasoning_summary": "极简邀约。",
+                        }
+                        for item in prompt["candidates"]
+                    ]
+                }
+            else:
+                content = {
+                    "reply_text": "好的，我帮你问问。",
+                    "risk_level": "low",
+                    "reasoning_summary": "已生成候选人和待审批邀约。",
+                    "notes": ["测试"],
+                }
+            return json.dumps(
+                {
+                    "choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+    original_urlopen = module.urllib.request.urlopen
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(payload)
+
+    module.urllib.request.urlopen = fake_urlopen
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = FakeCache()
+            store = module.TrialStore(Path(temp_dir) / "trial.db")
+            service = module.BossTrialService(store, cache=cache)
+            now = datetime(2026, 6, 29, 23, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai"))
+            previous_parsed = {
+                "intent_action": "ask_clarification",
+                "user_intent": "想打/想组局，信息待确认",
+                "game_type": "hangzhou_mahjong",
+                "game_label": "杭麻",
+                "ruleset": "hangzhou_mahjong",
+                "variant": None,
+                "level": "0.5",
+                "start_at": None,
+                "start_time": None,
+                "start_time_mode": "unknown",
+                "duration_hours": None,
+                "duration_mode": "overnight",
+                "duration_text": "通宵",
+                "current_player_count": 1,
+                "missing_count": 3,
+                "rules": ["杭麻", "通宵"],
+                "play_options": [],
+                "ambiguities": [],
+                "summary": "杭麻 0.5档 缺3 通宵",
+            }
+            service._remember_sender(
+                sender_id="zhang",
+                sender_name="张哥",
+                conversation_id="followup_materialize",
+                text="组一个",
+                effective_text="通宵0.5有人吗\n组一个",
+                parsed=previous_parsed,
+                missing_fields=["start_time", "smoke"],
+                decision={"action": "ask_clarification"},
+                game_id=None,
+                trace_id="trace_previous_group_one",
+                now=now,
+            )
+            service._update_sender_memory_after_reply(
+                conversation_id="followup_materialize",
+                sender_id="zhang",
+                trace_id="trace_previous_group_one",
+                suggested_reply={
+                    "text": "可以，我先帮你看。大概几点开？烟这边有要求吗，无烟还是都可以？",
+                    "source": "llm",
+                    "model": "test-model",
+                    "reasoning_summary": "客户确认组局，但缺少开始时间和烟况，需追问。",
+                    "status": "待审批",
+                },
+                parsed=previous_parsed,
+                tool_results={
+                    "search_current_open_games": {"called": False, "result_count": 0},
+                    "search_candidate_customers": {"called": False, "result_count": 0},
+                    "send_message": {"called": False, "result_count": 0, "direct_send_executed": False},
+                },
+                pool_matches=[],
+                now=now,
+            )
+
+            result = service.analyze(
+                {
+                    "sender_name": "张哥",
+                    "sender_id": "zhang",
+                    "conversation_id": "followup_materialize",
+                    "text": "人齐开吧，有烟无烟都行",
+                    "now": "2026-06-29T23:08:29+08:00",
+                }
+            )
+
+            assert result["parsed"]["semantic_action"]["source"] == "llm"
+            assert result["parsed"]["semantic_action"]["effective_action"] == "create_game"
+            assert result["missing_fields"] == []
+            assert result["parsed"]["start_time"] == "人齐开"
+            assert result["parsed"]["start_time_mode"] == "people_ready"
+            assert result["parsed"]["duration_mode"] == "overnight"
+            assert {"人齐开", "通宵", "烟况都可"}.issubset(set(result["parsed"]["rules"]))
+            assert result["parsed"]["current_player_count"] == 1
+            assert result["parsed"]["missing_count"] == 3
+            assert result["parsed"]["intent_action"] == "queue_invites"
+            assert result["tool_results"]["search_candidate_customers"]["called"] is True
+            assert result["tool_results"]["send_message"]["called"] is True
+            assert result["outbox"]
+            assert result["suggested_reply"]["text"] == "好的，我帮你问问。"
+    finally:
+        module.urllib.request.urlopen = original_urlopen
+        restore_env(saved_env)
+
+
 def test_truncated_followup_semantic_action_still_reaches_candidate_tools() -> None:
     saved_env = without_llm_env()
     os.environ.update(
@@ -2756,11 +2952,11 @@ def test_contextual_group_one_without_game_context_asks_clarification_not_waitin
             assert second["parsed"]["semantic_action"]["source"] == "llm"
             assert second["parsed"]["semantic_action"]["proposed_action"] == "create_game"
             assert second["parsed"]["semantic_action"]["effective_action"] == "ask_clarification"
-            assert second["parsed"]["semantic_action"]["validation"]["code"] == "missing_game_context"
+            assert second["parsed"]["semantic_action"]["validation"]["code"] == "critical_slots_missing"
             assert second["tool_results"]["search_candidate_customers"]["called"] is False
             assert second["tool_results"]["send_message"]["called"] is False
             assert second["suggested_reply"]["text"] != "好的，我先帮你留意下。"
-            assert "你一个人吗" in second["suggested_reply"]["text"]
+            assert "大概几点开" in second["suggested_reply"]["text"] or "打多大" in second["suggested_reply"]["text"]
     finally:
         module.urllib.request.urlopen = original_urlopen
         restore_env(saved_env)

@@ -3802,6 +3802,17 @@ class BossTrialService:
         if effective_text != text:
             decision.notes.append("已合并 Redis 短期记忆中的同一客户近期碎片消息")
         game = self.responder.core.store.games.get(decision.game_id) if decision.game_id else None
+        if game is None:
+            game = self._materialize_contextual_game_from_llm_slots(
+                trace_id=trace_id,
+                decision=decision,
+                workflow_followup_context=workflow_followup_context,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                conversation_id=conversation_id,
+                source_message_id=message.id,
+                now=now,
+            )
         if game:
             self._apply_trial_inferences(
                 game,
@@ -4138,6 +4149,201 @@ class BossTrialService:
             "effective_text": effective_text,
             "state": self.state(now=now),
         }
+
+    def _materialize_contextual_game_from_llm_slots(
+        self,
+        *,
+        trace_id: str,
+        decision: Any,
+        workflow_followup_context: dict[str, Any],
+        sender_id: str,
+        sender_name: str,
+        conversation_id: str,
+        source_message_id: str,
+        now: datetime,
+    ) -> GameRequest | None:
+        semantic = getattr(decision, "semantic_proposal", None)
+        if not isinstance(semantic, dict) or semantic.get("source") != "llm":
+            return None
+        proposed_action = self._normalize_user_semantic_action(semantic.get("proposed_action"))
+        confidence = self._safe_float(semantic.get("confidence")) or 0.0
+        if proposed_action != "create_game" or confidence < 0.72:
+            return None
+        if not isinstance(workflow_followup_context, dict) or not workflow_followup_context:
+            return None
+        previous_reply = str(workflow_followup_context.get("previous_system_suggested_reply") or "").strip()
+        if not previous_reply:
+            return None
+        previous_game = workflow_followup_context.get("previous_game")
+        if not isinstance(previous_game, dict):
+            previous_game = {}
+        slots = semantic.get("slots") if isinstance(semantic.get("slots"), dict) else {}
+        if not previous_game and not slots:
+            return None
+
+        rules = self._unique_strings([str(item) for item in previous_game.get("rules") or []])
+        play_options = self._unique_strings([str(item) for item in previous_game.get("play_options") or []])
+        notes = self._unique_strings([str(item) for item in previous_game.get("notes") or []])
+        ambiguities = self._unique_strings([str(item) for item in previous_game.get("ambiguities") or []])
+        notes.append("LLM 语义提案结合上一轮组局上下文，物化为待后端校验的局对象")
+
+        game_type = str(previous_game.get("game_type") or "mahjong")
+        ruleset = previous_game.get("ruleset")
+        variant = previous_game.get("variant")
+        level = previous_game.get("level")
+        base_score = self._safe_float(previous_game.get("base_score"))
+        cap_score = self._safe_float(previous_game.get("cap_score"))
+        start_at = parse_dt(str(previous_game.get("start_at") or "")) if previous_game.get("start_at") else None
+        duration_hours = self._safe_float(previous_game.get("duration_hours"))
+        current_player_count = self._safe_int(previous_game.get("current_player_count"))
+        missing_count = self._safe_int(previous_game.get("missing_count"))
+
+        slot_game_type = self._semantic_slot_value(slots.get("game_type"))
+        if self._semantic_slot_usable(slots.get("game_type"), min_confidence=0.7) and isinstance(slot_game_type, str):
+            if slot_game_type and slot_game_type != "unknown":
+                game_type = slot_game_type
+        if game_type and game_type != "mahjong" and not ruleset:
+            ruleset = game_type
+        game_label = GAME_TYPE_LABELS.get(game_type, "")
+        if game_label and game_label != "麻将":
+            rules.append(game_label)
+
+        slot_variant = self._semantic_slot_value(slots.get("variant"))
+        if self._semantic_slot_usable(slots.get("variant"), min_confidence=0.7) and isinstance(slot_variant, str):
+            if slot_variant and slot_variant != "unknown":
+                variant = slot_variant
+        variant_label = VARIANT_LABELS.get(str(variant or ""), "")
+        if variant_label:
+            play_options.append(variant_label)
+
+        slot_level = self._semantic_slot_value(slots.get("level"))
+        if self._semantic_slot_usable(slots.get("level"), min_confidence=0.7) and slot_level not in (None, "", "unknown"):
+            level = str(slot_level).strip()
+        if level:
+            base_score = self._safe_float(level) if base_score is None else base_score
+
+        start_time_mode = self._semantic_slot_value(slots.get("start_time_mode"))
+        if start_time_mode == "people_ready" and self._semantic_slot_usable(slots.get("start_time_mode"), min_confidence=0.7):
+            start_at = None
+            rules.append("人齐开")
+            play_options = [item for item in play_options if item != "固定时间"]
+            ambiguities = [item for item in ambiguities if "上午还是下午" not in item and "已经过了" not in item]
+        else:
+            slot_start_time = self._semantic_slot_value(slots.get("start_time"))
+            if (
+                isinstance(slot_start_time, str)
+                and re.fullmatch(r"\d{1,2}:\d{2}", slot_start_time)
+                and self._semantic_slot_usable(slots.get("start_time"), min_confidence=0.75)
+            ):
+                hour, minute = [int(part) for part in slot_start_time.split(":", 1)]
+                candidate_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate_start < now - timedelta(minutes=30):
+                    ambiguity = f"{hour}点 已经过了"
+                    if ambiguity not in ambiguities:
+                        ambiguities.append(ambiguity)
+                else:
+                    start_at = candidate_start
+
+        duration_mode = self._semantic_slot_value(slots.get("duration_mode"))
+        if duration_mode == "overnight" and self._semantic_slot_usable(slots.get("duration_mode"), min_confidence=0.7):
+            duration_hours = None
+            rules.append("通宵")
+        else:
+            slot_duration = self._semantic_slot_value(slots.get("duration_hours"))
+            slot_duration_float = self._safe_float(slot_duration)
+            if slot_duration_float and self._semantic_slot_usable(slots.get("duration_hours"), min_confidence=0.75):
+                duration_hours = slot_duration_float
+                rules = [item for item in rules if item != "通宵"]
+
+        smoke = self._semantic_slot_value(slots.get("smoke"))
+        if self._semantic_slot_usable(slots.get("smoke"), min_confidence=0.7) and isinstance(smoke, str):
+            smoke_rule = {
+                "any": "烟况都可",
+                "no_smoke": "无烟",
+                "smoke_ok": "可吸烟",
+            }.get(smoke)
+            if smoke_rule:
+                rules = [item for item in rules if item not in {"无烟", "可吸烟", "烟况都可"}]
+                rules.append(smoke_rule)
+
+        slot_known_players = self._semantic_slot_value(slots.get("known_players"))
+        slot_known_int = self._safe_int(slot_known_players)
+        if slot_known_int and self._semantic_slot_usable(slots.get("known_players"), min_confidence=0.7):
+            current_player_count = max(1, min(4, slot_known_int))
+        slot_missing = self._semantic_slot_value(slots.get("missing_count"))
+        slot_missing_int = self._safe_int(slot_missing)
+        if slot_missing_int is not None and self._semantic_slot_usable(slots.get("missing_count"), min_confidence=0.7):
+            missing_count = max(0, min(3, slot_missing_int))
+        if current_player_count is not None and missing_count is None:
+            missing_count = max(0, 4 - current_player_count)
+        if missing_count is not None and current_player_count is None:
+            current_player_count = max(1, 4 - missing_count)
+
+        game = GameRequest(
+            organizer_id=sender_id,
+            organizer_name=sender_name,
+            channel_id=conversation_id,
+            source_message_id=source_message_id,
+            status=GameStatus.NEED_CLARIFICATION,
+            game_type=game_type or "mahjong",
+            ruleset=str(ruleset) if ruleset else None,
+            variant=str(variant) if variant else None,
+            current_player_count=current_player_count,
+            missing_count=missing_count,
+            level=str(level) if level else None,
+            base_score=base_score,
+            cap_score=cap_score,
+            start_at=start_at,
+            start_time_confidence=0.0 if start_at is None else 0.8,
+            duration_hours=duration_hours,
+            rules=self._unique_strings(rules),
+            play_options=self._unique_strings(play_options),
+            notes=self._unique_strings(notes),
+            ambiguities=self._unique_strings(ambiguities),
+        )
+        if not game.ruleset and game.game_type != "mahjong":
+            game.ruleset = game.game_type
+        if game.status == GameStatus.NEED_CLARIFICATION and not (set(self._missing_fields(game, decision)) & CRITICAL_FIELDS):
+            game.status = GameStatus.OPEN
+        decision.notes.append("后端已根据 LLM 槽位和上一轮上下文生成待校验局对象")
+        write_tool_audit_log(
+            trace_id,
+            "state_materialization",
+            {
+                "source": "llm_slots",
+                "stage": "contextual_game_materialization",
+                "allowed": True,
+                "proposed_action": proposed_action,
+                "confidence": confidence,
+                "previous_missing_fields": workflow_followup_context.get("previous_missing_fields") or [],
+                "materialized_game": self._game_to_dict(game),
+            },
+        )
+        return game
+
+    def _semantic_slot_value(self, slot: Any) -> Any:
+        if isinstance(slot, dict):
+            return slot.get("value")
+        return slot
+
+    def _semantic_slot_confidence(self, slot: Any) -> float:
+        if not isinstance(slot, dict):
+            return 0.0
+        return self._safe_float(slot.get("confidence")) or 0.0
+
+    def _semantic_slot_source(self, slot: Any) -> str:
+        if not isinstance(slot, dict):
+            return ""
+        return str(slot.get("source") or "").strip().lower()
+
+    def _semantic_slot_usable(self, slot: Any, *, min_confidence: float) -> bool:
+        if not isinstance(slot, dict):
+            return False
+        if bool(slot.get("needs_confirmation")):
+            return False
+        if self._semantic_slot_confidence(slot) < min_confidence:
+            return False
+        return self._semantic_slot_source(slot) not in {"", "unknown"}
 
     def feedback(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace_id = str(payload.get("trace_id") or make_trace_id())
