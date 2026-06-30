@@ -58,6 +58,9 @@ from mahjong_agent import (  # noqa: E402
     TrialReplyDraftAdapter,
     TrialReplyDraftCallbacks,
     TrialReplyDraftInput,
+    TrialReplyRulePolicy,
+    TrialReplyRulePolicyCallbacks,
+    TrialReplyRulePolicyInput,
     TrialCreateGameStateInput,
     TrialGameStateCreationAdapter,
     TrialGameStateCreationCallbacks,
@@ -3740,6 +3743,16 @@ class BossTrialService:
             callbacks=TrialReplyDraftCallbacks(
                 suggested_reply=self._suggested_reply,
                 update_sender_memory_after_reply=self._update_sender_memory_after_reply,
+            )
+        )
+        self.trial_reply_rule_policy = TrialReplyRulePolicy(
+            callbacks=TrialReplyRulePolicyCallbacks(
+                pool_match_reply=self._pool_match_reply,
+                follow_up_text=self._follow_up_text,
+                should_search_existing_pool=self._should_search_existing_pool,
+                is_explicit_grouping_request=self._is_explicit_grouping_request,
+                pool_no_match_reply=self._pool_no_match_reply,
+                brief_ack_reply=self._brief_ack_reply,
             )
         )
         self.controlled_runtime = build_controlled_runtime(
@@ -7865,39 +7878,26 @@ class BossTrialService:
         tool_results: dict[str, Any],
         now: datetime,
     ) -> dict[str, Any]:
-        fallback_text = self._rule_suggested_reply(
-            source_text=source_text,
-            effective_text=effective_text,
-            sender_id=sender_id,
-            sender_name=sender_name,
-            game=game,
-            missing_fields=missing_fields,
-            decision_reply=decision_reply,
-            recommendations=recommendations,
-            outbox=outbox,
-            pool_matches=pool_matches,
-            tool_results=tool_results,
+        rule_decision = self.trial_reply_rule_policy.decide(
+            TrialReplyRulePolicyInput(
+                source_text=source_text,
+                effective_text=effective_text,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                game=game,
+                workflow_followup_context=workflow_followup_context,
+                missing_fields=missing_fields,
+                decision_reply=decision_reply,
+                recommendations=recommendations,
+                outbox=outbox,
+                pool_matches=pool_matches,
+                tool_results=tool_results,
+            )
         )
-        fallback = {
-            "text": fallback_text,
-            "source": "rules",
-            "model": None,
-            "needs_approval": True,
-            "status": "待审批",
-            "selected_pool_game_id": pool_matches[0]["game_id"] if pool_matches else None,
-            "notes": ["规则兜底生成，老板确认后再复制发送。"],
-        }
-        if self._should_use_rule_reply_for_pool_no_match(
-            source_text=source_text,
-            effective_text=effective_text,
-            game=game,
-            tool_results=tool_results,
-            workflow_followup_context=workflow_followup_context,
-        ):
-            return {
-                **fallback,
-                "reasoning_summary": "强规则命中当前局池查询且没有匹配局，使用确定性回复，跳过 LLM。",
-            }
+        fallback = rule_decision.fallback
+        fallback_text = str(fallback.get("text") or "")
+        if rule_decision.skip_llm:
+            return fallback
         llm_result = self._llm_suggested_reply(
             source_text=source_text,
             effective_text=effective_text,
@@ -7915,62 +7915,6 @@ class BossTrialService:
             now=now,
         )
         return llm_result or fallback
-
-    def _should_use_rule_reply_for_pool_no_match(
-        self,
-        *,
-        source_text: str,
-        effective_text: str,
-        game: GameRequest | None,
-        tool_results: dict[str, Any],
-        workflow_followup_context: dict[str, Any] | None = None,
-    ) -> bool:
-        if workflow_followup_context:
-            return False
-        pool_result = tool_results.get("search_current_open_games") if isinstance(tool_results, dict) else {}
-        return (
-            isinstance(pool_result, dict)
-            and pool_result.get("called") is True
-            and int(pool_result.get("result_count") or 0) == 0
-            and self._should_search_existing_pool(source_text, effective_text, game)
-            and not self._is_explicit_grouping_request(source_text, effective_text, game)
-        )
-
-    def _rule_suggested_reply(
-        self,
-        *,
-        source_text: str,
-        effective_text: str,
-        sender_id: str,
-        sender_name: str,
-        game: GameRequest | None,
-        missing_fields: list[str],
-        decision_reply: str,
-        recommendations: list[CandidateRecommendation],
-        outbox: list[dict[str, Any]],
-        pool_matches: list[dict[str, Any]],
-        tool_results: dict[str, Any],
-    ) -> str:
-        if pool_matches:
-            return self._pool_match_reply(pool_matches[0])
-        follow_up = self._follow_up_text(missing_fields, decision_reply, sender_id=sender_id, game=game)
-        if follow_up:
-            return follow_up
-        pool_result = tool_results.get("search_current_open_games") if isinstance(tool_results, dict) else {}
-        if (
-            isinstance(pool_result, dict)
-            and pool_result.get("called") is True
-            and int(pool_result.get("result_count") or 0) == 0
-            and self._should_search_existing_pool(source_text, effective_text, game)
-        ):
-            return self._pool_no_match_reply(source_text, effective_text, sender_id)
-        if game and outbox:
-            return self._brief_ack_reply()
-        if game and recommendations:
-            return self._brief_ack_reply()
-        if game:
-            return "好的，我先帮你留意下。"
-        return decision_reply or f"{sender_name}，我可以帮你组局。你把时间、玩法、档位和现在几个人发我一下。"
 
     def _llm_suggested_reply(
         self,
