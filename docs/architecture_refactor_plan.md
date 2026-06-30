@@ -261,10 +261,12 @@ eval/
   regression/
 ```
 
-保留现有 JSONL 文件作为输入来源，但新增脚本逐步归档：
+现有 JSONL 已按职责归档：
 
-- `eval/badcases.jsonl`：用户试用反馈的真实坏例。
-- `eval/boss_trial_golden.jsonl`：老板试用台核心样例。
+- `eval/golden/scenario_golden.jsonl`：底层 workflow 稳定回归集。
+- `eval/golden/boss_trial_golden.jsonl`：老板试用台核心样例。
+- `eval/badcases/badcases.jsonl`：用户试用反馈的真实坏例。
+- `eval/regression/`：badcase 修复后的专项回归集。
 - `eval/few_shot_examples.jsonl`：可进入 prompt 的少量示例。
 
 每次重构必须跑：

@@ -42,7 +42,7 @@ from .models import (
     RoomHoldStatus,
 )
 from .normalization import NormalizationChange, TextNormalizationResult, normalize_mahjong_text
-from .observability import InMemoryTraceRecorder, TraceEvent, TraceRecorder, TraceStep
+from .observability import InMemoryTraceRecorder, JsonlTraceRecorder, TraceEvent, TraceRecorder, TraceStep
 from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
 from .reply_guard import ReplyGuard
@@ -137,6 +137,7 @@ __all__ = [
     "TextNormalizationResult",
     "normalize_mahjong_text",
     "InMemoryTraceRecorder",
+    "JsonlTraceRecorder",
     "TraceEvent",
     "TraceRecorder",
     "TraceStep",

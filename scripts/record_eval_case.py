@@ -17,8 +17,9 @@ from mahjong_agent import ReplyAction  # noqa: E402
 
 TZ = ZoneInfo("Asia/Shanghai")
 DATASETS = {
-    "golden": ROOT / "eval" / "golden_dataset.jsonl",
-    "badcase": ROOT / "eval" / "badcases.jsonl",
+    "golden": ROOT / "eval" / "golden" / "scenario_golden.jsonl",
+    "badcase": ROOT / "eval" / "badcases" / "badcases.jsonl",
+    "regression": ROOT / "eval" / "regression" / "manual_regression.jsonl",
 }
 
 

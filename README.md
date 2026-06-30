@@ -177,9 +177,9 @@ export MAHJONG_LLM_MAX_COST_PER_DAY=5
 真实开发流程里，不靠主观感觉判断模型是否好用，而是按任务和指标验收：
 
 1. 明确模型职责：本项目里 LLM 负责语义理解、动作提案、工具选择建议、归一化和草稿生成，不直接改状态、不直接发消息。
-2. 建立 golden dataset：用 [eval/golden_dataset.jsonl](eval/golden_dataset.jsonl) 覆盖明确组局、弱意图、模糊时间、玩法行话、多模态转写、敏感资金、报名接受等关键场景。
+2. 建立 golden dataset：用 [eval/golden/scenario_golden.jsonl](eval/golden/scenario_golden.jsonl) 覆盖明确组局、弱意图、模糊时间、玩法行话、多模态转写、敏感资金、报名接受等关键场景。
 3. 离线跑评估：比较不同模型的意图准确率、字段抽取准确率、JSON 合法率、转人工率、平均延迟和平均成本。
-4. 试用阶段跑影子模式：模型只给建议，不影响真实发送；人工结果回写到 [eval/badcases.jsonl](eval/badcases.jsonl)。
+4. 试用阶段跑影子模式：模型只给建议，不影响真实发送；人工结果回写到 [eval/badcases/badcases.jsonl](eval/badcases/badcases.jsonl)。
 5. 设上线阈值：例如高风险场景 100% 转人工、JSON 合法率 > 99%、关键字段准确率 > 95%、P95 延迟在可接受范围内、单店日成本不超过预算。
 6. 持续迭代：高频稳定错误进规则/词典，模糊表达进 prompt/golden，低频复杂问题保留人工审核。
 
@@ -453,9 +453,9 @@ export MAHJONG_DEEPSEEK_MAX_TOKENS=12000
 export MAHJONG_DEEPSEEK_MAX_COST=1
 ```
 
-场景评估现在读取 [eval/golden_dataset.jsonl](eval/golden_dataset.jsonl)。它是稳定回归集，失败代表行为回归或预期需要评审。
+场景评估现在读取 [eval/golden/scenario_golden.jsonl](eval/golden/scenario_golden.jsonl)。它是稳定回归集，失败代表行为回归或预期需要评审。
 
-测试、试用或真实运营中发现的新问题先写入 [eval/badcases.jsonl](eval/badcases.jsonl)。修复确认后，再把它整理进 golden dataset。
+测试、试用或真实运营中发现的新问题先写入 [eval/badcases/badcases.jsonl](eval/badcases/badcases.jsonl)。修复确认后，再把它整理进 golden dataset 或 `eval/regression/`。
 
 手动追加样本：
 

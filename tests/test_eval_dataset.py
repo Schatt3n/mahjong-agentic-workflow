@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "run_scenario_eval.py"
 BOSS_TRIAL_SCRIPT = ROOT / "scripts" / "run_boss_trial_app.py"
-BOSS_TRIAL_GOLDEN_PATH = ROOT / "eval" / "boss_trial_golden.jsonl"
+BOSS_TRIAL_GOLDEN_PATH = ROOT / "eval" / "golden" / "boss_trial_golden.jsonl"
 LLM_ENV_KEYS = [
     "MAHJONG_LLM_API_KEY",
     "MAHJONG_LLM_PROVIDER",
@@ -69,6 +69,8 @@ def restore_env(saved) -> None:
 def test_golden_dataset_loads_and_has_unique_ids() -> None:
     module = load_eval_module()
 
+    assert module.GOLDEN_PATH == ROOT / "eval" / "golden" / "scenario_golden.jsonl"
+    assert module.BADCASE_PATH == ROOT / "eval" / "badcases" / "badcases.jsonl"
     scenarios = module.load_scenarios(module.GOLDEN_PATH)
     ids = [scenario.id for scenario in scenarios]
 

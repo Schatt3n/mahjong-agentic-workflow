@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from enum import Enum, StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 
 from .models import DEFAULT_TZ
@@ -102,6 +103,63 @@ class InMemoryTraceRecorder:
         removed = len(self._events.get(trace_id, []))
         self._events.pop(trace_id, None)
         return removed
+
+
+class JsonlTraceRecorder:
+    """Durable trace recorder for local production-style deployments.
+
+    Each event is appended as one JSON object and also carries the human-readable
+    log line format used by the trial console:
+    traceId-time(yyyy-mm-dd hh:mm:ss)-loglevel: content
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(
+        self,
+        trace_id: str,
+        step: TraceStep | str,
+        content: dict[str, Any],
+        *,
+        level: str = "INFO",
+        occurred_at: datetime | None = None,
+    ) -> TraceEvent:
+        event = TraceEvent(
+            trace_id=trace_id,
+            step=step,
+            content=to_trace_payload(content),
+            level=level,
+            occurred_at=occurred_at,
+        )
+        payload = event.to_dict()
+        payload["log_line"] = event.format_log_line()
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        return event
+
+    def get_trace(self, trace_id: str) -> list[TraceEvent]:
+        if not self.path.exists():
+            return []
+        events: list[TraceEvent] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            if raw.get("trace_id") != trace_id:
+                continue
+            events.append(
+                TraceEvent(
+                    trace_id=str(raw["trace_id"]),
+                    step=str(raw["step"]),
+                    content=dict(raw.get("content") or {}),
+                    level=str(raw.get("level") or "INFO"),
+                    occurred_at=datetime.fromisoformat(str(raw["time"])) if raw.get("time") else None,
+                )
+            )
+        return events
 
 
 def to_trace_payload(value: Any) -> Any:

@@ -2,21 +2,22 @@
 
 这个目录用于沉淀麻将馆运营 workflow 的长期质量资产。
 
-## 文件分工
+## 目录分工
 
-- `golden_dataset.jsonl`：稳定、已确认正确的回归评估集。每一条都应该长期通过，失败就代表系统行为发生了回归，或者预期需要重新评审。
-- `boss_trial_golden.jsonl`：试用台端到端评估集，覆盖页面建议回复、老板话术风格、候选推荐展示等不属于底层 `AgentResponder` 的行为。
-- `badcases.jsonl`：测试、试用或真实运营中发现的失败样本、边界样本和争议样本。它是待处理队列，不默认作为发布阻塞条件。
+- `golden/scenario_golden.jsonl`：稳定、已确认正确的底层 workflow 回归评估集。每一条都应该长期通过，失败就代表系统行为发生了回归，或者预期需要重新评审。
+- `golden/boss_trial_golden.jsonl`：试用台端到端评估集，覆盖页面建议回复、老板话术风格、候选推荐展示等不属于底层 `AgentResponder` 的行为。
+- `badcases/badcases.jsonl`：测试、试用或真实运营中发现的失败样本、边界样本和争议样本。它是待处理队列，不默认作为发布阻塞条件。
+- `regression/`：从 badcase 修复后沉淀出来的专项回归集。适合放“曾经线上/试用中明确失败过，修复后必须永远防回归”的样本。
 - `few_shot_examples.jsonl`：老板认可的话术样例。运行试用台时会被动态读取，作为 LLM 起草回复的 few-shot examples，但它不等同于回归评估集。
 - `../skills/mahjong_operations_skills.jsonl`：可复用的运营 skill。它描述“遇到某类场景应该怎么判断和行动”，会被动态注入语义解析、工具规划、回复起草和邀约草稿阶段。
 
 ## 什么时候写入
 
-- 发现系统回复明显不对：先写入 `badcases.jsonl`。
-- 发现真实老板表达方式很常见，但当前评估集没有覆盖：写入 `badcases.jsonl`，修复后提升到 `golden_dataset.jsonl`。
+- 发现系统回复明显不对：先写入 `badcases/badcases.jsonl`。
+- 发现真实老板表达方式很常见，但当前评估集没有覆盖：写入 `badcases/badcases.jsonl`，修复后提升到 `golden/scenario_golden.jsonl` 或 `regression/`。
 - 修复一个 badcase 后：把稳定预期整理成 golden case，并保留原 badcase 的 `source_scenario_id` 或备注。
 - 新增玩法、规则、通道、状态机能力时：同步补 golden case，避免后续改坏。
-- 发现“页面建议回复/老板话术/候选展示”这类试用台问题：先写入 `badcases.jsonl`，修复后补到 `boss_trial_golden.jsonl`，并让 `scripts/run_tests.py` 跑过。
+- 发现“页面建议回复/老板话术/候选展示”这类试用台问题：先写入 `badcases/badcases.jsonl`，修复后补到 `golden/boss_trial_golden.jsonl`，并让 `scripts/run_tests.py` 跑过。
 - 老板确认某句回复“像我会说的话”：写入 `few_shot_examples.jsonl`，用于改善后续回复风格。
 - 发现某条规则不是单个样本，而是一类可复用运营经验：写入 `../skills/mahjong_operations_skills.jsonl`，例如“过期时间必须确认”“弱意图先查当前局池”。
 - 试用台页面可以直接归档三类数据：点 `归档 badcase`、`加入 golden` 或 `采集 few-shot`，系统会保留 traceId，便于回查输入、提示词、模型输出和人工判断。
@@ -62,7 +63,7 @@ PYTHONPATH=src python scripts/run_scenario_eval.py
 使用指定数据集：
 
 ```bash
-PYTHONPATH=src python scripts/run_scenario_eval.py --dataset eval/golden_dataset.jsonl
+PYTHONPATH=src python scripts/run_scenario_eval.py --dataset eval/golden/scenario_golden.jsonl
 ```
 
 把失败样本自动追加到 badcase：

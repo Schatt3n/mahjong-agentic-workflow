@@ -18,8 +18,8 @@ from mahjong_agent import AgentResponder, ChannelType, CustomerProfile, Message,
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 6, 16, 12, 0, tzinfo=TZ)
-GOLDEN_PATH = ROOT / "eval" / "golden_dataset.jsonl"
-BADCASE_PATH = ROOT / "eval" / "badcases.jsonl"
+GOLDEN_PATH = ROOT / "eval" / "golden" / "scenario_golden.jsonl"
+BADCASE_PATH = ROOT / "eval" / "badcases" / "badcases.jsonl"
 
 
 @dataclass(slots=True)
@@ -277,7 +277,7 @@ def main() -> int:
     parser.add_argument(
         "--record-failures",
         action="store_true",
-        help="把失败样本追加写入 eval/badcases.jsonl，默认不写入",
+        help="把失败样本追加写入 eval/badcases/badcases.jsonl，默认不写入",
     )
     args = parser.parse_args()
 
