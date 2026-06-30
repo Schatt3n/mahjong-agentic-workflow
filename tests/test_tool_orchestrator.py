@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 from mahjong_agent.core import AgentCore
 from mahjong_agent.models import CustomerProfile, PlayPreference
-from mahjong_agent.tool_orchestrator import ToolOrchestrator, ToolOrchestratorConfig
+from mahjong_agent.tool_orchestrator import InMemoryToolExecutionLedger, ToolOrchestrator, ToolOrchestratorConfig
 from mahjong_agent.workflow_models import (
     ActionName,
     ActionSource,
@@ -218,3 +218,71 @@ def test_orchestrator_blocks_state_write_when_disabled() -> None:
     assert result.tool_results[0].allowed is False
     assert result.tool_results[0].request.execution_mode == ToolExecutionMode.STATE_WRITE
     assert "State-write tools are disabled" in result.tool_results[0].error
+
+
+def test_orchestrator_deduplicates_pending_outbox_by_idempotency_key() -> None:
+    core = AgentCore()
+    seed_customers(core)
+    ledger = InMemoryToolExecutionLedger()
+    orchestrator = ToolOrchestrator(core, execution_ledger=ledger)
+    required_tools = [ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX]
+
+    first = orchestrator.run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(required_tools),
+        now=NOW,
+    )
+    second = orchestrator.run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(required_tools),
+        now=NOW,
+    )
+
+    first_outbox = first.result_for(ToolName.CREATE_PENDING_OUTBOX)
+    second_candidate_search = second.result_for(ToolName.SEARCH_CANDIDATE_CUSTOMERS)
+    second_outbox = second.result_for(ToolName.CREATE_PENDING_OUTBOX)
+    assert first_outbox is not None
+    assert second_candidate_search is not None
+    assert second_outbox is not None
+    assert second_candidate_search.deduplicated is False
+    assert second_outbox.deduplicated is True
+    assert second_outbox.called is True
+    assert second_outbox.allowed is True
+    assert second_outbox.result["drafts"][0]["id"] == first_outbox.result["drafts"][0]["id"]
+    assert len(ledger.history(tool_name=ToolName.CREATE_PENDING_OUTBOX)) == 2
+    assert ledger.history(tool_name=ToolName.CREATE_PENDING_OUTBOX)[1].deduplicated is True
+
+
+def test_orchestrator_does_not_cache_denied_side_effect_tool_result() -> None:
+    core = AgentCore()
+    seed_customers(core)
+    ledger = InMemoryToolExecutionLedger()
+    denied = ToolOrchestrator(
+        core,
+        config=ToolOrchestratorConfig(allow_create_pending=False),
+        execution_ledger=ledger,
+    ).run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated([ToolName.CREATE_PENDING_OUTBOX]),
+        now=NOW,
+    )
+
+    assert denied.result_for(ToolName.CREATE_PENDING_OUTBOX).allowed is False
+    assert ledger.lookup("action_test:create_pending_outbox") is None
+
+    allowed = ToolOrchestrator(core, execution_ledger=ledger).run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated([ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX]),
+        now=NOW,
+    )
+
+    outbox = allowed.result_for(ToolName.CREATE_PENDING_OUTBOX)
+    assert outbox is not None
+    assert outbox.called is True
+    assert outbox.allowed is True
+    assert outbox.deduplicated is False
+    assert ledger.lookup("action_test:create_pending_outbox") is outbox

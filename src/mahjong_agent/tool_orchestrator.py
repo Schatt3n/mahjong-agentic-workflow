@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from .core import AgentCore
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
@@ -38,6 +38,41 @@ class ToolOrchestrationResult:
         return None
 
 
+class ToolExecutionLedger(Protocol):
+    def lookup(self, idempotency_key: str) -> ToolResult | None:
+        ...
+
+    def record(self, result: ToolResult) -> ToolResult:
+        ...
+
+    def history(self, *, tool_name: ToolName | None = None) -> list[ToolResult]:
+        ...
+
+
+class InMemoryToolExecutionLedger:
+    """Auditable idempotency ledger for backend-approved tool calls."""
+
+    def __init__(self) -> None:
+        self._by_idempotency_key: dict[str, ToolResult] = {}
+        self._history: list[ToolResult] = []
+
+    def lookup(self, idempotency_key: str) -> ToolResult | None:
+        return self._by_idempotency_key.get(str(idempotency_key))
+
+    def record(self, result: ToolResult) -> ToolResult:
+        self._history.append(result)
+        key = result.request.idempotency_key
+        if key and result.called and result.allowed and key not in self._by_idempotency_key:
+            self._by_idempotency_key[key] = result
+        return result
+
+    def history(self, *, tool_name: ToolName | None = None) -> list[ToolResult]:
+        history = list(self._history)
+        if tool_name is not None:
+            history = [item for item in history if item.request.tool_name == tool_name]
+        return history
+
+
 class ToolOrchestrator:
     """Runs backend-approved tools and normalizes results.
 
@@ -52,12 +87,14 @@ class ToolOrchestrator:
         current_games_tool: CurrentGameSearchTool | None = None,
         candidate_tool: CandidateSearchTool | None = None,
         outbox_tool: PendingOutboxTool | None = None,
+        execution_ledger: ToolExecutionLedger | None = None,
     ) -> None:
         self.core = core
         self.config = config or ToolOrchestratorConfig()
         self.current_games_tool = current_games_tool or CurrentGameSearchTool()
         self.candidate_tool = candidate_tool or CandidateSearchTool(core)
         self.outbox_tool = outbox_tool or PendingOutboxTool()
+        self.execution_ledger = execution_ledger or InMemoryToolExecutionLedger()
 
     def run(
         self,
@@ -80,13 +117,21 @@ class ToolOrchestrator:
             permission_error = self._permission_error(request, validated_action)
             if permission_error:
                 results.append(
-                    ToolResult(
-                        request=request,
-                        called=False,
-                        allowed=False,
-                        error=permission_error,
+                    self.execution_ledger.record(
+                        ToolResult(
+                            request=request,
+                            called=False,
+                            allowed=False,
+                            error=permission_error,
+                        )
                     )
                 )
+                continue
+            deduplicated = self._deduplicated_result(request)
+            if deduplicated is not None:
+                deduplicated = self.execution_ledger.record(deduplicated)
+                results.append(deduplicated)
+                self._update_scratch_from_result(deduplicated, scratch)
                 continue
             result = self._execute(
                 request,
@@ -95,6 +140,8 @@ class ToolOrchestrator:
                 scratch=scratch,
                 now=now,
             )
+            result = self.execution_ledger.record(result)
+            self._update_scratch_from_result(result, scratch)
             results.append(result)
         return ToolOrchestrationResult(tool_results=results)
 
@@ -166,6 +213,37 @@ class ToolOrchestrator:
             allowed=False,
             error=f"Tool {request.tool_name.value} is not implemented in controlled orchestrator.",
         )
+
+    def _deduplicated_result(self, request: ToolCallRequest) -> ToolResult | None:
+        if not self._should_deduplicate(request):
+            return None
+        existing = self.execution_ledger.lookup(str(request.idempotency_key))
+        if existing is None:
+            return None
+        return replace(
+            existing,
+            request=request,
+            deduplicated=True,
+        )
+
+    def _should_deduplicate(self, request: ToolCallRequest) -> bool:
+        if not request.idempotency_key:
+            return False
+        return request.execution_mode in {
+            ToolExecutionMode.CREATE_PENDING,
+            ToolExecutionMode.STATE_WRITE,
+            ToolExecutionMode.DIRECT_SEND,
+        }
+
+    def _update_scratch_from_result(self, result: ToolResult, scratch: dict[str, Any]) -> None:
+        if not result.allowed or not result.result:
+            return
+        if result.request.tool_name == ToolName.SEARCH_CURRENT_OPEN_GAMES:
+            scratch["current_game_matches"] = result.result.get("matches") or []
+        elif result.request.tool_name == ToolName.SEARCH_CANDIDATE_CUSTOMERS:
+            scratch["candidates"] = result.result.get("candidates") or []
+        elif result.request.tool_name == ToolName.CREATE_PENDING_OUTBOX:
+            scratch["outbox_drafts"] = result.result.get("drafts") or []
 
     def _permission_error(self, request: ToolCallRequest, validated_action: ValidatedAction) -> str | None:
         if request.risk_level == RiskLevel.HIGH:

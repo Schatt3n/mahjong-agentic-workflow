@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from mahjong_agent.controlled_runtime import ControlledRuntimeConfig, build_controlled_runtime
 from mahjong_agent.models import ChannelType, Message
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore
-from mahjong_agent.workflow_models import ActionName, GameWorkflowStatus
+from mahjong_agent.workflow_models import ActionName, GameWorkflowStatus, ToolName
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -165,3 +165,4 @@ def test_controlled_runtime_exposes_state_store_for_applied_transitions(tmp_path
     game_id = result.run.state_transitions[-1].entity_id
     assert runtime.state_store.current_status("game", game_id) == GameWorkflowStatus.OPEN.value
     assert runtime.state_store.transition_history(entity_type="game", entity_id=game_id)[0].metadata["store_applied"] is True
+    assert runtime.tool_ledger.history(tool_name=ToolName.SEARCH_CANDIDATE_CUSTOMERS)
