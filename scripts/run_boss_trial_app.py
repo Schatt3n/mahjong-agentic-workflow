@@ -57,6 +57,7 @@ from mahjong_agent import (  # noqa: E402
     TrialOrganizerFollowupAdapter,
     TrialShortMemoryTextMerger,
     TrialToolActionProposalFactory,
+    TrialToolActionValidator,
     TrialToolCallNormalizer,
     TrialToolPlanPromptBuilder,
     TrialToolPlanPromptInput,
@@ -3678,6 +3679,14 @@ class BossTrialService:
             protocol_version=CONTROLLED_AGENT_PROTOCOL_VERSION,
             tool_policy=self._tool_policy,
         )
+        self.tool_action_validator = TrialToolActionValidator(
+            critical_fields=set(CRITICAL_FIELDS),
+            tool_spec_for_stage=tool_spec_for_stage,
+            tool_specs_for_stage=self._tool_specs_for_stage,
+            runtime_policy_getter=self.store.runtime_policy,
+            runtime_policy_validation_override=self._runtime_policy_validation_override,
+            trusted_action_proposer=trusted_action_proposer,
+        )
         self.controlled_runtime = build_controlled_runtime(
             core=self.responder.core,
             config=ControlledRuntimeConfig(
@@ -6908,108 +6917,12 @@ class BossTrialService:
         missing_fields: list[str],
         tool_results: dict[str, Any],
     ) -> dict[str, Any]:
-        tool_name = str(proposal.get("tool_name") or "")
-        stage = str(proposal.get("stage") or "")
-        args = proposal.get("arguments") if isinstance(proposal.get("arguments"), dict) else {}
-        spec = tool_spec_for_stage(tool_name, stage)
-        available = {str(item.get("name")) for item in self._tool_specs_for_stage(stage)}
-        critical_missing = sorted(set(missing_fields) & CRITICAL_FIELDS)
-        notes: list[str] = []
-
-        if tool_name not in available or spec is None:
-            return {
-                "allowed": False,
-                "reason": f"{tool_name or 'unknown'} 不在当前阶段可用工具列表内。",
-                "code": "tool_not_available_for_stage",
-                "effective_arguments": {},
-            }
-        if tool_name in {"search_candidate_customers", "send_message"} and game is None:
-            return {
-                "allowed": False,
-                "reason": "当前没有可操作的组局对象，拒绝执行该工具。",
-                "code": "missing_game_context",
-                "effective_arguments": {},
-            }
-        if tool_name in {"search_candidate_customers", "send_message"} and critical_missing:
-            return {
-                "allowed": False,
-                "reason": "组局关键信息不足，拒绝搜索候选人或创建外发草稿。",
-                "code": "critical_slots_missing",
-                "missing_fields": critical_missing,
-                "effective_arguments": {},
-            }
-        runtime_policy = self.store.runtime_policy()
-        if (
-            bool(proposal.get("side_effect"))
-            and runtime_policy.get("llm_required_for_side_effect_tools")
-        ):
-            proposer = str(proposal.get("proposed_by") or proposal.get("source") or "").strip()
-            source = str(proposal.get("source") or "").strip()
-            if not trusted_action_proposer(proposer, source):
-                return {
-                    "allowed": False,
-                    "reason": "当前生产策略要求副作用工具必须由 LLM 或人工明确提案，拒绝后端兜底写入。",
-                    "code": "runtime_policy_llm_required_for_side_effect_tool",
-                    "runtime_policy": runtime_policy,
-                    "effective_arguments": {},
-                }
-
-        schema = spec.get("arguments_schema") if isinstance(spec.get("arguments_schema"), dict) else {}
-        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        allowed_arg_names = set(properties)
-        effective_arguments = {
-            key: value
-            for key, value in dict(args).items()
-            if key in allowed_arg_names or key == "requested_execution_mode"
-        }
-        stripped_arguments = sorted(
-            key for key in dict(args)
-            if key not in allowed_arg_names and key != "requested_execution_mode"
+        return self.tool_action_validator.validate(
+            proposal=proposal,
+            game=game,
+            missing_fields=missing_fields,
+            tool_results=tool_results,
         )
-        if stripped_arguments:
-            notes.append(f"已剔除未注册参数：{', '.join(stripped_arguments)}。")
-        if tool_name == "send_message":
-            allowed_modes = list(spec.get("allowed_execution_modes") or [])
-            allowed_mode = str(allowed_modes[0] if allowed_modes else "create_pending_outbox")
-            requested_mode = str(args.get("requested_execution_mode") or args.get("execution_mode") or "")
-            if requested_mode and requested_mode != allowed_mode:
-                notes.append(f"模型请求 {requested_mode} 已被降级为 {allowed_mode}。")
-            effective_arguments["execution_mode"] = allowed_mode
-            candidate_result = tool_results.get("search_candidate_customers") if isinstance(tool_results, dict) else {}
-            if stage == "after_candidate_search" and int((candidate_result or {}).get("result_count") or 0) <= 0:
-                return {
-                    "allowed": False,
-                    "reason": "没有候选人搜索结果，拒绝创建待审批消息。",
-                    "code": "no_candidate_result",
-                    "effective_arguments": effective_arguments,
-                }
-            if stage == "organizer_followup_draft":
-                notes.append("send_message 是高风险动作，只允许创建待审批 followup，禁止直接发送。")
-            else:
-                notes.append("send_message 是高风险动作，只允许创建待审批 outbox，禁止直接发送。")
-
-        allowed_verdict = {
-            "allowed": True,
-            "reason": "动作通过后端状态、权限和风险校验。",
-            "code": "allowed",
-            "effective_arguments": effective_arguments,
-            "notes": notes,
-        }
-        policy_verdict = self._runtime_policy_validation_override(
-            stage=stage,
-            action_name=tool_name,
-            side_effect=bool(proposal.get("side_effect")),
-            approval_required=bool(proposal.get("approval_required")),
-        )
-        if policy_verdict:
-            original_notes = [str(item) for item in allowed_verdict.get("notes") or []]
-            return {
-                **allowed_verdict,
-                **policy_verdict,
-                "effective_arguments": effective_arguments,
-                "notes": original_notes + [str(item) for item in policy_verdict.get("notes") or []],
-            }
-        return allowed_verdict
 
     def _tool_policy(self, tool_name: str, stage: str) -> dict[str, Any]:
         item = tool_spec_for_stage(tool_name, stage)

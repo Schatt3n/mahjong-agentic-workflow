@@ -133,6 +133,7 @@ from .trial_persistence import TrialControlledPersistenceAdapter
 from .trial_response import TrialControlledResponseAdapter, merge_controlled_trial_response
 from .trial_tool_planning import (
     TrialToolActionProposalFactory,
+    TrialToolActionValidator,
     TrialToolCallNormalizer,
     TrialToolPlanPromptBuilder,
     TrialToolPlanPromptInput,
@@ -299,6 +300,7 @@ __all__ = [
     "TrialControlledResponseAdapter",
     "merge_controlled_trial_response",
     "TrialToolActionProposalFactory",
+    "TrialToolActionValidator",
     "TrialToolCallNormalizer",
     "TrialToolPlanPromptBuilder",
     "TrialToolPlanPromptInput",
