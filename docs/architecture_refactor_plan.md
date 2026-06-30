@@ -105,6 +105,7 @@ src/mahjong_agent/
 - `workflow_models.py` 已新增，作为受控工作流 contract。
 - `context_builder.py` 已新增，负责把旧运行数据转换为 `ConversationContext`，但尚未接管 Web 试用台主链路。
 - `memory.py` 已新增，定义短期记忆接口和内存实现；后续 Redis 实现应替换这个接口，而不是改 ContextBuilder。
+- `semantic_resolver.py` 和 `prompts/semantic_resolution.md` 已新增，负责把 `ConversationContext` 转换为 `SemanticResolution`，但尚未接管 Web 试用台主链路。
 - `scripts/run_evals.py` 已新增，统一运行当前场景评估和 boss trial golden 回归。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
 
@@ -289,7 +290,7 @@ python scripts/run_evals.py
 ### 第 3 步：抽 SemanticResolver
 
 - 将 `semantic_resolution` prompt 从 `run_boss_trial_app.py` 移到 `prompts/semantic_resolution.md`。
-- 输出 `SemanticResolution`。
+- 新增 `semantic_resolver.py`，输入 `ConversationContext`，输出 `SemanticResolution`。
 - 旧逻辑通过 adapter 转换。
 
 ### 第 4 步：抽 ActionValidator

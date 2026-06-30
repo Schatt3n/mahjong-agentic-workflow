@@ -69,6 +69,8 @@ class ActionName(StrEnum):
     CREATE_GAME = "create_game"
     QUEUE_INVITES = "queue_invites"
     MATCH_EXISTING_GAME = "match_existing_game"
+    JOIN_GAME = "join_game"
+    CANCEL_GAME = "cancel_game"
     ACCEPT_SEAT = "accept_seat"
     CLOSE_GAME = "close_game"
     HUMAN_REVIEW = "human_review"

@@ -44,6 +44,7 @@ from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
 from .responder import AgentResponder, ReplyAction, ReplyDecision
 from .runtime import AgentRuntime, RuntimeConfig, RuntimeResult
+from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
 from .signals import IntentEvidence, extract_intent_evidence, message_for_intent
 from .workflow_models import (
     ActionName,
@@ -123,6 +124,9 @@ __all__ = [
     "AgentRuntime",
     "RuntimeConfig",
     "RuntimeResult",
+    "SemanticLLMClient",
+    "SemanticResolver",
+    "SemanticResolverConfig",
     "IntentEvidence",
     "extract_intent_evidence",
     "message_for_intent",
