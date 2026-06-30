@@ -13,6 +13,8 @@ from .observability import to_trace_payload
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
 from .workflow_models import (
     ConversationContext,
+    EntityType,
+    GameWorkflowStatus,
     RiskLevel,
     SemanticResolution,
     ToolCallRequest,
@@ -278,6 +280,14 @@ class ToolOrchestrator:
         if tool_name == ToolName.CREATE_PENDING_OUTBOX:
             arguments["candidate_count"] = len(scratch.get("candidates") or [])
             arguments["conversation_id"] = context.current_message.conversation_id
+        if tool_name in {ToolName.CREATE_GAME, ToolName.CLOSE_GAME}:
+            arguments["game_id"] = self._state_entity_id(
+                context=context,
+                semantic_resolution=semantic_resolution,
+                validated_action=validated_action,
+            )
+            arguments["conversation_id"] = context.current_message.conversation_id
+            arguments["trace_id"] = context.current_message.trace_id
         return ToolCallRequest(
             tool_name=tool_name,
             arguments=arguments,
@@ -323,6 +333,14 @@ class ToolOrchestrator:
             )
             scratch["outbox_drafts"] = payload.get("drafts") or []
             return ToolResult(request=request, called=True, allowed=True, result=payload)
+        if request.tool_name == ToolName.CREATE_GAME:
+            payload = self._create_game_state_write_intent(request, semantic_resolution, scratch)
+            scratch.setdefault("state_write_intents", []).append(payload["state_write_intent"])
+            return ToolResult(request=request, called=True, allowed=True, result=payload)
+        if request.tool_name == ToolName.CLOSE_GAME:
+            payload = self._close_game_state_write_intent(request, semantic_resolution)
+            scratch.setdefault("state_write_intents", []).append(payload["state_write_intent"])
+            return ToolResult(request=request, called=True, allowed=True, result=payload)
         return ToolResult(
             request=request,
             called=False,
@@ -360,6 +378,10 @@ class ToolOrchestrator:
             scratch["candidates"] = result.result.get("candidates") or []
         elif result.request.tool_name == ToolName.CREATE_PENDING_OUTBOX:
             scratch["outbox_drafts"] = result.result.get("drafts") or []
+        elif result.request.tool_name in {ToolName.CREATE_GAME, ToolName.CLOSE_GAME}:
+            intent = result.result.get("state_write_intent")
+            if intent:
+                scratch.setdefault("state_write_intents", []).append(intent)
 
     def _permission_error(self, request: ToolCallRequest, validated_action: ValidatedAction) -> str | None:
         if request.risk_level == RiskLevel.HIGH:
@@ -393,6 +415,63 @@ class ToolOrchestrator:
         if tool_name in {ToolName.CREATE_PENDING_OUTBOX, ToolName.CREATE_GAME, ToolName.CLOSE_GAME, ToolName.PROFILE_UPDATE}:
             return RiskLevel.MEDIUM
         return validated_action.risk_level if validated_action.risk_level == RiskLevel.HIGH else RiskLevel.LOW
+
+    def _state_entity_id(
+        self,
+        *,
+        context: ConversationContext,
+        semantic_resolution: SemanticResolution,
+        validated_action: ValidatedAction,
+    ) -> str:
+        action_game_id = semantic_resolution.proposed_action.arguments.get("game_id")
+        if action_game_id:
+            return str(action_game_id)
+        return validated_action.idempotency_key or f"pending_game:{context.current_message.trace_id}"
+
+    def _create_game_state_write_intent(
+        self,
+        request: ToolCallRequest,
+        semantic_resolution: SemanticResolution,
+        scratch: dict[str, Any],
+    ) -> dict[str, Any]:
+        outbox_created = bool(scratch.get("outbox_drafts"))
+        game_id = str(request.arguments.get("game_id") or request.idempotency_key or "pending_game")
+        intent = {
+            "kind": "create_game",
+            "entity_type": EntityType.GAME.value,
+            "entity_id": game_id,
+            "target_status": GameWorkflowStatus.NEGOTIATING.value
+            if outbox_created
+            else GameWorkflowStatus.OPEN.value,
+            "enter_negotiating_if_outbox_created": outbox_created,
+            "reason": request.reason,
+            "requirement": semantic_resolution.game_requirement.to_prompt_dict(),
+        }
+        return {
+            "state_write_intent": intent,
+            "game_id": game_id,
+            "policy": "只生成状态写入意图，由 StateMachine 校验并由 StateStore 落库。",
+        }
+
+    def _close_game_state_write_intent(
+        self,
+        request: ToolCallRequest,
+        semantic_resolution: SemanticResolution,
+    ) -> dict[str, Any]:
+        game_id = str(request.arguments.get("game_id") or request.idempotency_key or "pending_game")
+        intent = {
+            "kind": "close_game",
+            "entity_type": EntityType.GAME.value,
+            "entity_id": game_id,
+            "target_status": GameWorkflowStatus.CANCELLED.value,
+            "reason": request.reason,
+            "requirement": semantic_resolution.game_requirement.to_prompt_dict(),
+        }
+        return {
+            "state_write_intent": intent,
+            "game_id": game_id,
+            "policy": "只生成关闭局状态写入意图，由 StateMachine 校验并由 StateStore 落库。",
+        }
 
 
 def _coerce_tool_name(tool_name: ToolName | str) -> ToolName:

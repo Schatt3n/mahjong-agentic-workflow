@@ -196,7 +196,11 @@ class ActionValidator:
                 allowed=True,
                 code="confirmed_create_after_no_match",
                 reason="上一轮无匹配局后，用户确认新组且关键信息齐全，进入待审批邀约。",
-                required_tools=[ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX],
+                required_tools=[
+                    ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+                    ToolName.CREATE_PENDING_OUTBOX,
+                    ToolName.CREATE_GAME,
+                ],
                 approval_required=True,
                 risk_level=RiskLevel.MEDIUM,
             )
@@ -246,7 +250,11 @@ class ActionValidator:
             allowed=True,
             code="queue_invites_after_create_validation",
             reason="LLM 提出新组局，后端校验关键槽位和局池后，允许进入待审批邀约。",
-            required_tools=[ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX],
+            required_tools=[
+                ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+                ToolName.CREATE_PENDING_OUTBOX,
+                ToolName.CREATE_GAME,
+            ],
             approval_required=self.config.queue_invites_approval_required,
             risk_level=RiskLevel.MEDIUM,
         )

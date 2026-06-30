@@ -146,6 +146,7 @@ def test_trial_projection_exposes_legacy_shape_without_redeciding_business_flow(
     assert projected["parsed"]["semantic_action"]["required_tools"] == [
         "search_candidate_customers",
         "create_pending_outbox",
+        "create_game",
     ]
 
     assert projected["suggested_reply"]["text"] == "好的，我帮你问问。"
@@ -158,6 +159,7 @@ def test_trial_projection_exposes_legacy_shape_without_redeciding_business_flow(
 
     assert projected["tool_results"]["search_candidate_customers"]["called"] is True
     assert projected["tool_results"]["create_pending_outbox"]["called"] is True
+    assert projected["tool_results"]["create_game"]["called"] is True
     assert projected["state"]["games"][0]["status"] == "negotiating"
     assert projected["agent_actions"][0]["protocol"] == "controlled_workflow.v1"
     assert projected["trace"]

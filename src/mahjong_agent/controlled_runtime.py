@@ -126,7 +126,7 @@ def build_controlled_runtime(
         action_validator=ActionValidator(),
         tool_orchestrator=ToolOrchestrator(
             runtime_core,
-            ToolOrchestratorConfig(),
+            ToolOrchestratorConfig(allow_state_write=True),
             execution_ledger=workflow_tool_ledger,
         ),
         state_machine=StateMachine(),

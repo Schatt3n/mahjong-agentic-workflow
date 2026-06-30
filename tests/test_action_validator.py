@@ -99,7 +99,11 @@ def test_create_game_with_complete_slots_queues_invites_not_final_reply() -> Non
     assert result.effective_action == ActionName.QUEUE_INVITES
     assert result.allowed is True
     assert result.approval_required is True
-    assert result.required_tools == [ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX]
+    assert result.required_tools == [
+        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+        ToolName.CREATE_PENDING_OUTBOX,
+        ToolName.CREATE_GAME,
+    ]
     assert result.missing_slots == []
     assert result.idempotency_key.startswith("action_")
 
@@ -134,7 +138,11 @@ def test_search_existing_no_match_but_followup_confirmed_create_queues_invites()
     assert result.allowed is True
     assert result.effective_action == ActionName.QUEUE_INVITES
     assert result.code == "confirmed_create_after_no_match"
-    assert result.required_tools == [ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX]
+    assert result.required_tools == [
+        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+        ToolName.CREATE_PENDING_OUTBOX,
+        ToolName.CREATE_GAME,
+    ]
 
 
 def test_search_existing_no_match_without_create_confirmation_asks_create_confirmation() -> None:

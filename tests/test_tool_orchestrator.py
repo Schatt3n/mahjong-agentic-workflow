@@ -83,7 +83,12 @@ def make_resolution(requirement: GameRequirement | None = None) -> SemanticResol
     )
 
 
-def make_validated(required_tools: list[ToolName], *, risk_level: RiskLevel = RiskLevel.LOW) -> ValidatedAction:
+def make_validated(
+    required_tools: list[ToolName],
+    *,
+    effective_action: ActionName = ActionName.QUEUE_INVITES,
+    risk_level: RiskLevel = RiskLevel.LOW,
+) -> ValidatedAction:
     return ValidatedAction(
         proposed_action=ProposedAction(
             name=ActionName.CREATE_GAME,
@@ -91,7 +96,7 @@ def make_validated(required_tools: list[ToolName], *, risk_level: RiskLevel = Ri
             confidence=0.9,
             reason="test",
         ),
-        effective_action=ActionName.QUEUE_INVITES,
+        effective_action=effective_action,
         allowed=True,
         code="allowed",
         reason="test allowed",
@@ -223,6 +228,65 @@ def test_orchestrator_blocks_state_write_when_disabled() -> None:
     assert result.tool_results[0].allowed is False
     assert result.tool_results[0].request.execution_mode == ToolExecutionMode.STATE_WRITE
     assert "State-write tools are disabled" in result.tool_results[0].error
+
+
+def test_orchestrator_creates_game_state_write_intent_after_outbox() -> None:
+    core = AgentCore()
+    seed_customers(core)
+    result = ToolOrchestrator(
+        core,
+        config=ToolOrchestratorConfig(allow_state_write=True),
+    ).run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(
+            [ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX, ToolName.CREATE_GAME]
+        ),
+        now=NOW,
+    )
+
+    create_result = result.result_for(ToolName.CREATE_GAME)
+    assert create_result is not None
+    assert create_result.called is True
+    assert create_result.allowed is True
+    assert create_result.request.execution_mode == ToolExecutionMode.STATE_WRITE
+    assert create_result.result["policy"] == "只生成状态写入意图，由 StateMachine 校验并由 StateStore 落库。"
+    intent = create_result.result["state_write_intent"]
+    assert intent["kind"] == "create_game"
+    assert intent["entity_type"] == "game"
+    assert intent["entity_id"] == "action_test"
+    assert intent["target_status"] == "negotiating"
+    assert intent["enter_negotiating_if_outbox_created"] is True
+
+
+def test_orchestrator_creates_close_game_state_write_intent_when_enabled() -> None:
+    result = ToolOrchestrator(
+        AgentCore(),
+        config=ToolOrchestratorConfig(allow_state_write=True),
+    ).run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(
+            [ToolName.CLOSE_GAME],
+            effective_action=ActionName.CLOSE_GAME,
+            risk_level=RiskLevel.MEDIUM,
+        ),
+        now=NOW,
+    )
+
+    close_result = result.result_for(ToolName.CLOSE_GAME)
+    assert close_result is not None
+    assert close_result.called is True
+    assert close_result.allowed is True
+    assert close_result.request.execution_mode == ToolExecutionMode.STATE_WRITE
+    assert close_result.result["state_write_intent"] == {
+        "kind": "close_game",
+        "entity_type": "game",
+        "entity_id": "action_test",
+        "target_status": "cancelled",
+        "reason": "test allowed",
+        "requirement": make_resolution().game_requirement.to_prompt_dict(),
+    }
 
 
 def test_orchestrator_deduplicates_pending_outbox_by_idempotency_key() -> None:

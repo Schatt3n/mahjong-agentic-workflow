@@ -162,8 +162,17 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     assert result.final_text == "好的，我帮你问问。"
 
     tool_names = [item.request.tool_name for item in result.tool_orchestration.tool_results]
-    assert tool_names == [ToolName.SEARCH_CANDIDATE_CUSTOMERS, ToolName.CREATE_PENDING_OUTBOX]
+    assert tool_names == [
+        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+        ToolName.CREATE_PENDING_OUTBOX,
+        ToolName.CREATE_GAME,
+    ]
     assert result.tool_orchestration.result_for(ToolName.CREATE_PENDING_OUTBOX).result["drafts"]
+    create_game_result = result.tool_orchestration.result_for(ToolName.CREATE_GAME)
+    assert create_game_result.called is True
+    assert create_game_result.allowed is True
+    assert create_game_result.result["state_write_intent"]["kind"] == "create_game"
+    assert create_game_result.result["state_write_intent"]["target_status"] == GameWorkflowStatus.NEGOTIATING.value
 
     assert [transition.to_status for transition in result.run.state_transitions] == [
         GameWorkflowStatus.OPEN.value,
