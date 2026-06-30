@@ -87,6 +87,7 @@ from .organizer_followup_draft import OrganizerFollowupDraftService
 from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
 from .reply_guard import ReplyGuard
+from .reply_approval import ReplyApprovalQueue, ReplyApprovalQueueResult
 from .reply_policy import ReplyDraftLLMClient, ReplyPolicy, ReplyPolicyConfig, ReplyPolicyInput
 from .responder import AgentResponder, ReplyAction, ReplyDecision
 from .runtime import AgentRuntime, RuntimeConfig, RuntimeResult
@@ -295,6 +296,8 @@ __all__ = [
     "AgentRuntime",
     "RuntimeConfig",
     "RuntimeResult",
+    "ReplyApprovalQueue",
+    "ReplyApprovalQueueResult",
     "SemanticLLMClient",
     "SemanticResolver",
     "SemanticResolverConfig",

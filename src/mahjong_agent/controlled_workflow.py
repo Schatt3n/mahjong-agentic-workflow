@@ -17,6 +17,7 @@ from .observability import (
     TraceStep,
     validate_controlled_trace_completeness,
 )
+from .reply_approval import ReplyApprovalQueue, ReplyApprovalQueueResult
 from .reply_guard import ReplyGuard
 from .reply_policy import ReplyPolicy
 from .semantic_resolver import SemanticResolver
@@ -58,6 +59,7 @@ class ControlledWorkflowResult:
     run: WorkflowRun
     context_build: WorkflowContextBuildResult
     tool_orchestration: ToolOrchestrationResult
+    reply_approval: ReplyApprovalQueueResult | None = None
     trace_events: list[TraceEvent] = field(default_factory=list)
 
     @property
@@ -85,6 +87,7 @@ class ControlledWorkflowService:
         state_store: WorkflowStateStore | None = None,
         reply_policy: ReplyPolicy | None = None,
         reply_guard: ReplyGuard | None = None,
+        reply_approval_queue: ReplyApprovalQueue | None = None,
         memory_store: ShortTermMemoryStore | None = None,
         input_gate: InputGate | None = None,
         trace_recorder: TraceRecorder | None = None,
@@ -102,6 +105,7 @@ class ControlledWorkflowService:
         self.state_store = state_store or InMemoryWorkflowStateStore()
         self.reply_policy = reply_policy or ReplyPolicy()
         self.reply_guard = reply_guard or ReplyGuard()
+        self.reply_approval_queue = reply_approval_queue
         self.memory_store = memory_store
         self.input_gate = input_gate
         self.trace_recorder = trace_recorder or InMemoryTraceRecorder()
@@ -215,6 +219,15 @@ class ControlledWorkflowService:
         run.guarded_reply = guarded_reply
         self._record_guarded_reply(trace_id, guarded_reply, now=now)
 
+        reply_approval = self._queue_reply_approval(
+            context=context,
+            reply_draft=reply_draft,
+            guarded_reply=guarded_reply,
+            validated_action=validated_action,
+            now=now,
+        )
+        self._record_reply_approval(trace_id, reply_approval, now=now)
+
         if self.config.persist_short_memory:
             self._write_short_memory(
                 context_build,
@@ -242,6 +255,7 @@ class ControlledWorkflowService:
             {
                 "final_text": guarded_reply.final_text,
                 "reply_status": guarded_reply.status,
+                "reply_approval": reply_approval.to_dict(),
                 "approval_required": validated_action.approval_required,
                 "effective_action": validated_action.effective_action,
                 "validation_code": validated_action.code,
@@ -254,6 +268,7 @@ class ControlledWorkflowService:
             run=run,
             context_build=context_build,
             tool_orchestration=tool_orchestration,
+            reply_approval=reply_approval,
             trace_events=self.trace_recorder.get_trace(trace_id),
         )
         return result
@@ -536,6 +551,40 @@ class ControlledWorkflowService:
             TraceStep.REPLY_GUARDED,
             {"guarded_reply": guarded_reply},
             level="WARN" if guarded_reply.changed else "INFO",
+            now=now,
+        )
+
+    def _queue_reply_approval(
+        self,
+        *,
+        context: ConversationContext,
+        reply_draft: ReplyDraft,
+        guarded_reply: GuardedReply,
+        validated_action: ValidatedAction,
+        now: datetime,
+    ) -> ReplyApprovalQueueResult:
+        if self.reply_approval_queue is None:
+            return ReplyApprovalQueueResult(queued=False, reason="reply_approval_queue_not_configured")
+        return self.reply_approval_queue.enqueue(
+            context=context,
+            reply_draft=reply_draft,
+            guarded_reply=guarded_reply,
+            validated_action=validated_action,
+            now=now,
+        )
+
+    def _record_reply_approval(
+        self,
+        trace_id: str,
+        reply_approval: ReplyApprovalQueueResult,
+        *,
+        now: datetime,
+    ) -> None:
+        self._record(
+            trace_id,
+            TraceStep.REPLY_APPROVAL,
+            {"reply_approval": reply_approval.to_dict()},
+            level="INFO" if reply_approval.queued else "WARN",
             now=now,
         )
 

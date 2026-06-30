@@ -24,6 +24,7 @@ class TraceStep(StrEnum):
     STATE_TRANSITION = "state_transition"
     REPLY_DRAFTED = "reply_drafted"
     REPLY_GUARDED = "reply_guarded"
+    REPLY_APPROVAL = "reply_approval"
     FINAL_OUTPUT = "final_output"
     MEMORY_WRITTEN = "memory_written"
 

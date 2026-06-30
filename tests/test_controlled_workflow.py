@@ -276,6 +276,7 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     assert TraceStep.STATE_TRANSITION in steps
     assert TraceStep.REPLY_DRAFTED in steps
     assert TraceStep.REPLY_GUARDED in steps
+    assert TraceStep.REPLY_APPROVAL in steps
     assert TraceStep.MEMORY_WRITTEN in steps
     assert TraceStep.FINAL_OUTPUT in steps
     completeness = validate_controlled_trace_completeness(result.trace_events)
@@ -283,6 +284,8 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     final_event = next(event for event in result.trace_events if event.step == TraceStep.FINAL_OUTPUT)
     assert final_event.content["trace_completeness"]["complete"] is True
     assert final_event.content["trace_completeness"]["missing_steps"] == []
+    assert final_event.content["reply_approval"]["queued"] is False
+    assert final_event.content["reply_approval"]["reason"] == "reply_approval_queue_not_configured"
 
     prompt_event = next(event for event in result.trace_events if event.step == TraceStep.LLM_PROMPT)
     assert "semantic_resolution_contract_v1" in prompt_event.content["messages"][1]["content"]

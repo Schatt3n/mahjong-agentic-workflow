@@ -11,7 +11,7 @@ from mahjong_agent.memory import SQLiteShortTermMemoryStore
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore, SQLiteWorkflowStateStore
 from mahjong_agent.tool_orchestrator import SQLiteToolExecutionLedger
-from mahjong_agent.tools import OUTBOX_APPROVED, SQLitePendingOutboxStore
+from mahjong_agent.tools import OUTBOX_APPROVED, OUTBOX_PENDING_APPROVAL, SQLitePendingOutboxStore
 from mahjong_agent.workflow_models import ActionName, GameWorkflowStatus, ToolName
 
 
@@ -669,21 +669,30 @@ def test_controlled_runtime_can_use_sqlite_pending_outbox_store(tmp_path) -> Non
     assert outbox_result.called is True
     assert outbox_result.result["stored_count"] == 1
     pending = SQLitePendingOutboxStore(outbox_path).list_pending(conversation_id="boss_trial")
-    assert len(pending) == 1
-    assert pending[0]["target_customer_id"] == "ran"
-    assert pending[0]["message_text"].endswith("打吗？")
+    assert len(pending) == 2
+    invite = next(item for item in pending if item["source"] == "tool_orchestrator")
+    reply = next(item for item in pending if item["source"] == "controlled_reply")
+    assert invite["target_customer_id"] == "ran"
+    assert invite["message_text"].endswith("打吗？")
+    assert reply["target_customer_id"] == "zhang"
+    assert reply["message_text"] == result.final_text
+    assert reply["status"] == OUTBOX_PENDING_APPROVAL
+    assert reply["metadata"]["kind"] == "boss_reply"
+    assert result.reply_approval is not None
+    assert result.reply_approval.queued is True
+    assert result.reply_approval.outbox_items[0]["id"] == reply["id"]
     assert runtime.outbox_store is not None
     assert runtime.approval_service is not None
 
     approved = runtime.approval_service.decide(
-        outbox_id=pending[0]["id"],
+        outbox_id=invite["id"],
         decision="approved",
         reviewer_id="boss",
         reason="运行时审批测试",
         trace_id="trace_runtime_approval",
         idempotency_key="runtime_approval_once",
     )
-    persisted = SQLitePendingOutboxStore(outbox_path).get(pending[0]["id"])
+    persisted = SQLitePendingOutboxStore(outbox_path).get(invite["id"])
 
     assert approved["ok"] is True
     assert persisted["status"] == OUTBOX_APPROVED

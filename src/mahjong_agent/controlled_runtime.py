@@ -15,6 +15,7 @@ from .input_gate import InMemoryInputGate, InputGate, SQLiteInputGate
 from .llm_client import OpenAICompatibleSemanticLLMClient
 from .memory import InMemoryShortTermMemoryStore, SQLiteShortTermMemoryStore, ShortTermMemoryStore
 from .observability import JsonlTraceRecorder, TraceRecorder
+from .reply_approval import ReplyApprovalQueue
 from .reply_guard import ReplyGuard
 from .reply_policy import ReplyDraftLLMClient, ReplyPolicy
 from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
@@ -174,6 +175,7 @@ def build_controlled_runtime(
         state_store=workflow_state_store,
         reply_policy=ReplyPolicy(reply_client),
         reply_guard=ReplyGuard(),
+        reply_approval_queue=ReplyApprovalQueue(outbox_store) if outbox_store is not None else None,
         memory_store=memory,
         input_gate=input_gate,
         trace_recorder=recorder,
