@@ -341,6 +341,7 @@ def test_controlled_workflow_records_candidate_acceptance_and_updates_open_game_
     assert accept_tool.called is True
     assert accept_tool.allowed is True
     assert accept_tool.result["state_write_intent"]["kind"] == "record_seat_acceptance"
+    assert accept_result.final_text == "好的，加你272了。"
 
     assert len(accept_result.run.state_transitions) == 1
     applied_transition = accept_result.run.state_transitions[0]

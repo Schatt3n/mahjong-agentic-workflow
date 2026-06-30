@@ -126,7 +126,12 @@ class ReplyPolicy:
         if action == ActionName.QUEUE_INVITES:
             return self._draft(self._queue_invites_text(tool_result), data, validated_action.reason, llm_contract=llm_contract)
         if action == ActionName.ACCEPT_SEAT:
-            return self._draft("好的，先帮你确认这桌。", data, validated_action.reason, llm_contract=llm_contract)
+            return self._draft(
+                self._accept_seat_text(data),
+                data,
+                validated_action.reason,
+                llm_contract=llm_contract,
+            )
         if action == ActionName.CLOSE_GAME:
             return self._draft("收到，我先标记这桌需要处理。", data, validated_action.reason, llm_contract=llm_contract)
         return self._draft("我先确认一下。", data, f"未覆盖的有效动作：{action.value}", llm_contract=llm_contract)
@@ -248,6 +253,7 @@ class ReplyPolicy:
                     "to_status": item.to_status,
                     "allowed": item.allowed,
                     "reason": item.reason,
+                    "metadata": dict(item.metadata),
                 }
                 for item in data.state_transitions
             ],
@@ -282,6 +288,7 @@ class ReplyPolicy:
                     "from_status": item.from_status,
                     "to_status": item.to_status,
                     "allowed": item.allowed,
+                    "metadata": dict(item.metadata),
                 }
                 for item in data.state_transitions
             ],
@@ -346,6 +353,33 @@ class ReplyPolicy:
             return "我先看下合适的人选。"
         return "我先确认一下。"
 
+    def _accept_seat_text(self, data: ReplyPolicyInput) -> str:
+        for transition in reversed(data.state_transitions):
+            seat_delta = transition.metadata.get("seat_delta")
+            if not isinstance(seat_delta, dict):
+                continue
+            current_count = _coerce_int(seat_delta.get("current_player_count"))
+            missing_count = _coerce_int(seat_delta.get("missing_count"))
+            if current_count is None or missing_count is None:
+                continue
+            label = _party_progress_label(current_count, missing_count)
+            if label == "人齐":
+                return "好的，加你了，人齐了。"
+            return f"好的，加你{label}了。"
+
+        accept_result = data.tool_result.result_for(ToolName.RECORD_SEAT_ACCEPTANCE)
+        intent = accept_result.result.get("state_write_intent") if accept_result and accept_result.result else {}
+        seat_delta = intent.get("seat_delta") if isinstance(intent, dict) else {}
+        if isinstance(seat_delta, dict):
+            current_count = _coerce_int(seat_delta.get("current_player_count"))
+            missing_count = _coerce_int(seat_delta.get("missing_count"))
+            if current_count is not None and missing_count is not None:
+                label = _party_progress_label(current_count, missing_count)
+                if label == "人齐":
+                    return "好的，加你了，人齐了。"
+                return f"好的，加你{label}了。"
+        return "好的，加你了。"
+
 
 def _parse_reply_contract(
     raw_output: str | dict[str, Any],
@@ -389,3 +423,21 @@ def _optional_str(value: Any) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _party_progress_label(current_count: int, missing_count: int) -> str:
+    if missing_count <= 0:
+        return "人齐"
+    mapping = {
+        (1, 3): "173",
+        (2, 2): "272",
+        (3, 1): "371",
+    }
+    return mapping.get((current_count, missing_count), f"{current_count}缺{missing_count}")

@@ -13,6 +13,7 @@ from mahjong_agent.workflow_models import (
     ReplyDraft,
     RiskLevel,
     SemanticResolution,
+    StateTransition,
     ToolCallRequest,
     ToolExecutionMode,
     ToolName,
@@ -216,6 +217,59 @@ def test_reply_policy_ask_create_confirmation_is_not_invite_promise() -> None:
     assert draft.text == "现在没有合适的，要组一个吗？"
 
 
+def test_reply_policy_accept_seat_uses_state_transition_seat_delta() -> None:
+    transition = StateTransition(
+        entity_type="game",
+        entity_id="game_accept_001",
+        from_status="negotiating",
+        to_status="negotiating",
+        reason="候选人确认加入",
+        allowed=True,
+        metadata={
+            "seat_delta": {
+                "previous_current_player_count": 1,
+                "previous_missing_count": 3,
+                "current_player_count": 2,
+                "missing_count": 2,
+                "seats_total": 4,
+            }
+        },
+    )
+
+    draft = ReplyPolicy().draft(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(ActionName.ACCEPT_SEAT, risk_level=RiskLevel.MEDIUM),
+        tool_result=ToolOrchestrationResult(),
+        state_transitions=[transition],
+    )
+
+    assert draft.text == "好的，加你272了。"
+    assert draft.metadata["state_transitions"][0]["metadata"]["seat_delta"]["missing_count"] == 2
+
+
+def test_reply_policy_accept_seat_says_full_when_missing_count_zero() -> None:
+    transition = StateTransition(
+        entity_type="game",
+        entity_id="game_accept_002",
+        from_status="negotiating",
+        to_status="confirmed",
+        reason="最后一位候选人确认加入",
+        allowed=True,
+        metadata={"seat_delta": {"current_player_count": 4, "missing_count": 0, "seats_total": 4}},
+    )
+
+    draft = ReplyPolicy().draft(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(ActionName.ACCEPT_SEAT, risk_level=RiskLevel.MEDIUM),
+        tool_result=ToolOrchestrationResult(),
+        state_transitions=[transition],
+    )
+
+    assert draft.text == "好的，加你了，人齐了。"
+
+
 def test_reply_policy_can_use_llm_contract_after_tool_results() -> None:
     client = FixedReplyLLMClient(
         [
@@ -253,6 +307,44 @@ def test_reply_policy_can_use_llm_contract_after_tool_results() -> None:
     assert payload["input"]["validated_action"]["effective_action"] == "queue_invites"
     assert payload["input"]["tool_results"][0]["tool_name"] == "create_pending_outbox"
     assert payload["input"]["tool_results"][0]["result"]["drafts"][0]["message_text"] == "冉姐，16:00，0.5无烟，打吗？"
+
+
+def test_reply_policy_llm_prompt_includes_state_transition_metadata() -> None:
+    client = FixedReplyLLMClient(
+        [
+            {
+                "text": "好的，加你272了。",
+                "reasoning_summary": "候选人确认后还缺两人。",
+                "risk_level": "medium",
+            }
+        ]
+    )
+    transition = StateTransition(
+        entity_type="game",
+        entity_id="game_accept_003",
+        from_status="negotiating",
+        to_status="negotiating",
+        reason="候选人确认加入",
+        allowed=True,
+        metadata={
+            "participant": {"customer_id": "ran", "display_name": "冉姐"},
+            "seat_delta": {"current_player_count": 2, "missing_count": 2, "seats_total": 4},
+        },
+    )
+
+    draft = ReplyPolicy(client).draft(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(ActionName.ACCEPT_SEAT, risk_level=RiskLevel.MEDIUM),
+        tool_result=ToolOrchestrationResult(),
+        state_transitions=[transition],
+    )
+
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    state_payload = payload["input"]["state_transitions"][0]
+    assert draft.text == "好的，加你272了。"
+    assert state_payload["metadata"]["seat_delta"]["current_player_count"] == 2
+    assert state_payload["metadata"]["participant"]["customer_id"] == "ran"
 
 
 def test_reply_policy_falls_back_when_llm_contract_is_invalid() -> None:
