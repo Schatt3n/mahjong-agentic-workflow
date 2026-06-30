@@ -11,6 +11,7 @@ from mahjong_agent.memory import InMemoryShortTermMemoryStore
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
 from mahjong_agent.semantic_resolver import SemanticResolver
 from mahjong_agent.trial_projection import project_controlled_result_for_trial
+from mahjong_agent.trial_response import TrialControlledResponseAdapter, merge_controlled_trial_response
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -161,3 +162,60 @@ def test_trial_projection_exposes_legacy_shape_without_redeciding_business_flow(
     assert projected["agent_actions"][0]["protocol"] == "controlled_workflow.v1"
     assert projected["trace"]
     assert any(event["step"] == "llm_prompt" for event in projected["trace"])
+
+
+def test_trial_response_adapter_delegates_persistence_and_merges_trial_shape() -> None:
+    workflow_result = make_result()
+
+    class FakePersistenceAdapter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def persist(self, **kwargs) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {
+                "persisted": True,
+                "game": {"id": "game_persisted", "status": "邀约中"},
+                "outbox": [{"id": "out_persisted", "approval_required": True}],
+                "agent_actions": [{"stage": "create_game", "validated_actions": []}],
+            }
+
+    persistence = FakePersistenceAdapter()
+    response = TrialControlledResponseAdapter(persistence).build(
+        workflow_result=workflow_result,
+        source_text="0.5财敲人齐开，173，4h，烟都可",
+        sender_id="zhang",
+        sender_name="张哥",
+        trace_id="trace_response",
+        now=NOW,
+    )
+
+    assert len(persistence.calls) == 1
+    assert persistence.calls[0]["workflow_result"] is workflow_result
+    assert persistence.calls[0]["projected"]["workflow"]["engine"] == "controlled_workflow.v1"
+    assert response["controlled_workflow_enabled"] is True
+    assert response["legacy_path"] is False
+    assert response["api_trace_id"] == "trace_response"
+    assert response["persistence"]["persisted"] is True
+    assert response["state"]["games"] == [{"id": "game_persisted", "status": "邀约中"}]
+    assert response["outbox"] == [{"id": "out_persisted", "approval_required": True}]
+    assert response["agent_actions"][-1]["stage"] == "create_game"
+
+
+def test_merge_controlled_trial_response_keeps_projected_data_when_persistence_skips() -> None:
+    projected = {
+        "state": {"games": [{"id": "projected_game"}]},
+        "outbox": [{"id": "projected_outbox"}],
+        "agent_actions": [{"stage": "action_validation"}],
+    }
+    response = merge_controlled_trial_response(
+        projected,
+        {"persisted": False, "reason": "no_state_write_for_action"},
+        trace_id="trace_skip",
+    )
+
+    assert response["state"]["games"] == [{"id": "projected_game"}]
+    assert response["outbox"] == [{"id": "projected_outbox"}]
+    assert response["agent_actions"] == [{"stage": "action_validation"}]
+    assert response["persistence"]["reason"] == "no_state_write_for_action"
+    assert response["trace_id"] == "trace_skip"

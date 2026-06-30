@@ -63,6 +63,7 @@ from .tool_orchestrator import ToolOrchestrationResult, ToolOrchestrator, ToolOr
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
 from .trial_projection import project_controlled_result_for_trial
 from .trial_persistence import TrialControlledPersistenceAdapter
+from .trial_response import TrialControlledResponseAdapter, merge_controlled_trial_response
 from .workflow_models import (
     ActionName,
     ActionSource,
@@ -175,6 +176,8 @@ __all__ = [
     "PendingOutboxTool",
     "project_controlled_result_for_trial",
     "TrialControlledPersistenceAdapter",
+    "TrialControlledResponseAdapter",
+    "merge_controlled_trial_response",
     "IntentEvidence",
     "extract_intent_evidence",
     "message_for_intent",

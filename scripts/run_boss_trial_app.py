@@ -40,8 +40,8 @@ from mahjong_agent import (  # noqa: E402
     RedisCache,
     RedisCacheError,
     TrialControlledPersistenceAdapter,
+    TrialControlledResponseAdapter,
     build_controlled_runtime,
-    project_controlled_result_for_trial,
 )
 from mahjong_agent.budget import usage_from_response  # noqa: E402
 from mahjong_agent.normalization import normalize_mahjong_text  # noqa: E402
@@ -3801,35 +3801,23 @@ class BossTrialService:
             now=now,
             trace_id=trace_id,
         )
-        projected = project_controlled_result_for_trial(workflow_result)
-        persistence = TrialControlledPersistenceAdapter(
-            store=self.store,
-            action_record_factory=self._workflow_state_action_record,
-            action_executor=self._execute_controlled_action,
-            action_plan_projector=self._single_action_plan_view,
-            game_lookup=self._game_by_id,
-            approval_status_labeler=approval_status_label,
-        ).persist(
+        return TrialControlledResponseAdapter(
+            persistence_adapter=TrialControlledPersistenceAdapter(
+                store=self.store,
+                action_record_factory=self._workflow_state_action_record,
+                action_executor=self._execute_controlled_action,
+                action_plan_projector=self._single_action_plan_view,
+                game_lookup=self._game_by_id,
+                approval_status_labeler=approval_status_label,
+            )
+        ).build(
             workflow_result=workflow_result,
-            projected=projected,
             source_text=text,
             sender_id=sender_id,
             sender_name=sender_name,
             trace_id=trace_id,
             now=now,
         )
-        projected["persistence"] = persistence
-        if persistence.get("game"):
-            projected["state"]["games"] = [persistence["game"]]
-        if persistence.get("outbox"):
-            projected["outbox"] = list(persistence["outbox"])
-        if persistence.get("agent_actions"):
-            projected["agent_actions"] = [*projected.get("agent_actions", []), *persistence["agent_actions"]]
-        projected["controlled_workflow_enabled"] = True
-        projected["api_trace_id"] = trace_id
-        projected["trace_id"] = trace_id
-        projected["legacy_path"] = False
-        return projected
 
     def save_customer(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace_id = str(payload.get("trace_id") or make_trace_id())
