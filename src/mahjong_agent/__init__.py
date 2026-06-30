@@ -16,8 +16,10 @@ from .budget import LLMBudgetDecision, LLMBudgetLimits, LLMBudgetManager, LLMUsa
 from .candidate_semantics import (
     CandidateSemanticProposalAdapter,
     CandidateSemanticProposalResult,
+    CandidateSemanticResolverService,
     candidate_action_for_feedback_type,
     feedback_type_for_candidate_action,
+    normalize_candidate_action_proposal,
     normalize_candidate_proposed_action,
     normalize_candidate_semantic_type,
 )
@@ -163,6 +165,8 @@ __all__ = [
     "LLMUsage",
     "CandidateSemanticProposalAdapter",
     "CandidateSemanticProposalResult",
+    "CandidateSemanticResolverService",
+    "normalize_candidate_action_proposal",
     "CandidateReplyDraftService",
     "CandidateActionProposalValidator",
     "candidate_action_for_feedback_type",
