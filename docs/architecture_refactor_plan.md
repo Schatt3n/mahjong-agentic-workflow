@@ -108,6 +108,7 @@ src/mahjong_agent/
 - `semantic_resolver.py` 和 `prompts/semantic_resolution.md` 已新增，负责把 `ConversationContext` 转换为 `SemanticResolution`，但尚未接管 Web 试用台主链路。
 - `action_validator.py` 和 `state_machine.py` 已新增，负责把 LLM 的动作提案校验为 `ValidatedAction`，但尚未接管 Web 试用台主链路。
 - `tool_orchestrator.py` 和 `tools/` 已新增，负责按 `ValidatedAction.required_tools` 执行受控工具；副作用工具当前只创建待审批结果，不直接外发。
+- `reply_policy.py`、`reply_guard.py` 和 `prompts/reply_draft.md` 已新增，负责基于最终动作和工具结果生成回复草稿并做安全一致性检查，但尚未接管 Web 试用台主链路。
 - `scripts/run_evals.py` 已新增，统一运行当前场景评估和 boss trial golden 回归。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
 
@@ -311,7 +312,7 @@ python scripts/run_evals.py
 
 ### 第 6 步：抽 ReplyPolicy 和 ReplyGuard
 
-- prompt 移到 `prompts/reply_draft.md`。
+- 新增 `reply_policy.py`、`reply_guard.py`，prompt 移到 `prompts/reply_draft.md`。
 - 回复策略只吃最终动作结果。
 - guard 只拦安全矛盾，不做主流程决策。
 

@@ -43,6 +43,8 @@ from .models import (
 from .normalization import NormalizationChange, TextNormalizationResult, normalize_mahjong_text
 from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
+from .reply_guard import ReplyGuard
+from .reply_policy import ReplyPolicy, ReplyPolicyInput
 from .responder import AgentResponder, ReplyAction, ReplyDecision
 from .runtime import AgentRuntime, RuntimeConfig, RuntimeResult
 from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
@@ -115,6 +117,9 @@ __all__ = [
     "RedisCache",
     "RedisCacheConfig",
     "RedisCacheError",
+    "ReplyGuard",
+    "ReplyPolicy",
+    "ReplyPolicyInput",
     "MatchingEngine",
     "MergeSuggestion",
     "Message",
