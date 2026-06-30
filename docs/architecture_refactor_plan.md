@@ -153,6 +153,15 @@ src/mahjong_agent/
 - `source=region_default`：地区默认，例如杭州默认杭麻。
 - `source=inferred`：模型或规则推断，必须看置信度和是否需要确认。
 
+`ConversationContext.followup_context` 使用 `followup_context.v1`，用于解决多轮短消息理解问题。它只提供上下文信号，不直接推进业务状态：
+
+- `previous_turn`：上一轮用户消息、老板建议回复和时间。
+- `previous_game_requirement`：上一轮已形成的结构化槽位，LLM 可按 `source=context` 继承。
+- `unresolved_questions`：上一轮还在等用户回答的问题，例如 `create_confirmation/start_time/party_size/stake/smoke/duration`。
+- `expected_answer_type`：本轮预期是确认、补槽位，还是两者都有可能。
+- `current_message_response_type`：当前消息像 `short_ack/slot_fill/correction/negative/unknown` 哪一类。
+- `should_treat_current_message_as_followup`：提示 LLM 优先按“回答上一轮”理解，但最终动作仍由 LLM contract 和后端校验共同决定。
+
 ## 动作决策表
 
 `ActionValidator` 需要显式决策，而不是散落判断：

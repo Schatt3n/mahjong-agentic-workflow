@@ -7,11 +7,11 @@ from zoneinfo import ZoneInfo
 from mahjong_agent.context_builder import WorkflowContextBuilder
 from mahjong_agent.controlled_workflow import ControlledWorkflowService
 from mahjong_agent.core import AgentCore
-from mahjong_agent.memory import InMemoryShortTermMemoryStore
+from mahjong_agent.memory import InMemoryShortTermMemoryStore, ShortTermMemoryRecord
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
 from mahjong_agent.observability import InMemoryTraceRecorder, TraceStep
 from mahjong_agent.semantic_resolver import SemanticResolver
-from mahjong_agent.workflow_models import ActionName, GameWorkflowStatus, ToolName
+from mahjong_agent.workflow_models import ActionName, GameRequirement, GameWorkflowStatus, SlotSource, SlotValue, ToolName, UserMessage
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -190,6 +190,69 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     assert len(memory_records) == 1
     assert memory_records[0].system_reply == "好的，我帮你问问。"
     assert memory_records[0].game_requirement.slot("start_time_mode").value == "people_ready"
+
+
+def test_controlled_workflow_prompt_and_trace_include_structured_followup_context() -> None:
+    core = AgentCore()
+    seed_customers(core)
+    memory = InMemoryShortTermMemoryStore()
+    previous_requirement = GameRequirement()
+    previous_requirement.set_slot(
+        SlotValue(
+            name="stake",
+            value="0.5",
+            source=SlotSource.EXPLICIT,
+            confidence=0.9,
+            confirmed=True,
+            needs_confirmation=False,
+        )
+    )
+    memory.append(
+        ShortTermMemoryRecord(
+            conversation_id="boss_trial",
+            sender_id="zhang",
+            user_message=UserMessage(
+                text="老板，今天下班有人打麻将吗？0.5或者1都行，烟也都可",
+                sender_id="zhang",
+                sender_name="张哥",
+                conversation_id="boss_trial",
+                trace_id="trace_prev",
+                message_id="msg_prev",
+            ),
+            system_reply="可以，我先确认下：大概几点能到？你这边几个人？",
+            game_requirement=previous_requirement,
+            created_at=NOW,
+        ),
+        now=NOW,
+    )
+    trace = InMemoryTraceRecorder()
+    llm_client = FakeSemanticLLMClient(complete_create_game_contract())
+    service = ControlledWorkflowService(
+        core=core,
+        context_builder=WorkflowContextBuilder(core, memory),
+        semantic_resolver=SemanticResolver(llm_client),
+        memory_store=memory,
+        trace_recorder=trace,
+    )
+
+    result = service.handle_message(
+        make_message("六点，我这边两个人"),
+        now=NOW,
+        trace_id="trace_followup",
+    )
+
+    context_event = next(event for event in result.trace_events if event.step == TraceStep.CONTEXT_BUILT)
+    followup = context_event.content["followup_context"]
+    assert followup["schema_version"] == "followup_context.v1"
+    assert followup["unresolved_questions"] == ["start_time", "party_size"]
+    assert followup["current_message_response_type"] == "slot_fill"
+    assert followup["should_treat_current_message_as_followup"] is True
+
+    prompt_event = next(event for event in result.trace_events if event.step == TraceStep.LLM_PROMPT)
+    prompt_text = prompt_event.content["messages"][1]["content"]
+    assert '"schema_version": "followup_context.v1"' in prompt_text
+    assert '"current_message_response_type": "slot_fill"' in prompt_text
+    assert '"previous_game_requirement"' in prompt_text
 
 
 def test_controlled_workflow_trace_line_uses_required_format() -> None:

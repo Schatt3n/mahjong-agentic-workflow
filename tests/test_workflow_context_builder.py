@@ -123,8 +123,52 @@ def test_workflow_context_builder_includes_followup_memory_for_llm() -> None:
     assert prompt["current_message"]["text"] == "组"
     assert prompt["previous_system_reply"] == "0.5的暂时没有诶。要组一个吗？"
     assert prompt["followup_context"]["current_message_may_answer_previous_reply"] is True
+    assert prompt["followup_context"]["schema_version"] == "followup_context.v1"
+    assert prompt["followup_context"]["unresolved_questions"] == ["create_confirmation"]
+    assert prompt["followup_context"]["expected_answer_type"] == "yes_no_confirmation"
+    assert prompt["followup_context"]["current_message_response_type"] == "short_ack"
+    assert prompt["followup_context"]["should_treat_current_message_as_followup"] is True
+    assert prompt["followup_context"]["previous_turn"]["message_id"] == "msg_prev"
     assert prompt["followup_context"]["previous_game_requirement"]["slots"]["stake"]["value"] == "0.5"
     assert "要组一个吗" in prompt["memory_summary"]
+
+
+def test_workflow_context_builder_marks_slot_fill_followup_for_llm() -> None:
+    core = AgentCore()
+    memory = InMemoryShortTermMemoryStore()
+    previous_user = UserMessage(
+        text="老板，今天下班有人打麻将吗？0.5或者1都行，烟也都可",
+        sender_id="zhang",
+        sender_name="张哥",
+        conversation_id="group_a",
+        trace_id="trace_prev",
+        message_id="msg_prev",
+    )
+    memory.append(
+        ShortTermMemoryRecord(
+            conversation_id="group_a",
+            sender_id="zhang",
+            user_message=previous_user,
+            system_reply="可以，我先确认下：大概几点能到？你这边几个人？",
+            created_at=NOW - timedelta(seconds=20),
+        ),
+        now=NOW,
+    )
+
+    result = WorkflowContextBuilder(core, memory).build(
+        make_message("六点，我这边两个人", "msg_current"),
+        now=NOW,
+        trace_id="trace_current",
+    )
+    followup = result.context.to_prompt_dict()["followup_context"]
+
+    assert followup["schema_version"] == "followup_context.v1"
+    assert followup["unresolved_questions"] == ["start_time", "party_size"]
+    assert followup["expected_answer_type"] == "slot_fill"
+    assert followup["current_message_response_type"] == "slot_fill"
+    assert followup["should_treat_current_message_as_followup"] is True
+    assert followup["signals"]["current_message_is_slot_fill"] is True
+    assert followup["signals"]["previous_reply_asked_clarification"] is True
 
 
 def test_workflow_context_builder_structures_profile_history_and_open_games() -> None:

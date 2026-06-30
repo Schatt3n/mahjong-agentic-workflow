@@ -162,29 +162,105 @@ class WorkflowContextBuilder:
         previous_turn = next((turn for turn in reversed(memory_turns) if turn.system_reply), None)
         if previous_turn is None:
             return {
+                "schema_version": "followup_context.v1",
                 "has_previous_system_reply": False,
+                "previous_turn": None,
+                "unresolved_questions": [],
+                "expected_answer_type": "none",
+                "current_message_response_type": self._current_message_response_type(current_message.text, []),
+                "should_treat_current_message_as_followup": False,
                 "current_message_may_answer_previous_reply": False,
+                "signals": {},
             }
         current_text = current_message.text.strip()
         previous_reply = previous_turn.system_reply or ""
-        short_ack = current_text in {"组", "组吧", "可以", "好", "好的", "行", "要", "来", "打"}
-        asks_create_confirmation = any(token in previous_reply for token in ["要组一个吗", "要不要帮你组", "帮你组一个"])
-        asks_clarification = any(token in previous_reply for token in ["几点", "多大", "几个人", "一个人吗", "烟", "几个小时"])
+        unresolved_questions = self._unresolved_questions(previous_reply)
+        response_type = self._current_message_response_type(current_text, unresolved_questions)
+        short_ack = response_type == "short_ack"
+        asks_create_confirmation = "create_confirmation" in unresolved_questions
+        asks_clarification = any(item != "create_confirmation" for item in unresolved_questions)
+        should_treat_as_followup = bool(
+            response_type in {"short_ack", "slot_fill", "correction", "negative"}
+            and (asks_create_confirmation or asks_clarification)
+        )
         return {
+            "schema_version": "followup_context.v1",
             "has_previous_system_reply": True,
+            "previous_turn": {
+                "message_id": previous_turn.user_message.message_id,
+                "user_text": previous_turn.user_message.text,
+                "system_reply": previous_reply,
+                "at": previous_turn.at.isoformat(),
+            },
             "previous_user_text": previous_turn.user_message.text,
             "previous_system_reply": previous_reply,
             "previous_game_requirement": previous_turn.game_requirement.to_prompt_dict()
             if previous_turn.game_requirement
             else None,
-            "current_message_may_answer_previous_reply": bool(short_ack or asks_create_confirmation or asks_clarification),
+            "unresolved_questions": unresolved_questions,
+            "expected_answer_type": self._expected_answer_type(unresolved_questions),
+            "current_message_response_type": response_type,
+            "should_treat_current_message_as_followup": should_treat_as_followup,
+            "current_message_may_answer_previous_reply": should_treat_as_followup,
             "signals": {
                 "current_message_is_short_ack": short_ack,
+                "current_message_is_slot_fill": response_type == "slot_fill",
+                "current_message_is_correction": response_type == "correction",
+                "current_message_is_negative": response_type == "negative",
                 "previous_reply_asked_create_confirmation": asks_create_confirmation,
                 "previous_reply_asked_clarification": asks_clarification,
             },
-            "instruction": "这是候选 follow-up 信号，不是最终动作。LLM 需要结合上下文判断当前消息是否在确认、拒绝或补充上一轮老板建议。",
+            "instruction": (
+                "这是上下文信号，不是最终动作。LLM 需要结合 current_message、previous_turn、"
+                "previous_game_requirement 和 unresolved_questions 判断本轮是在确认、拒绝、纠正还是补充上一轮老板建议。"
+            ),
         }
+
+    def _unresolved_questions(self, previous_reply: str) -> list[str]:
+        questions: list[str] = []
+        if any(token in previous_reply for token in ["要组一个吗", "要不要帮你组", "帮你组一个", "组一个吗"]):
+            questions.append("create_confirmation")
+        if any(token in previous_reply for token in ["几点", "什么时候", "大概时间", "几点能", "几点开"]):
+            questions.append("start_time")
+        if any(token in previous_reply for token in ["多大", "打多大", "档位"]):
+            questions.append("stake")
+        if any(token in previous_reply for token in ["几个人", "一个人吗", "你这边几人", "现在几人"]):
+            questions.append("party_size")
+        if any(token in previous_reply for token in ["烟况", "无烟", "有烟", "烟都可"]):
+            questions.append("smoke")
+        if any(token in previous_reply for token in ["几个小时", "打多久", "多久", "通宵"]):
+            questions.append("duration")
+        return list(dict.fromkeys(questions))
+
+    def _expected_answer_type(self, unresolved_questions: list[str]) -> str:
+        if not unresolved_questions:
+            return "none"
+        if unresolved_questions == ["create_confirmation"]:
+            return "yes_no_confirmation"
+        if "create_confirmation" in unresolved_questions:
+            return "confirmation_or_slot_fill"
+        return "slot_fill"
+
+    def _current_message_response_type(self, text: str, unresolved_questions: list[str]) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return "empty"
+        if normalized in {"组", "组吧", "可以", "好", "好的", "行", "要", "来", "打", "可以的", "行的"}:
+            return "short_ack"
+        if normalized in {"不", "不要", "不组", "算了", "不打了", "取消", "不用了"}:
+            return "negative"
+        if any(token in normalized for token in ["不是", "不对", "我说的是", "改成", "改到"]):
+            return "correction"
+        if unresolved_questions and self._looks_like_slot_fill(normalized):
+            return "slot_fill"
+        return "unknown"
+
+    def _looks_like_slot_fill(self, text: str) -> bool:
+        if any(token in text for token in ["点", "半", "小时", "通宵", "人", "个", "烟", "无烟", "有烟", "都可"]):
+            return True
+        if any(ch.isdigit() for ch in text):
+            return True
+        return False
 
     def _customer_profile(self, sender_id: str) -> CustomerProfile | None:
         profile = self.core.store.customers.get(sender_id)

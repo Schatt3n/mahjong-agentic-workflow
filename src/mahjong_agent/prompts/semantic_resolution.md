@@ -23,6 +23,12 @@
 - `current_message` 是本轮用户消息。
 - `recent_turns` 是最近会话历史。
 - `previous_system_reply` 和 `followup_context` 用于判断当前短消息是不是在回复上一轮问题。
+- `followup_context.schema_version=followup_context.v1` 时，重点看：
+  - `previous_turn.system_reply`：上一轮老板建议/追问。
+  - `previous_game_requirement`：上一轮已经形成的组局槽位，能继承则标记 `source=context`。
+  - `unresolved_questions`：上一轮还在等待用户回答的问题，例如 `create_confirmation/start_time/party_size/stake/smoke/duration`。
+  - `current_message_response_type`：当前消息像确认、补槽位、纠正、拒绝还是未知。
+  - `should_treat_current_message_as_followup`：这是上下文信号，不是最终动作；为 true 时需要优先按“回答上一轮”理解。
 - `customer_profile` 只能作为偏好和低风险默认，不等于用户本轮明确确认。
 - `open_games` 是当前局池快照，可用于提出 `search_existing_games` 或 `match_existing_game` 类动作，但不能自行落库。
 - `memory_summary` 是有损摘要，只能帮助理解上下文，不能覆盖当前用户明说的内容。
