@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mahjong_agent import (  # noqa: E402
     AgentResponder,
+    CandidateReplyDraftService,
     CandidateSemanticProposalAdapter,
     CandidateRecommendation,
     CandidateActionProposalValidator,
@@ -4605,13 +4606,14 @@ class BossTrialService:
             extracted_fact_applier=self._apply_llm_extracted_negotiation_facts,
             final_game_statuses=set(FINAL_GAME_STATUSES),
         )
+        reply_service = CandidateReplyDraftService(confirmed_count_provider=self._confirmed_count)
         return TrialCandidateMessageAdapter(
             outbox_lookup=self.store.outbox_item,
             game_lookup=self._game_by_id,
             semantic_proposal_factory=semantic_proposer.propose,
             proposal_validator=action_validator.validate,
-            candidate_reply_factory=self._candidate_boss_reply,
-            candidate_reply_guard=self._guard_candidate_boss_reply,
+            candidate_reply_factory=reply_service.fallback_reply,
+            candidate_reply_guard=reply_service.guard_reply,
             candidate_action_factory=self._candidate_state_action_record,
             organizer_followup_factory=self._organizer_followup_for_candidate_negotiation,
             action_executor=self._execute_controlled_action,
@@ -5582,8 +5584,9 @@ class BossTrialService:
     ) -> dict[str, Any]:
         parsed = game.get("parsed") if isinstance(game, dict) and isinstance(game.get("parsed"), dict) else {}
         confirmed_before = self._confirmed_count(game) if isinstance(game, dict) else 0
-        if_confirmed_label = self._game_progress_label_after_candidate(game, outbox_item, include_candidate=True)
-        no_change_label = self._game_progress_label_after_candidate(game, outbox_item, include_candidate=False)
+        reply_service = CandidateReplyDraftService(confirmed_count_provider=self._confirmed_count)
+        if_confirmed_label = reply_service.progress_label_after_candidate(game, outbox_item, include_candidate=True)
+        no_change_label = reply_service.progress_label_after_candidate(game, outbox_item, include_candidate=False)
         customer = self.store.customer(str(outbox_item.get("customer_id") or "")) or {}
         return {
             "task": "理解候选人回复并提出后端可校验动作。不要直接改状态。",
@@ -5632,7 +5635,7 @@ class BossTrialService:
                 "if_confirmed": {
                     "confirmed_after": confirmed_before + (0 if str(outbox_item.get("status") or "") in {"已确认", "已到店"} else 1),
                     "progress_label_after": if_confirmed_label,
-                    "fallback_reply": self._accepted_candidate_reply(game, outbox_item),
+                    "fallback_reply": reply_service.accepted_reply(game, outbox_item),
                 },
                 "if_no_state_change": {
                     "confirmed_count": confirmed_before,
@@ -5882,43 +5885,6 @@ class BossTrialService:
             return float(chinese_digits.get(match.group(1), 0) or 0) or None
         return None
 
-    def _candidate_boss_reply(
-        self,
-        classification: dict[str, str],
-        text: str,
-        outbox_item: dict[str, Any],
-        game: dict[str, Any] | None,
-    ) -> str:
-        name = str(outbox_item.get("customer_name") or "你")
-        intent = classification.get("intent")
-        if intent == "accepted":
-            return self._accepted_candidate_reply(game, outbox_item)
-        if intent == "candidate_negotiation":
-            return self._candidate_negotiation_reply(classification)
-        if intent == "arrived":
-            return f"{name}，好，到了直接进来。"
-        if intent == "declined":
-            return f"{name}，好，下次有合适的再问你。"
-        if intent == "ask_later":
-            return f"{name}，好，你确定了跟我说，我这边先看别人。"
-        if intent == "do_not_disturb":
-            return f"{name}，收到，后面不打扰你。"
-        detail = self._candidate_question_detail(text, game)
-        return f"{name}，{detail}"
-
-    def _candidate_negotiation_reply(self, classification: dict[str, Any]) -> str:
-        requested_start = classification.get("requested_start_time_label")
-        if requested_start:
-            return f"可以，我问下这桌其他人{requested_start}能不能对上。"
-        requested_duration = classification.get("requested_duration_hours")
-        if requested_duration:
-            if float(requested_duration).is_integer():
-                duration_text = f"{int(requested_duration)}小时"
-            else:
-                duration_text = f"{float(requested_duration):g}小时"
-            return f"可以，我问下这桌其他人能不能打{duration_text}。"
-        return "可以，我先问下这桌其他人，看大家能不能对上。"
-
     def _organizer_followup_for_candidate_negotiation(
         self,
         *,
@@ -5994,305 +5960,6 @@ class BossTrialService:
             },
         )
         return {**followup, "approval": approval, "approval_status": approval_status_label(approval.get("status"))}
-
-    def _candidate_question_detail(self, text: str, game: dict[str, Any] | None) -> str:
-        parsed = game.get("parsed") if isinstance(game, dict) and isinstance(game.get("parsed"), dict) else {}
-        normalized = re.sub(r"\s+", "", text.lower())
-        start_time = str(parsed.get("start_time") or "").strip()
-        level = str(parsed.get("level") or "").strip()
-        duration = parsed.get("duration_hours")
-        rules = [str(item) for item in parsed.get("rules") or []]
-        smoke = "无烟" if "无烟" in rules else "有烟" if "可吸烟" in rules else ""
-        parts: list[str] = []
-        if re.search(r"几点|时间", normalized) and start_time:
-            parts.append(start_time)
-        if re.search(r"多大|多少钱|档", normalized) and level:
-            parts.append(f"{level}档")
-        if re.search(r"有烟|无烟|抽烟|烟", normalized) and smoke:
-            parts.append(smoke)
-        if re.search(r"多久|几个小时|打几", normalized) and duration:
-            parts.append(f"约{duration}小时")
-        if re.search(r"几个人|几缺|几位", normalized):
-            return "差不多了，你能来我就给你确认。"
-        if re.search(r"哪里|地址|几楼", normalized):
-            return "在店里老地方，你能来我给你确认。"
-        if not parts:
-            parts = [item for item in [start_time, f"{level}档" if level else "", smoke] if item]
-        if parts:
-            return "，".join(parts[:3]) + "，你能来吗？"
-        return "你能来吗？"
-
-    def _accepted_candidate_reply(self, game: dict[str, Any] | None, outbox_item: dict[str, Any]) -> str:
-        label = self._game_progress_label_after_candidate(game, outbox_item, include_candidate=True)
-        if label == "人齐":
-            return "好的，人齐了。"
-        if label:
-            return f"好的，加你{label}了。"
-        return "好的，加你了。"
-
-    def _game_progress_label_after_candidate(
-        self,
-        game: dict[str, Any] | None,
-        outbox_item: dict[str, Any],
-        *,
-        include_candidate: bool,
-    ) -> str:
-        if not isinstance(game, dict):
-            return ""
-        parsed = game.get("parsed") if isinstance(game.get("parsed"), dict) else {}
-        current_count = parsed.get("current_player_count")
-        missing_count = parsed.get("missing_count")
-        if not isinstance(current_count, int) or not isinstance(missing_count, int):
-            return ""
-        confirmed = self._confirmed_count(game)
-        already_confirmed = str(outbox_item.get("status") or "") in {"已确认", "已到店"}
-        if include_candidate and not already_confirmed:
-            confirmed += 1
-        after_current = min(4, current_count + confirmed)
-        after_missing = max(0, missing_count - confirmed)
-        if after_missing <= 0 or after_current >= 4:
-            return "人齐"
-        mapping = {
-            (1, 3): "173",
-            (2, 2): "272",
-            (3, 1): "371",
-        }
-        return mapping.get((after_current, after_missing), f"{after_current}缺{after_missing}")
-
-    def _llm_candidate_boss_reply(
-        self,
-        *,
-        trace_id: str,
-        classification: dict[str, str],
-        candidate_text: str,
-        outbox_item: dict[str, Any],
-        game: dict[str, Any] | None,
-        fallback: str,
-    ) -> dict[str, Any]:
-        if not self.llm_config or not self.llm_budget_manager:
-            return {"text": fallback, "source": "rules", "model": None}
-        max_tokens = min(self.llm_config.max_completion_tokens, 160)
-        parsed = game.get("parsed") if isinstance(game, dict) and isinstance(game.get("parsed"), dict) else {}
-        confirmed_before = self._confirmed_count(game) if isinstance(game, dict) else 0
-        confirmed_after = confirmed_before
-        if classification.get("feedback_type") in {"accepted", "arrived"}:
-            already_confirmed = str(outbox_item.get("status") or "") in {"已确认", "已到店"}
-            if not already_confirmed:
-                confirmed_after += 1
-        current_count = parsed.get("current_player_count")
-        missing_count = parsed.get("missing_count")
-        current_after = current_count + confirmed_after if isinstance(current_count, int) else None
-        missing_after = max(0, missing_count - confirmed_after) if isinstance(missing_count, int) else None
-        progress_label = self._game_progress_label_after_candidate(
-            game,
-            outbox_item,
-            include_candidate=classification.get("feedback_type") in {"accepted", "arrived"},
-        )
-        system_prompt = """你是麻将馆老板的私聊回复起草助手。
-你只给老板生成一条“回复候选人”的建议话术，不能直接发送。
-回复要短、自然、像微信里麻将馆老板会说的话。
-候选人明确说可以/来/行时，要同时表达确认收到，并告知加入后的局面，例如“好的，加你272了。”、“好的，加你371了。”、“好的，人齐了。”。
-如果候选人提出和原局不同的新条件，比如想改时长、改烟况、改时间，这不是已确认；要回复“我先问下这桌其他人/发起人能不能接受”，不要说加你371/272/人齐。
-不要说“给你留着/留位/留座”，麻将组局场景不这样说。
-不要透露发起人是谁、推荐分数、内部规则、候选人排序。
-候选人拒绝时礼貌收尾；候选人追问时只回答必要信息并继续确认能不能来。
-reasoning_summary 只写一句简短判断依据，不要输出长篇思维链。
-只输出 JSON：
-{"reply_text":"老板可复制给候选人的一句话","risk_level":"low|medium|high","reasoning_summary":"一句话原因","notes":["可选简短说明"]}"""
-        prompt = {
-            "task": "根据候选人的回复、当前局状态和后端识别结果，起草老板下一句私聊回复。",
-            "candidate": {
-                "customer_id": outbox_item.get("customer_id"),
-                "customer_name": outbox_item.get("customer_name"),
-                "reply_text": candidate_text,
-                "current_outbox_status": outbox_item.get("status"),
-            },
-            "original_invite": {
-                "message_text": outbox_item.get("message_text"),
-                "game_id": outbox_item.get("game_id"),
-            },
-            "backend_classification": classification,
-            "game_state": {
-                "summary": parsed.get("summary"),
-                "start_time": parsed.get("start_time"),
-                "level": parsed.get("level"),
-                "duration_hours": parsed.get("duration_hours"),
-                "rules": parsed.get("rules") or [],
-                "current_player_count": current_count,
-                "missing_count": missing_count,
-                "confirmed_before": confirmed_before,
-                "confirmed_after": confirmed_after,
-                "current_player_count_after": current_after,
-                "missing_count_after": missing_after,
-                "progress_label_after": progress_label,
-                "participants": (game or {}).get("participants") or [],
-            },
-            "fallback_reply": fallback,
-            "style_rules": [
-                "优先使用中文短句。",
-                "accepted/arrived 场景不能说留着、留位、留座。",
-                "candidate_negotiation 场景不能说加你、371、272、人齐、已确认；要先问其他人是否接受新条件。",
-                "accepted 且 progress_label_after=272 时，推荐“好的，加你272了。”",
-                "accepted 且 progress_label_after=371 时，推荐“好的，加你371了。”",
-                "accepted 且 progress_label_after=人齐 时，推荐“好的，人齐了。”",
-                "不要解释系统怎么判断，不要输出内部字段名。",
-            ],
-        }
-        payload = {
-            "model": self.llm_config.model,
-            "temperature": min(self.llm_config.temperature, 0.3),
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ],
-        }
-        if self.llm_config.thinking_enabled is not None:
-            payload["thinking"] = {"type": "enabled" if self.llm_config.thinking_enabled else "disabled"}
-        if self.llm_config.response_format:
-            payload["response_format"] = {"type": self.llm_config.response_format}
-
-        budget_decision = self.llm_budget_manager.reserve(
-            key="boss_trial_candidate_reply",
-            model=self.llm_config.model,
-            prompt=payload,
-            max_completion_tokens=max_tokens,
-        )
-        if not budget_decision.allowed:
-            write_llm_audit_log(
-                trace_id,
-                "llm_budget_denied",
-                {
-                    "stage": "candidate_reply_draft",
-                    "provider": self.llm_config.provider,
-                    "model": self.llm_config.model,
-                    "budget": budget_decision.to_dict(),
-                },
-            )
-            return {"text": fallback, "source": "rules", "model": self.llm_config.model}
-
-        write_llm_audit_log(
-            trace_id,
-            "llm_request",
-            {
-                "stage": "candidate_reply_draft",
-                "provider": self.llm_config.provider,
-                "model": self.llm_config.model,
-                "base_url": self.llm_config.base_url,
-                "timeout_seconds": self.llm_config.timeout_seconds,
-                "budget": budget_decision.to_dict(),
-                "payload": payload,
-            },
-        )
-        request = urllib.request.Request(
-            f"{self.llm_config.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.llm_config.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.llm_config.timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            write_llm_audit_log(
-                trace_id,
-                "llm_error",
-                {
-                    "stage": "candidate_reply_draft",
-                    "provider": self.llm_config.provider,
-                    "model": self.llm_config.model,
-                    "error": f"HTTP {exc.code}",
-                    "budget": budget_decision.to_dict(),
-                },
-            )
-            return {"text": fallback, "source": "rules", "model": self.llm_config.model}
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            write_llm_audit_log(
-                trace_id,
-                "llm_error",
-                {
-                    "stage": "candidate_reply_draft",
-                    "provider": self.llm_config.provider,
-                    "model": self.llm_config.model,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "budget": budget_decision.to_dict(),
-                },
-            )
-            return {"text": fallback, "source": "rules", "model": self.llm_config.model}
-
-        actual_usage = usage_from_response(data, self.llm_config.model)
-        self.llm_budget_manager.commit(budget_decision.reservation_id, actual_usage)
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        write_llm_audit_log(
-            trace_id,
-            "llm_response",
-            {
-                "stage": "candidate_reply_draft",
-                "provider": self.llm_config.provider,
-                "model": self.llm_config.model,
-                "raw_response": data,
-                "content": content,
-                "usage": actual_usage.to_dict() if actual_usage else None,
-            },
-        )
-        parsed_reply = self._parse_llm_reply_json(
-            content,
-            trace_id=trace_id,
-            stage="candidate_reply_draft",
-            schema_hint='{"reply_text":str,"reasoning_summary":str,"notes":[]}',
-        )
-        reply_text = str(parsed_reply.get("reply_text") or "").strip()
-        reply_text = self._guard_candidate_boss_reply(
-            reply_text or fallback,
-            fallback=fallback,
-            classification=classification,
-        )
-        result = {
-            "text": reply_text,
-            "source": "llm",
-            "model": self.llm_config.model,
-            "reasoning_summary": str(parsed_reply.get("reasoning_summary") or ""),
-            "notes": parsed_reply.get("notes") if isinstance(parsed_reply.get("notes"), list) else [],
-            "budget": budget_decision.to_dict(),
-        }
-        write_llm_audit_log(
-            trace_id,
-            "llm_parsed",
-            {
-                "stage": "candidate_reply_draft",
-                "provider": self.llm_config.provider,
-                "model": self.llm_config.model,
-                "parsed": result,
-            },
-        )
-        return result
-
-    def _guard_candidate_boss_reply(
-        self,
-        reply_text: str,
-        *,
-        fallback: str,
-        classification: dict[str, str],
-    ) -> str:
-        text = re.sub(r"\s+", " ", reply_text).strip()
-        if "留" in text:
-            return fallback
-        if classification.get("feedback_type") == "candidate_negotiation":
-            if re.search(r"加你|人齐|已确认|确认了|371|272|173", text):
-                return fallback
-        if classification.get("feedback_type") not in {"accepted", "arrived", "candidate_negotiation"}:
-            if re.search(r"加你|人齐|已确认|确认了|371|272|173", text):
-                return fallback
-        if classification.get("feedback_type") in {"accepted", "arrived"}:
-            for label in ["人齐", "371", "272", "173"]:
-                if label in fallback and label not in text:
-                    return fallback
-            if not re.search(r"加你|人齐|已确认|确认", text):
-                return fallback
-        return text or fallback
 
     def manual_create_game(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace_id = str(payload.get("trace_id") or make_trace_id())

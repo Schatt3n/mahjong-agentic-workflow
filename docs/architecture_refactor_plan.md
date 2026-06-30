@@ -121,6 +121,7 @@ src/mahjong_agent/
 - `candidate_validation.py` 已新增 `CandidateActionProposalValidator`，把候选人回复后的后端动作校验从脚本移出：它只检查 proposed_action 白名单、状态提交置信度、协商覆盖、局已归档和局已满等边界，不调用 LLM、不写库、不发消息；当前“候选人是否提出改时间/改时长”的探测和 LLM extracted facts 合并仍由脚本回调提供，后续应迁移到更通用的候选人上下文/事实解析模块。
 - `trial_followup.py` 已新增 `TrialOrganizerFollowupAdapter`，把候选人协商后给发起人的 followup 编排从脚本移出：它只负责 `send_message/create_pending_followup` 的后端工具校验、待审批 followup 创建、tool audit 和 action plan 投影；不会直接外发，也不改变局状态。
 - `organizer_followup_draft.py` 已新增 `OrganizerFollowupDraftService`，把协商 followup 的兜底话术、LLM 草稿 prompt、模型调用、预算/audit 和文案 guard 从脚本移出；它只生成待审批草稿 contract，不写库、不发消息。当前 SQLite followup/approval 写入函数仍由脚本回调提供，后续可继续迁移到发送网关或统一持久化 adapter。
+- `candidate_reply_draft.py` 已新增 `CandidateReplyDraftService`，把候选人私聊回复的兜底话术、局面进度标签和安全 guard 从脚本移出；它不调用 LLM、不写库、不发消息，只根据后端已校验的候选人反馈生成安全草稿。当前候选人 LLM 语义提案中的 `reply_text` 仍由 `candidate_semantics` contract 产出，后续应迁移到统一 `ReplyPolicy`，并调整到状态/工具执行之后生成。
 - `reply_policy.py`、`reply_guard.py` 和 `prompts/reply_draft.md` 已新增，负责基于最终动作和工具结果生成回复草稿并做安全一致性检查；`ReplyPolicy` 已支持可选 `reply_draft_contract_v1` 模型调用，模型只生成结构化回复草稿，后端仍负责工具、状态和 guard。
 - `state_machine.py` 已新增 `WorkflowStateStore` 协议、`InMemoryWorkflowStateStore` 和 `SQLiteWorkflowStateStore`；受控链路会把允许的状态迁移应用到账本，本地生产可通过 `MAHJONG_STATE_SQLITE_PATH` 启用 SQLite 状态落库，后续 Redis/PostgreSQL 也应实现同一接口。
 - `observability.py` 已新增 `controlled_trace.v1` contract、受控链路必需 trace step 列表和完整性校验函数；`final_output` 会携带 `trace_completeness`，回归评估可直接断言每轮链路是否可回放。

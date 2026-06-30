@@ -21,6 +21,7 @@ from .candidate_semantics import (
     normalize_candidate_proposed_action,
     normalize_candidate_semantic_type,
 )
+from .candidate_reply_draft import CandidateReplyDraftService
 from .candidate_validation import CandidateActionProposalValidator
 from .adapters import (
     ChannelAddress,
@@ -162,6 +163,7 @@ __all__ = [
     "LLMUsage",
     "CandidateSemanticProposalAdapter",
     "CandidateSemanticProposalResult",
+    "CandidateReplyDraftService",
     "CandidateActionProposalValidator",
     "candidate_action_for_feedback_type",
     "feedback_type_for_candidate_action",
