@@ -27,6 +27,7 @@ from mahjong_agent import (  # noqa: E402
     AgentResponder,
     CandidateRecommendation,
     ChannelType,
+    ControlledRuntimeConfig,
     CustomerProfile,
     GameRequest,
     GameStatus,
@@ -38,6 +39,8 @@ from mahjong_agent import (  # noqa: E402
     PlayPreference,
     RedisCache,
     RedisCacheError,
+    build_controlled_runtime,
+    project_controlled_result_for_trial,
 )
 from mahjong_agent.budget import usage_from_response  # noqa: E402
 from mahjong_agent.normalization import normalize_mahjong_text  # noqa: E402
@@ -180,6 +183,31 @@ def env_bool(name: str, default: bool) -> bool:
     if value in {"1", "true", "yes", "y", "on"}:
         return True
     if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def use_controlled_trial_workflow(payload: dict[str, Any] | None = None) -> bool:
+    payload = payload or {}
+    explicit = (
+        payload.get("use_controlled_workflow")
+        if "use_controlled_workflow" in payload
+        else payload.get("controlled_workflow")
+    )
+    if explicit is not None:
+        return env_bool_value(explicit, default=False)
+    return env_bool("MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW", False)
+
+
+def env_bool_value(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
         return False
     return default
 
@@ -3611,6 +3639,15 @@ class BossTrialService:
             else None
         )
         self.responder = AgentResponder(invite_limit=8, llm_resolver=llm_resolver)
+        self.controlled_runtime = build_controlled_runtime(
+            core=self.responder.core,
+            config=ControlledRuntimeConfig(
+                trace_jsonl_path=ROOT / "logs" / "controlled_workflow_trace.jsonl",
+                short_memory_ttl_seconds=SHORT_MEMORY_TTL_SECONDS,
+                short_memory_max_records=20,
+                fail_closed_without_llm=True,
+            ),
+        )
         self.reload_customers()
 
     def reload_customers(self) -> None:
@@ -3729,6 +3766,46 @@ class BossTrialService:
     def _stable_request_game_id(self, trace_id: str) -> str:
         digest = hashlib.sha256(f"trial-game:{trace_id}".encode("utf-8")).hexdigest()[:12]
         return f"game_{digest}"
+
+    def analyze_controlled(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.reload_customers()
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ValueError("消息不能为空")
+        trace_id = str(payload.get("trace_id") or make_trace_id())
+        sender_id = str(payload.get("sender_id") or "trial_customer")
+        sender_name = str(payload.get("sender_name") or "试用客户")
+        conversation_id = str(
+            payload.get("conversation_id")
+            or payload.get("conversationId")
+            or "boss_trial"
+        ).strip() or "boss_trial"
+        now = parse_dt(payload.get("now")) or now_tz()
+        self.store.run_lifecycle(now=now)
+        message = Message(
+            text=text,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            channel_id=conversation_id,
+            channel_type=ChannelType.WEB_CONSOLE,
+            sent_at=now,
+            metadata={
+                "conversation_id": conversation_id,
+                "trace_id": trace_id,
+                "source": "boss_trial_controlled",
+            },
+        )
+        workflow_result = self.controlled_runtime.service.handle_message(
+            message,
+            now=now,
+            trace_id=trace_id,
+        )
+        projected = project_controlled_result_for_trial(workflow_result)
+        projected["controlled_workflow_enabled"] = True
+        projected["api_trace_id"] = trace_id
+        projected["trace_id"] = trace_id
+        projected["legacy_path"] = False
+        return projected
 
     def save_customer(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace_id = str(payload.get("trace_id") or make_trace_id())
@@ -12528,7 +12605,11 @@ class BossTrialHandler(BaseHTTPRequestHandler):
             body["trace_id"] = trace_id
             write_io_log(trace_id, "INFO", log_input_content(parsed.path, body))
             if parsed.path == "/api/analyze":
-                result = self.service.analyze(body)
+                result = (
+                    self.service.analyze_controlled(body)
+                    if use_controlled_trial_workflow(body)
+                    else self.service.analyze(body)
+                )
                 result["trace_id"] = trace_id
                 write_io_log(trace_id, "INFO", log_output_content(parsed.path, result))
                 self._json(result)
