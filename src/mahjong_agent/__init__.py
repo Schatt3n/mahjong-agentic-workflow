@@ -127,6 +127,12 @@ from .trial_approval import TrialApprovalDecisionAdapter
 from .trial_candidate import TrialCandidateMessageAdapter
 from .trial_delivery import TrialOutboxDeliveryAdapter, delivery_message_hash
 from .trial_followup import TrialOrganizerFollowupAdapter
+from .trial_game_state import (
+    TrialCreateGameStateInput,
+    TrialCreateGameStateResult,
+    TrialGameStateCreationAdapter,
+    TrialGameStateCreationCallbacks,
+)
 from .trial_manual_game import TrialManualGameAdapter
 from .trial_projection import project_controlled_result_for_trial
 from .trial_persistence import TrialControlledPersistenceAdapter
@@ -302,6 +308,10 @@ __all__ = [
     "TrialOutboxDeliveryAdapter",
     "delivery_message_hash",
     "TrialOrganizerFollowupAdapter",
+    "TrialCreateGameStateInput",
+    "TrialCreateGameStateResult",
+    "TrialGameStateCreationAdapter",
+    "TrialGameStateCreationCallbacks",
     "TrialManualGameAdapter",
     "project_controlled_result_for_trial",
     "TrialControlledPersistenceAdapter",

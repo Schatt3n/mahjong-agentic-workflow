@@ -55,6 +55,9 @@ from mahjong_agent import (  # noqa: E402
     TrialManualGameAdapter,
     TrialOutboxDeliveryAdapter,
     TrialOrganizerFollowupAdapter,
+    TrialCreateGameStateInput,
+    TrialGameStateCreationAdapter,
+    TrialGameStateCreationCallbacks,
     TrialShortMemoryTextMerger,
     TrialToolGateway,
     TrialToolOrchestrationCallbacks,
@@ -3719,6 +3722,17 @@ class BossTrialService:
             ),
             critical_fields=set(CRITICAL_FIELDS),
         )
+        self.trial_game_state_creation_adapter = TrialGameStateCreationAdapter(
+            callbacks=TrialGameStateCreationCallbacks(
+                game_status_label=self._game_status_label,
+                workflow_state_action_record=self._workflow_state_action_record,
+                execute_controlled_action=self._execute_controlled_action,
+                create_game_state_write=self._create_game_state_write,
+                compact_action_record=self._compact_action_record,
+                cache_game=self._cache_game,
+                single_action_plan_view=self._single_action_plan_view,
+            )
+        )
         self.controlled_runtime = build_controlled_runtime(
             core=self.responder.core,
             config=ControlledRuntimeConfig(
@@ -4075,70 +4089,25 @@ class BossTrialService:
             now=now,
         )
         if should_materialize_game:
-            status = self._game_status_label(game, missing_fields, bool(outbox))
-            create_game_action = self._workflow_state_action_record(
-                trace_id=trace_id,
-                stage="create_game",
-                action_name="create_game",
-                arguments={
-                    "game_id": game.id,
-                    "status": status,
-                    "organizer_id": sender_id,
-                    "organizer_name": sender_name,
-                    "missing_fields": list(missing_fields),
-                    "missing_count": parsed.get("missing_count"),
-                    "start_at": parsed.get("start_at"),
-                    "level": parsed.get("level"),
-                    "rules": parsed.get("rules") or [],
-                    "source": "analyze",
-                },
-                proposed_by=str(user_action_record.get("source") or "orchestrator"),
-                source=str(user_action_record.get("source") or "orchestrator"),
-                risk_level="medium",
-                approval_required=False,
-                reason=str(user_action_record.get("reason") or "用户已明确要求组局且关键信息足够，后端准备创建当前局看板记录。"),
-                now=now,
-                validation={
-                    "allowed": True,
-                    "code": "state_transition_allowed",
-                    "reason": "创建局动作通过状态机、语义动作提案和关键信息校验。",
-                    "notes": [
-                        "这是内部状态写入，不会自动外发消息。",
-                        f"semantic_action_source={user_action_record.get('source')}",
-                        f"semantic_effective_action={effective_user_action}",
-                    ],
-                },
-            )
-            create_result = self._execute_controlled_action(
-                create_game_action,
-                lambda: self._create_game_state_write(
+            create_game_state = self.trial_game_state_creation_adapter.create(
+                TrialCreateGameStateInput(
+                    trace_id=trace_id,
                     game=game,
-                    status=status,
-                    organizer_id=sender_id,
-                    organizer_name=sender_name,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
                     source_text=text,
                     parsed=parsed,
-                    reply_text=str(suggested_reply.get("text") or decision.reply_text),
+                    suggested_reply=suggested_reply,
+                    fallback_reply_text=decision.reply_text,
                     missing_fields=missing_fields,
-                    notes=[
-                        *decision.notes,
-                        {
-                            "kind": "controlled_action",
-                            "action": self._compact_action_record(create_game_action),
-                        },
-                    ],
+                    decision_notes=list(decision.notes),
+                    user_action_record=user_action_record,
+                    effective_user_action=effective_user_action,
                     outbox=outbox,
-                ),
-            )
-            if create_result.get("ok"):
-                self._cache_game(game, outbox, status=status, source_text=text)
-            action_plans.append(
-                self._single_action_plan_view(
-                    stage="create_game",
-                    source=str(user_action_record.get("source") or "orchestrator"),
-                    action=create_game_action,
+                    now=now,
                 )
             )
+            action_plans.append(create_game_state.action_plan)
         elif game and (use_existing_pool or not should_materialize_game):
             self.responder.core.store.games.pop(game.id, None)
 
