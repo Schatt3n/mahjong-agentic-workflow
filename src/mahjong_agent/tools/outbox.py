@@ -1,14 +1,158 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Protocol
 
+from ..models import DEFAULT_TZ
 from ..workflow_models import GameRequirement, new_workflow_id
+
+
+class PendingOutboxStore(Protocol):
+    def create_many(self, drafts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ...
+
+    def list_pending(self, *, conversation_id: str | None = None) -> list[dict[str, Any]]:
+        ...
+
+    def get(self, outbox_id: str) -> dict[str, Any] | None:
+        ...
+
+
+class InMemoryPendingOutboxStore:
+    def __init__(self) -> None:
+        self._items: dict[str, dict[str, Any]] = {}
+
+    def create_many(self, drafts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        stored: list[dict[str, Any]] = []
+        for draft in drafts:
+            item = _stored_outbox_item(draft)
+            self._items.setdefault(str(item["id"]), item)
+            stored.append(dict(self._items[str(item["id"])]))
+        return stored
+
+    def list_pending(self, *, conversation_id: str | None = None) -> list[dict[str, Any]]:
+        items = [dict(item) for item in self._items.values() if item.get("status") == "pending_approval"]
+        if conversation_id is not None:
+            items = [item for item in items if item.get("conversation_id") == str(conversation_id)]
+        return sorted(items, key=lambda item: str(item.get("created_at") or ""))
+
+    def get(self, outbox_id: str) -> dict[str, Any] | None:
+        item = self._items.get(str(outbox_id))
+        return dict(item) if item else None
+
+
+class SQLitePendingOutboxStore:
+    """SQLite-backed pending outbox store for local production trials."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def create_many(self, drafts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = [_stored_outbox_item(draft) for draft in drafts]
+        with self._connect() as conn:
+            for item in items:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO controlled_pending_outbox (
+                        id, trace_id, conversation_id, target_customer_id,
+                        target_display_name, message_text, status, source,
+                        metadata_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item["id"],
+                        item["trace_id"],
+                        item["conversation_id"],
+                        item["target_customer_id"],
+                        item["target_display_name"],
+                        item["message_text"],
+                        item["status"],
+                        item["source"],
+                        json.dumps(item["metadata"], ensure_ascii=False, sort_keys=True),
+                        item["created_at"],
+                        item["updated_at"],
+                    ),
+                )
+        return [self.get(str(item["id"])) or item for item in items]
+
+    def list_pending(self, *, conversation_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM controlled_pending_outbox WHERE status = ?"
+        params: list[str] = ["pending_approval"]
+        if conversation_id is not None:
+            sql += " AND conversation_id = ?"
+            params.append(str(conversation_id))
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def get(self, outbox_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM controlled_pending_outbox WHERE id = ?",
+                (str(outbox_id),),
+            ).fetchone()
+        return self._row_to_item(row) if row else None
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS controlled_pending_outbox (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    target_customer_id TEXT NOT NULL,
+                    target_display_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_controlled_pending_outbox_status
+                    ON controlled_pending_outbox(status, conversation_id, created_at);
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _row_to_item(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except json.JSONDecodeError:
+            metadata = {"raw_metadata_json": row["metadata_json"]}
+        return {
+            "id": str(row["id"]),
+            "trace_id": str(row["trace_id"]),
+            "conversation_id": str(row["conversation_id"]),
+            "target_customer_id": str(row["target_customer_id"]),
+            "target_display_name": str(row["target_display_name"]),
+            "message_text": str(row["message_text"]),
+            "status": str(row["status"]),
+            "source": str(row["source"]),
+            "metadata": metadata if isinstance(metadata, dict) else {"metadata": metadata},
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
 
 
 @dataclass(slots=True)
 class PendingOutboxTool:
     max_drafts: int = 8
+    store: PendingOutboxStore | None = None
 
     def create_pending_invites(
         self,
@@ -22,6 +166,7 @@ class PendingOutboxTool:
         for candidate in candidates[: self.max_drafts]:
             customer_id = str(candidate.get("customer_id") or "")
             display_name = str(candidate.get("display_name") or customer_id or "牌友")
+            now_text = datetime.now(DEFAULT_TZ).isoformat()
             drafts.append(
                 {
                     "id": new_workflow_id("outbox"),
@@ -32,15 +177,20 @@ class PendingOutboxTool:
                     "message_text": self._invite_text(display_name, requirement),
                     "status": "pending_approval",
                     "source": "tool_orchestrator",
+                    "created_at": now_text,
+                    "updated_at": now_text,
                     "metadata": {
                         "candidate_score": candidate.get("score"),
                         "candidate_reasons": list(candidate.get("reasons") or []),
+                        "candidate_warnings": list(candidate.get("warnings") or []),
                     },
                 }
             )
+        stored = self.store.create_many(drafts) if self.store else []
         return {
             "drafts": drafts,
             "result_count": len(drafts),
+            "stored_count": len(stored),
             "policy": "只创建待审批草稿，不自动发送。",
         }
 
@@ -92,3 +242,21 @@ def _duration_text(slots: dict[str, Any]) -> str | None:
     if mode == "overnight":
         return "通宵"
     return str(mode) if mode else None
+
+
+def _stored_outbox_item(draft: dict[str, Any]) -> dict[str, Any]:
+    now = datetime.now(DEFAULT_TZ).isoformat()
+    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+    return {
+        "id": str(draft.get("id") or new_workflow_id("outbox")),
+        "trace_id": str(draft.get("trace_id") or ""),
+        "conversation_id": str(draft.get("conversation_id") or ""),
+        "target_customer_id": str(draft.get("target_customer_id") or ""),
+        "target_display_name": str(draft.get("target_display_name") or ""),
+        "message_text": str(draft.get("message_text") or ""),
+        "status": str(draft.get("status") or "pending_approval"),
+        "source": str(draft.get("source") or "tool_orchestrator"),
+        "metadata": dict(metadata),
+        "created_at": str(draft.get("created_at") or now),
+        "updated_at": str(draft.get("updated_at") or now),
+    }

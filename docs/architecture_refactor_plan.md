@@ -111,6 +111,7 @@ src/mahjong_agent/
 - `tool_orchestrator.py` 已新增 `ToolExecutionLedger` 协议、`InMemoryToolExecutionLedger` 和 `SQLiteToolExecutionLedger`，只读工具可重复执行，`create_pending_outbox`、`create_game`、`close_game` 等副作用工具按后端生成的 idempotency key 复用结果；本地生产可通过 `MAHJONG_TOOL_LEDGER_SQLITE_PATH` 启用 SQLite 工具执行账本，防止服务重启或重试后重复创建草稿或状态写入意图。
 - `create_game` 和 `close_game` 已纳入受控工具链：工具只生成“状态写入意图”，不直接改数据库；真正状态变更仍由 `StateMachine` 校验并由 `WorkflowStateStore` 落库，避免 LLM 或工具绕过状态机。
 - `profile_update` 已纳入受控工具链：LLM 只能输出 `profile_observations` 观察事实，后端按字段白名单、置信度、风险等级和证据过滤后写入 `CustomerProfile.metadata.controlled_profile_observations`；`ContextBuilder` 会把这些低风险观察作为 `recent_facts` 带入后续上下文，但不会直接覆盖强画像字段。
+- `tools/outbox.py` 已新增 `PendingOutboxStore`、`InMemoryPendingOutboxStore` 和 `SQLitePendingOutboxStore`；受控 runtime 可通过 `MAHJONG_OUTBOX_SQLITE_PATH` 持久化待老板审批草稿，服务重启后仍可查询待审批 outbox。
 - `reply_policy.py`、`reply_guard.py` 和 `prompts/reply_draft.md` 已新增，负责基于最终动作和工具结果生成回复草稿并做安全一致性检查；`ReplyPolicy` 已支持可选 `reply_draft_contract_v1` 模型调用，模型只生成结构化回复草稿，后端仍负责工具、状态和 guard。
 - `state_machine.py` 已新增 `WorkflowStateStore` 协议、`InMemoryWorkflowStateStore` 和 `SQLiteWorkflowStateStore`；受控链路会把允许的状态迁移应用到账本，本地生产可通过 `MAHJONG_STATE_SQLITE_PATH` 启用 SQLite 状态落库，后续 Redis/PostgreSQL 也应实现同一接口。
 - `observability.py` 已新增 `controlled_trace.v1` contract、受控链路必需 trace step 列表和完整性校验函数；`final_output` 会携带 `trace_completeness`，回归评估可直接断言每轮链路是否可回放。
@@ -200,7 +201,7 @@ src/mahjong_agent/
 | --- | --- | --- |
 | `search_current_open_games` | low | 可自动执行，只读 |
 | `search_candidate_customers` | low | 可自动执行，只读 |
-| `create_pending_outbox` | medium | 只创建待审批草稿，不直接发送 |
+| `create_pending_outbox` | medium | 只创建待审批草稿，不直接发送；可通过 SQLite pending outbox store 持久化待审批队列 |
 | `send_message` | high | 必须人工审批 + 幂等发送网关 |
 | `create_game` | medium | 后端校验后由工具生成状态写入意图，再交给状态机落库 |
 | `close_game` | medium/high | 后端校验后由工具生成关闭意图，需要身份、状态和原因校验，再交给状态机落库 |
@@ -348,7 +349,7 @@ python scripts/run_evals.py
 当前已经新增受控运行时入口：
 
 - `controlled_workflow.py`：串联上下文构建、语义解析、动作校验、工具编排、状态机、回复策略、回复安全闸和短期记忆。
-- `controlled_runtime.py`：从环境变量组装 `ControlledWorkflowService`，默认写入 `logs/controlled_workflow_trace.jsonl`；可通过 `MAHJONG_STATE_SQLITE_PATH` 和 `MAHJONG_TOOL_LEDGER_SQLITE_PATH` 启用状态机落库和工具幂等账本。
+- `controlled_runtime.py`：从环境变量组装 `ControlledWorkflowService`，默认写入 `logs/controlled_workflow_trace.jsonl`；可通过 `MAHJONG_STATE_SQLITE_PATH`、`MAHJONG_TOOL_LEDGER_SQLITE_PATH` 和 `MAHJONG_OUTBOX_SQLITE_PATH` 启用状态机落库、工具幂等账本和待审批 outbox 持久化。
 - `llm_client.py`：OpenAI-compatible 语义解析客户端，实现 `SemanticLLMClient.complete()` contract，带预算、审计、超时和 fail-closed。
 - `observability.py`：内存 trace 和 JSONL trace recorder。
 

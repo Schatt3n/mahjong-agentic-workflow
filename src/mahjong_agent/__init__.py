@@ -83,7 +83,14 @@ from .tool_orchestrator import (
     ToolOrchestrator,
     ToolOrchestratorConfig,
 )
-from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
+from .tools import (
+    CandidateSearchTool,
+    CurrentGameSearchTool,
+    InMemoryPendingOutboxStore,
+    PendingOutboxStore,
+    PendingOutboxTool,
+    SQLitePendingOutboxStore,
+)
 from .trial_entry import (
     TrialControlledAnalyzeRequest,
     TrialControlledEntryAdapter,
@@ -215,7 +222,10 @@ __all__ = [
     "ToolOrchestratorConfig",
     "CandidateSearchTool",
     "CurrentGameSearchTool",
+    "InMemoryPendingOutboxStore",
+    "PendingOutboxStore",
     "PendingOutboxTool",
+    "SQLitePendingOutboxStore",
     "TrialControlledAnalyzeRequest",
     "TrialControlledEntryAdapter",
     "TrialControlledRequestBuilder",

@@ -23,6 +23,7 @@ from .tool_orchestrator import (
     ToolOrchestrator,
     ToolOrchestratorConfig,
 )
+from .tools import PendingOutboxTool, SQLitePendingOutboxStore
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +35,7 @@ class ControlledRuntimeConfig:
     trace_jsonl_path: Path = DEFAULT_TRACE_PATH
     state_sqlite_path: Path | None = None
     tool_ledger_sqlite_path: Path | None = None
+    outbox_sqlite_path: Path | None = None
     short_memory_ttl_seconds: int = 30 * 60
     short_memory_max_records: int = 20
     llm_timeout_seconds: float | None = None
@@ -48,6 +50,9 @@ class ControlledRuntimeConfig:
             else None,
             tool_ledger_sqlite_path=Path(os.environ["MAHJONG_TOOL_LEDGER_SQLITE_PATH"])
             if os.getenv("MAHJONG_TOOL_LEDGER_SQLITE_PATH")
+            else None,
+            outbox_sqlite_path=Path(os.environ["MAHJONG_OUTBOX_SQLITE_PATH"])
+            if os.getenv("MAHJONG_OUTBOX_SQLITE_PATH")
             else None,
             short_memory_ttl_seconds=int(os.getenv("MAHJONG_SHORT_MEMORY_TTL_SECONDS", str(30 * 60))),
             short_memory_max_records=int(os.getenv("MAHJONG_SHORT_MEMORY_MAX_RECORDS", "20")),
@@ -127,6 +132,7 @@ def build_controlled_runtime(
         tool_orchestrator=ToolOrchestrator(
             runtime_core,
             ToolOrchestratorConfig(allow_state_write=True),
+            outbox_tool=_pending_outbox_tool_from_config(runtime_config),
             execution_ledger=workflow_tool_ledger,
         ),
         state_machine=StateMachine(),
@@ -194,6 +200,12 @@ def _tool_ledger_from_config(config: ControlledRuntimeConfig) -> ToolExecutionLe
     if config.tool_ledger_sqlite_path is not None:
         return SQLiteToolExecutionLedger(config.tool_ledger_sqlite_path)
     return InMemoryToolExecutionLedger()
+
+
+def _pending_outbox_tool_from_config(config: ControlledRuntimeConfig) -> PendingOutboxTool | None:
+    if config.outbox_sqlite_path is None:
+        return None
+    return PendingOutboxTool(store=SQLitePendingOutboxStore(config.outbox_sqlite_path))
 
 
 def _env_bool(name: str, default: bool) -> bool:
