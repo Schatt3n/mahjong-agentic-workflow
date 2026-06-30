@@ -13,7 +13,7 @@ from .llm_client import OpenAICompatibleSemanticLLMClient
 from .memory import InMemoryShortTermMemoryStore, ShortTermMemoryStore
 from .observability import JsonlTraceRecorder, TraceRecorder
 from .reply_guard import ReplyGuard
-from .reply_policy import ReplyPolicy
+from .reply_policy import ReplyDraftLLMClient, ReplyPolicy
 from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
 from .state_machine import StateMachine
 from .tool_orchestrator import ToolOrchestrator, ToolOrchestratorConfig
@@ -73,6 +73,7 @@ def build_controlled_runtime(
     *,
     core: AgentCore | None = None,
     llm_client: SemanticLLMClient | None = None,
+    reply_llm_client: ReplyDraftLLMClient | None = None,
     memory_store: ShortTermMemoryStore | None = None,
     trace_recorder: TraceRecorder | None = None,
     config: ControlledRuntimeConfig | None = None,
@@ -84,7 +85,10 @@ def build_controlled_runtime(
         ttl_seconds=runtime_config.short_memory_ttl_seconds,
         max_records_per_scope=runtime_config.short_memory_max_records,
     )
-    semantic_client = llm_client or _llm_client_from_env(recorder, runtime_config)
+    semantic_client = llm_client or _llm_client_from_env(recorder, runtime_config, stage_name="semantic")
+    reply_client = reply_llm_client
+    if reply_client is None and llm_client is None:
+        reply_client = _optional_llm_client_from_env(recorder, stage_name="reply")
     context_builder = WorkflowContextBuilder(
         runtime_core,
         memory,
@@ -102,7 +106,7 @@ def build_controlled_runtime(
         action_validator=ActionValidator(),
         tool_orchestrator=ToolOrchestrator(runtime_core, ToolOrchestratorConfig()),
         state_machine=StateMachine(),
-        reply_policy=ReplyPolicy(),
+        reply_policy=ReplyPolicy(reply_client),
         reply_guard=ReplyGuard(),
         memory_store=memory,
         trace_recorder=recorder,
@@ -120,19 +124,37 @@ def build_controlled_runtime(
 def _llm_client_from_env(
     trace_recorder: TraceRecorder,
     config: ControlledRuntimeConfig,
+    *,
+    stage_name: str,
 ) -> SemanticLLMClient:
     client = OpenAICompatibleSemanticLLMClient.from_env(
         audit_logger=lambda trace_id, event, payload: trace_recorder.record(
             trace_id,
             f"llm_client.{event}",
             payload,
-        )
+        ),
+        stage_name=stage_name,
     )
     if client is not None:
         return client
     if config.fail_closed_without_llm:
         return FailClosedSemanticLLMClient()
     raise RuntimeError("LLM is not configured. Set MAHJONG_LLM_API_KEY and MAHJONG_LLM_MODEL.")
+
+
+def _optional_llm_client_from_env(
+    trace_recorder: TraceRecorder,
+    *,
+    stage_name: str,
+) -> OpenAICompatibleSemanticLLMClient | None:
+    return OpenAICompatibleSemanticLLMClient.from_env(
+        audit_logger=lambda trace_id, event, payload: trace_recorder.record(
+            trace_id,
+            f"llm_client.{event}",
+            payload,
+        ),
+        stage_name=stage_name,
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:

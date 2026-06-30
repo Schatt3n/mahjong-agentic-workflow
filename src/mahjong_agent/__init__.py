@@ -53,7 +53,7 @@ from .observability import InMemoryTraceRecorder, JsonlTraceRecorder, TraceEvent
 from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
 from .reply_guard import ReplyGuard
-from .reply_policy import ReplyPolicy, ReplyPolicyInput
+from .reply_policy import ReplyDraftLLMClient, ReplyPolicy, ReplyPolicyConfig, ReplyPolicyInput
 from .responder import AgentResponder, ReplyAction, ReplyDecision
 from .runtime import AgentRuntime, RuntimeConfig, RuntimeResult
 from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
@@ -146,7 +146,9 @@ __all__ = [
     "RedisCacheConfig",
     "RedisCacheError",
     "ReplyGuard",
+    "ReplyDraftLLMClient",
     "ReplyPolicy",
+    "ReplyPolicyConfig",
     "ReplyPolicyInput",
     "MatchingEngine",
     "MergeSuggestion",

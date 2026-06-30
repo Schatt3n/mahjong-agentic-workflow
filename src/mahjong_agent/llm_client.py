@@ -27,16 +27,17 @@ AuditLogger = Callable[[str, str, dict[str, Any]], None]
 
 @dataclass(slots=True)
 class OpenAICompatibleSemanticLLMClient:
-    """OpenAI-compatible client for the controlled SemanticResolver contract.
+    """OpenAI-compatible client for controlled workflow LLM contracts.
 
-    It only returns the model content for SemanticResolver to parse. It does not
-    interpret actions, call tools, mutate state, or generate outbound messages.
+    It only returns model content for a resolver/policy to parse. It does not
+    interpret actions, call tools, mutate state, or send outbound messages.
     """
 
     config: LLMConfig
     budget_manager: LLMBudgetManager | None = None
     audit_logger: AuditLogger | None = None
     urlopen: UrlOpen = urllib.request.urlopen
+    stage_name: str = "semantic"
 
     @classmethod
     def from_env(
@@ -44,11 +45,17 @@ class OpenAICompatibleSemanticLLMClient:
         *,
         budget_manager: LLMBudgetManager | None = None,
         audit_logger: AuditLogger | None = None,
+        stage_name: str = "semantic",
     ) -> "OpenAICompatibleSemanticLLMClient | None":
         config = LLMConfig.from_env()
         if config is None:
             return None
-        return cls(config=config, budget_manager=budget_manager, audit_logger=audit_logger)
+        return cls(
+            config=config,
+            budget_manager=budget_manager,
+            audit_logger=audit_logger,
+            stage_name=stage_name,
+        )
 
     def complete(
         self,
@@ -59,7 +66,7 @@ class OpenAICompatibleSemanticLLMClient:
     ) -> str:
         budget_manager = self.budget_manager or LLMBudgetManager.from_env()
         payload = self._payload(messages)
-        budget_key = "controlled_workflow"
+        budget_key = f"controlled_workflow:{self.stage_name}"
         budget_decision = budget_manager.reserve(
             key=budget_key,
             model=self.config.model,
@@ -68,7 +75,7 @@ class OpenAICompatibleSemanticLLMClient:
         )
         self._audit(
             trace_id,
-            "semantic_llm_budget",
+            f"{self.stage_name}_llm_budget",
             {
                 "provider": self.config.provider,
                 "model": self.config.model,
@@ -80,7 +87,7 @@ class OpenAICompatibleSemanticLLMClient:
 
         self._audit(
             trace_id,
-            "semantic_llm_request",
+            f"{self.stage_name}_llm_request",
             {
                 "provider": self.config.provider,
                 "model": self.config.model,
@@ -114,7 +121,7 @@ class OpenAICompatibleSemanticLLMClient:
         content = _content_from_response(data)
         self._audit(
             trace_id,
-            "semantic_llm_response",
+            f"{self.stage_name}_llm_response",
             {
                 "provider": self.config.provider,
                 "model": self.config.model,

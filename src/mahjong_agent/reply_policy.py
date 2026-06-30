@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
 
 from .tool_orchestrator import ToolOrchestrationResult
 from .workflow_models import (
@@ -17,6 +21,20 @@ from .workflow_models import (
 )
 
 
+DEFAULT_REPLY_PROMPT_PATH = Path(__file__).with_name("prompts") / "reply_draft.md"
+
+
+class ReplyDraftLLMClient(Protocol):
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        trace_id: str,
+        timeout_seconds: float,
+    ) -> str | dict[str, Any]:
+        ...
+
+
 MISSING_SLOT_QUESTIONS: dict[str, str] = {
     "game_type": "打杭麻吗？",
     "stake": "打多大？",
@@ -26,6 +44,13 @@ MISSING_SLOT_QUESTIONS: dict[str, str] = {
     "duration_mode": "大概要打多久？",
     "duration_hours": "大概要打几个小时？",
 }
+
+
+@dataclass(slots=True)
+class ReplyPolicyConfig:
+    prompt_path: Path = DEFAULT_REPLY_PROMPT_PATH
+    timeout_seconds: float = 8.0
+    include_prompt_in_metadata: bool = True
 
 
 @dataclass(slots=True)
@@ -44,6 +69,15 @@ class ReplyPolicy:
     not re-parse the user message, call tools, or mutate state.
     """
 
+    def __init__(
+        self,
+        llm_client: ReplyDraftLLMClient | None = None,
+        config: ReplyPolicyConfig | None = None,
+    ) -> None:
+        self.llm_client = llm_client
+        self.config = config or ReplyPolicyConfig()
+        self._prompt_cache: str | None = None
+
     def draft(
         self,
         *,
@@ -60,6 +94,11 @@ class ReplyPolicy:
             tool_result=tool_result,
             state_transitions=state_transitions or [],
         )
+        if self.llm_client is not None:
+            llm_draft = self._draft_with_llm(data)
+            if llm_draft is not None:
+                return llm_draft
+
         action = validated_action.effective_action
         if action == ActionName.HUMAN_REVIEW:
             return self._draft("这个我先转人工确认一下。", data, "高风险或不确定，转人工。", risk=RiskLevel.HIGH)
@@ -78,6 +117,105 @@ class ReplyPolicy:
         if action == ActionName.CLOSE_GAME:
             return self._draft("收到，我先标记这桌需要处理。", data, validated_action.reason)
         return self._draft("我先确认一下。", data, f"未覆盖的有效动作：{action.value}")
+
+    def build_messages(self, data: ReplyPolicyInput) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": self._prompt_text()},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": "reply_draft_contract_v1",
+                        "input": self._llm_input_payload(data),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            },
+        ]
+
+    def _draft_with_llm(self, data: ReplyPolicyInput) -> ReplyDraft | None:
+        messages = self.build_messages(data)
+        trace_id = data.context.current_message.trace_id
+        try:
+            raw_output = self.llm_client.complete(
+                messages,
+                trace_id=trace_id,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+        except Exception:
+            return None
+        raw, parse_error = _parse_reply_contract(raw_output)
+        if parse_error:
+            return None
+        text = _optional_str(raw.get("text")) or _optional_str(raw.get("reply_text"))
+        if text is None:
+            return None
+        metadata: dict[str, Any] = {
+            "schema": "reply_draft_contract_v1",
+            "model_output": raw,
+            "effective_action": data.validated_action.effective_action.value,
+            "validation_code": data.validated_action.code,
+        }
+        if self.config.include_prompt_in_metadata:
+            metadata["prompt_messages"] = list(messages)
+        return ReplyDraft(
+            text=text,
+            status=ReplyStatus.NEEDS_APPROVAL if text else ReplyStatus.DRAFT,
+            reasoning_summary=_optional_str(raw.get("reasoning_summary")) or data.validated_action.reason,
+            source=ActionSource.LLM,
+            risk_level=_risk_from_raw(raw.get("risk_level"), default=data.validated_action.risk_level),
+            metadata=metadata,
+        )
+
+    def _prompt_text(self) -> str:
+        if self._prompt_cache is None:
+            self._prompt_cache = self.config.prompt_path.read_text(encoding="utf-8")
+        return self._prompt_cache
+
+    def _llm_input_payload(self, data: ReplyPolicyInput) -> dict[str, Any]:
+        return {
+            "current_message": data.context.current_message.to_prompt_dict(),
+            "previous_system_reply": data.context.previous_system_reply(),
+            "semantic_resolution": {
+                "intent": data.semantic_resolution.intent.value,
+                "proposed_action": data.semantic_resolution.proposed_action.name.value,
+                "confidence": data.semantic_resolution.proposed_action.confidence,
+                "reasoning_summary": data.semantic_resolution.reasoning_summary,
+                "game_requirement": data.semantic_resolution.game_requirement.to_prompt_dict(),
+            },
+            "validated_action": {
+                "effective_action": data.validated_action.effective_action.value,
+                "allowed": data.validated_action.allowed,
+                "code": data.validated_action.code,
+                "reason": data.validated_action.reason,
+                "missing_slots": list(data.validated_action.missing_slots),
+                "approval_required": data.validated_action.approval_required,
+                "risk_level": data.validated_action.risk_level.value,
+                "required_tools": [tool.value for tool in data.validated_action.required_tools],
+            },
+            "tool_results": [
+                {
+                    "tool_name": item.request.tool_name.value,
+                    "called": item.called,
+                    "allowed": item.allowed,
+                    "error": item.error,
+                    "result": dict(item.result),
+                }
+                for item in data.tool_result.tool_results
+            ],
+            "state_transitions": [
+                {
+                    "entity_type": item.entity_type,
+                    "entity_id": item.entity_id,
+                    "from_status": item.from_status,
+                    "to_status": item.to_status,
+                    "allowed": item.allowed,
+                    "reason": item.reason,
+                }
+                for item in data.state_transitions
+            ],
+        }
 
     def _draft(
         self,
@@ -142,3 +280,41 @@ class ReplyPolicy:
         if candidate_result and candidate_result.called and candidate_result.allowed:
             return "我先看下合适的人选。"
         return "我先确认一下。"
+
+
+def _parse_reply_contract(raw_output: str | dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    if isinstance(raw_output, dict):
+        return raw_output, None
+    text = str(raw_output or "").strip()
+    if not text:
+        return {}, "reply draft LLM returned empty output."
+    try:
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            return {}, "reply draft LLM JSON root is not an object."
+        return raw, None
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return {}, "reply draft LLM returned no JSON object."
+        try:
+            raw = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            return {}, f"reply draft LLM returned invalid JSON: {exc}"
+        if not isinstance(raw, dict):
+            return {}, "reply draft LLM JSON fragment is not an object."
+        return raw, None
+
+
+def _risk_from_raw(value: Any, *, default: RiskLevel) -> RiskLevel:
+    try:
+        return RiskLevel(str(value or default.value))
+    except ValueError:
+        return default
+
+
+def _optional_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
