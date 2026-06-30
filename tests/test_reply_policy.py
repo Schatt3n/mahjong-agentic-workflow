@@ -185,6 +185,21 @@ def test_reply_policy_clarification_asks_missing_slots_only() -> None:
     assert "烟况" not in draft.text
 
 
+def test_reply_guard_does_not_generate_business_clarification_text() -> None:
+    guarded = ReplyGuard().guard(
+        draft=ReplyDraft(text="现在没有合适的，要组一个吗？"),
+        validated_action=make_validated(
+            ActionName.ASK_CLARIFICATION,
+            missing_slots=["stake", "party_size"],
+            allowed=False,
+        ),
+        tool_result=ToolOrchestrationResult(),
+    )
+
+    assert guarded.changed is False
+    assert guarded.final_text == "现在没有合适的，要组一个吗？"
+
+
 def test_reply_guard_replaces_room_promise() -> None:
     guarded = ReplyGuard().guard(
         draft=ReplyDraft(text="好的，我给你留着。"),

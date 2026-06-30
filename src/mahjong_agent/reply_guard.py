@@ -40,11 +40,6 @@ class ReplyGuard:
             text = "我先确认一下房间情况。"
             reasons.append("没有房态确认结果，不能承诺留座或确认房间。")
 
-        if validated_action.missing_slots and validated_action.effective_action == ActionName.ASK_CLARIFICATION:
-            if "要组一个吗" in text:
-                text = " ".join(_question_for_missing(slot) for slot in validated_action.missing_slots[:3])
-                reasons.append("缺关键字段时不能回复无匹配局建局确认。")
-
         return GuardedReply(
             draft=draft,
             final_text=text,
@@ -59,15 +54,3 @@ class ReplyGuard:
             return False
         drafts = result.result.get("drafts")
         return isinstance(drafts, list) and bool(drafts)
-
-
-def _question_for_missing(slot: str) -> str:
-    mapping = {
-        "game_type": "打杭麻吗？",
-        "stake": "打多大？",
-        "start_time_mode": "大概什么时候开？",
-        "party_size": "你这边几个人？",
-        "smoke": "烟况有要求吗？",
-        "duration_mode": "大概要打多久？",
-    }
-    return mapping.get(slot, "我再确认一下？")
