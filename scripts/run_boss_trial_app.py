@@ -44,6 +44,7 @@ from mahjong_agent import (  # noqa: E402
     TrialControlledPersistenceAdapter,
     TrialControlledRequestBuilder,
     TrialControlledResponseAdapter,
+    TrialOutboxDeliveryAdapter,
     build_controlled_runtime,
 )
 from mahjong_agent.budget import usage_from_response  # noqa: E402
@@ -4557,86 +4558,19 @@ class BossTrialService:
         return result
 
     def send_outbox(self, payload: dict[str, Any]) -> dict[str, Any]:
-        trace_id = str(payload.get("trace_id") or make_trace_id())
-        now = parse_dt(payload.get("now")) or now_tz()
-        outbox_id = str(payload.get("outbox_id") or "").strip()
-        channel = str(payload.get("channel") or "manual").strip() or "manual"
-        item = self.store.outbox_item(outbox_id) if outbox_id else None
-        approval = item.get("approval") if isinstance(item, dict) and isinstance(item.get("approval"), dict) else {}
-        final_message = str(payload.get("message_text") or approval.get("final_message_text") or (item or {}).get("message_text") or "")
-        delivery_hash = hashlib.sha256(
-            json.dumps(
-                {"outbox_id": outbox_id, "channel": channel, "message_text": final_message},
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()[:16]
-        delivery_idempotency_key = f"delivery:{outbox_id}:{channel}:{delivery_hash}"
-        delivery_action_id = "act_" + hashlib.sha256(delivery_idempotency_key.encode("utf-8")).hexdigest()[:16]
-        allowed = bool(
-            item
-            and approval
-            and approval.get("status") == "approved"
-            and str(item.get("status") or "") in {"已审批", "已复制", "已发送"}
-        )
-        notes: list[str] = []
-        if not outbox_id:
-            notes.append("缺少 outbox_id。")
-        if not item:
-            notes.append("找不到 outbox。")
-        elif not approval or approval.get("status") != "approved":
-            notes.append("草稿尚未审批通过。")
-        elif str(item.get("status") or "") not in {"已审批", "已复制", "已发送"}:
-            notes.append(f"当前状态 {item.get('status')} 不能发送。")
-        action = self._workflow_state_action_record(
-            trace_id=trace_id,
-            stage="message_delivery",
-            action_name="execute_outbox_delivery",
-            arguments={
-                "outbox_id": outbox_id,
-                "channel": channel,
-                "message_hash": delivery_hash,
-            },
-            proposed_by="boss_manual",
-            source="delivery_gateway",
-            risk_level="high",
-            approval_required=True,
-            reason="审批通过后的外发动作必须经过发送网关、幂等和 delivery 账本。",
-            now=now,
-            validation={
-                "allowed": allowed,
-                "code": "delivery_allowed" if allowed else "delivery_rejected",
-                "reason": "审批已通过，允许执行受控发送。" if allowed else "发送动作未满足审批或状态条件。",
-                "notes": notes or ["发送动作会写入 message_delivery_attempts，并把 outbox 推进为已发送。"],
-            },
-            action_id=delivery_action_id,
-            idempotency_key=delivery_idempotency_key,
-        )
-        result = self._execute_controlled_action(
-            action,
-            lambda: self.store.execute_outbox_delivery(
-                {
-                    **payload,
-                    "trace_id": trace_id,
-                    "outbox_id": outbox_id,
-                    "channel": channel,
-                    "message_text": final_message,
-                    "idempotency_key": delivery_idempotency_key,
-                    "action_id": action["action_id"],
-                    "now": now.isoformat(),
-                }
-            ),
-        )
-        if result.get("ok") and not result.get("deduplicated"):
-            self.reload_customers()
-        game_id = ((result.get("outbox_item") or {}) if isinstance(result.get("outbox_item"), dict) else {}).get("game_id") or (item or {}).get("game_id")
-        if game_id:
-            self._cache_existing_game(str(game_id))
-        result["agent_actions"] = [
-            self._single_action_plan_view(stage="message_delivery", source="delivery_gateway", action=action)
-        ]
-        result["state"] = self.state(now=now)
-        return result
+        return TrialOutboxDeliveryAdapter(
+            outbox_lookup=self.store.outbox_item,
+            delivery_executor=self.store.execute_outbox_delivery,
+            action_record_factory=self._workflow_state_action_record,
+            action_executor=self._execute_controlled_action,
+            action_plan_projector=self._single_action_plan_view,
+            state_loader=lambda now: self.state(now=now),
+            trace_id_factory=make_trace_id,
+            now_factory=now_tz,
+            parse_datetime=parse_dt,
+            customer_reloader=self.reload_customers,
+            game_cache_updater=self._cache_existing_game,
+        ).send(payload)
 
     def approval_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
         return TrialApprovalDecisionAdapter(
