@@ -10,6 +10,9 @@ from typing import Any, Protocol
 from .models import DEFAULT_TZ
 
 
+CONTROLLED_TRACE_SCHEMA_VERSION = "controlled_trace.v1"
+
+
 class TraceStep(StrEnum):
     USER_INPUT = "user_input"
     CONTEXT_BUILT = "context_built"
@@ -23,6 +26,21 @@ class TraceStep(StrEnum):
     REPLY_GUARDED = "reply_guarded"
     FINAL_OUTPUT = "final_output"
     MEMORY_WRITTEN = "memory_written"
+
+
+CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS: tuple[TraceStep, ...] = (
+    TraceStep.USER_INPUT,
+    TraceStep.CONTEXT_BUILT,
+    TraceStep.LLM_PROMPT,
+    TraceStep.LLM_RESPONSE,
+    TraceStep.ACTION_PROPOSED,
+    TraceStep.ACTION_VALIDATED,
+    TraceStep.TOOL_CALLED,
+    TraceStep.STATE_TRANSITION,
+    TraceStep.REPLY_DRAFTED,
+    TraceStep.REPLY_GUARDED,
+    TraceStep.FINAL_OUTPUT,
+)
 
 
 @dataclass(slots=True)
@@ -40,6 +58,7 @@ class TraceEvent:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": CONTROLLED_TRACE_SCHEMA_VERSION,
             "trace_id": self.trace_id,
             "time": self.occurred_at.isoformat() if self.occurred_at else None,
             "step": self.step.value if isinstance(self.step, TraceStep) else str(self.step),
@@ -162,6 +181,45 @@ class JsonlTraceRecorder:
         return events
 
 
+@dataclass(slots=True)
+class TraceCompletenessReport:
+    trace_id: str
+    schema_version: str
+    complete: bool
+    required_steps: list[str]
+    present_steps: list[str]
+    missing_steps: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trace_id": self.trace_id,
+            "schema_version": self.schema_version,
+            "complete": self.complete,
+            "required_steps": list(self.required_steps),
+            "present_steps": list(self.present_steps),
+            "missing_steps": list(self.missing_steps),
+        }
+
+
+def validate_controlled_trace_completeness(
+    events: list[TraceEvent],
+    *,
+    required_steps: tuple[TraceStep, ...] = CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS,
+) -> TraceCompletenessReport:
+    trace_id = events[0].trace_id if events else ""
+    present = [_step_value(event.step) for event in events]
+    required = [step.value for step in required_steps]
+    missing = [step for step in required if step not in present]
+    return TraceCompletenessReport(
+        trace_id=trace_id,
+        schema_version=CONTROLLED_TRACE_SCHEMA_VERSION,
+        complete=not missing,
+        required_steps=required,
+        present_steps=present,
+        missing_steps=missing,
+    )
+
+
 def to_trace_payload(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -184,6 +242,10 @@ def to_trace_payload(value: Any) -> Any:
                 for field in fields(value)
             }
     return str(value)
+
+
+def _step_value(step: TraceStep | str) -> str:
+    return step.value if isinstance(step, TraceStep) else str(step)
 
 
 def _coerce_step(step: TraceStep | str) -> TraceStep | str:

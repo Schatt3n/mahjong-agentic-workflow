@@ -49,7 +49,17 @@ from .models import (
     RoomHoldStatus,
 )
 from .normalization import NormalizationChange, TextNormalizationResult, normalize_mahjong_text
-from .observability import InMemoryTraceRecorder, JsonlTraceRecorder, TraceEvent, TraceRecorder, TraceStep
+from .observability import (
+    CONTROLLED_TRACE_SCHEMA_VERSION,
+    CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS,
+    InMemoryTraceRecorder,
+    JsonlTraceRecorder,
+    TraceCompletenessReport,
+    TraceEvent,
+    TraceRecorder,
+    TraceStep,
+    validate_controlled_trace_completeness,
+)
 from .parser import MahjongMessageParser
 from .redis_cache import RedisCache, RedisCacheConfig, RedisCacheError
 from .reply_guard import ReplyGuard
@@ -172,11 +182,15 @@ __all__ = [
     "NormalizationChange",
     "TextNormalizationResult",
     "normalize_mahjong_text",
+    "CONTROLLED_TRACE_SCHEMA_VERSION",
+    "CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS",
     "InMemoryTraceRecorder",
     "JsonlTraceRecorder",
+    "TraceCompletenessReport",
     "TraceEvent",
     "TraceRecorder",
     "TraceStep",
+    "validate_controlled_trace_completeness",
     "AgentResponder",
     "ReplyAction",
     "ReplyDecision",

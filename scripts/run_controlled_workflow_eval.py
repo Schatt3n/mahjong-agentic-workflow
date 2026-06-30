@@ -27,6 +27,7 @@ from mahjong_agent import (  # noqa: E402
     WorkflowContextBuilder,
 )
 from mahjong_agent.memory import ShortTermMemoryRecord  # noqa: E402
+from mahjong_agent.observability import validate_controlled_trace_completeness  # noqa: E402
 from mahjong_agent.workflow_models import GameRequirement, SlotSource, SlotValue, ToolName, UserMessage  # noqa: E402
 
 
@@ -339,6 +340,10 @@ def validate_result(expected: dict[str, Any], result: Any) -> list[str]:
         for step in expected["trace_steps_contains"]:
             if step not in steps:
                 errors.append(f"trace missing step {step!r}")
+    if expected.get("trace_complete") is not None:
+        report = validate_controlled_trace_completeness(result.trace_events)
+        if bool(report.complete) != bool(expected["trace_complete"]):
+            errors.append(f"trace_complete={report.complete}, missing={report.missing_steps}")
     if expected.get("followup_response_type") is not None:
         followup = result.context_build.followup_context
         actual = followup.get("current_message_response_type")

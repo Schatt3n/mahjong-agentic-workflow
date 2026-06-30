@@ -9,7 +9,13 @@ from .context_builder import WorkflowContextBuildResult, WorkflowContextBuilder
 from .core import AgentCore
 from .memory import ShortTermMemoryRecord, ShortTermMemoryStore
 from .models import DEFAULT_TZ, Message
-from .observability import InMemoryTraceRecorder, TraceEvent, TraceRecorder, TraceStep
+from .observability import (
+    InMemoryTraceRecorder,
+    TraceEvent,
+    TraceRecorder,
+    TraceStep,
+    validate_controlled_trace_completeness,
+)
 from .reply_guard import ReplyGuard
 from .reply_policy import ReplyPolicy
 from .semantic_resolver import SemanticResolver
@@ -171,6 +177,18 @@ class ControlledWorkflowService:
                 now=effective_now,
             )
 
+        trace_before_final = self.trace_recorder.get_trace(effective_trace_id)
+        completeness = validate_controlled_trace_completeness(
+            [
+                *trace_before_final,
+                TraceEvent(
+                    trace_id=effective_trace_id,
+                    step=TraceStep.FINAL_OUTPUT,
+                    content={},
+                    occurred_at=effective_now,
+                ),
+            ]
+        )
         self._record(
             effective_trace_id,
             TraceStep.FINAL_OUTPUT,
@@ -180,6 +198,7 @@ class ControlledWorkflowService:
                 "approval_required": validated_action.approval_required,
                 "effective_action": validated_action.effective_action,
                 "validation_code": validated_action.code,
+                "trace_completeness": completeness.to_dict(),
             },
             now=effective_now,
         )

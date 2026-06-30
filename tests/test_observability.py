@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from mahjong_agent.observability import InMemoryTraceRecorder, JsonlTraceRecorder, TraceStep
+from mahjong_agent.observability import (
+    CONTROLLED_TRACE_SCHEMA_VERSION,
+    CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS,
+    InMemoryTraceRecorder,
+    JsonlTraceRecorder,
+    TraceStep,
+    validate_controlled_trace_completeness,
+)
 from mahjong_agent.workflow_models import ActionName, ActionSource, ProposedAction
 
 
@@ -55,6 +62,7 @@ def test_jsonl_trace_recorder_persists_structured_events(tmp_path) -> None:
     )
 
     text = path.read_text(encoding="utf-8")
+    assert f'"schema_version":"{CONTROLLED_TRACE_SCHEMA_VERSION}"' in text
     assert '"step":"final_output"' in text
     assert "trace_jsonl-2026-06-30 16:01:02-INFO:" in text
     assert "好的，我帮你问问。" in text
@@ -63,3 +71,18 @@ def test_jsonl_trace_recorder_persists_structured_events(tmp_path) -> None:
     assert len(loaded) == 1
     assert loaded[0].step == TraceStep.FINAL_OUTPUT
     assert loaded[0].content["final_text"] == "好的，我帮你问问。"
+
+
+def test_validate_controlled_trace_completeness_reports_missing_steps() -> None:
+    recorder = InMemoryTraceRecorder()
+    recorder.record("trace_partial", TraceStep.USER_INPUT, {"text": "老板"})
+    recorder.record("trace_partial", TraceStep.FINAL_OUTPUT, {"final_text": "收到"})
+
+    report = validate_controlled_trace_completeness(recorder.get_trace("trace_partial"))
+
+    assert report.schema_version == CONTROLLED_TRACE_SCHEMA_VERSION
+    assert report.complete is False
+    assert report.required_steps == [step.value for step in CONTROLLED_WORKFLOW_REQUIRED_TRACE_STEPS]
+    assert report.present_steps == ["user_input", "final_output"]
+    assert "context_built" in report.missing_steps
+    assert "reply_guarded" in report.missing_steps

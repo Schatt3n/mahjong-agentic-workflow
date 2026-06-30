@@ -9,7 +9,7 @@ from mahjong_agent.controlled_workflow import ControlledWorkflowService
 from mahjong_agent.core import AgentCore
 from mahjong_agent.memory import InMemoryShortTermMemoryStore, ShortTermMemoryRecord
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
-from mahjong_agent.observability import InMemoryTraceRecorder, TraceStep
+from mahjong_agent.observability import InMemoryTraceRecorder, TraceStep, validate_controlled_trace_completeness
 from mahjong_agent.semantic_resolver import SemanticResolver
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore
 from mahjong_agent.workflow_models import ActionName, GameRequirement, GameWorkflowStatus, SlotSource, SlotValue, ToolName, UserMessage
@@ -188,6 +188,11 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     assert TraceStep.REPLY_GUARDED in steps
     assert TraceStep.MEMORY_WRITTEN in steps
     assert TraceStep.FINAL_OUTPUT in steps
+    completeness = validate_controlled_trace_completeness(result.trace_events)
+    assert completeness.complete is True
+    final_event = next(event for event in result.trace_events if event.step == TraceStep.FINAL_OUTPUT)
+    assert final_event.content["trace_completeness"]["complete"] is True
+    assert final_event.content["trace_completeness"]["missing_steps"] == []
 
     prompt_event = next(event for event in result.trace_events if event.step == TraceStep.LLM_PROMPT)
     assert "semantic_resolution_contract_v1" in prompt_event.content["messages"][1]["content"]
