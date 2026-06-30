@@ -308,7 +308,9 @@ class ControlledWorkflowService:
         )
 
     def _record_reply_draft(self, trace_id: str, reply_draft: ReplyDraft, *, now: datetime) -> None:
-        self._record(trace_id, TraceStep.REPLY_DRAFTED, {"reply_draft": reply_draft}, now=now)
+        llm_contract = reply_draft.metadata.get("llm_contract") if isinstance(reply_draft.metadata, dict) else None
+        level = "WARN" if isinstance(llm_contract, dict) and llm_contract.get("accepted") is False else "INFO"
+        self._record(trace_id, TraceStep.REPLY_DRAFTED, {"reply_draft": reply_draft}, level=level, now=now)
 
     def _record_guarded_reply(self, trace_id: str, guarded_reply: GuardedReply, *, now: datetime) -> None:
         self._record(

@@ -245,6 +245,9 @@ def test_reply_policy_can_use_llm_contract_after_tool_results() -> None:
     assert draft.source == ActionSource.LLM
     assert draft.text == "好，我来问问。"
     assert draft.metadata["schema"] == "reply_draft_contract_v1"
+    assert draft.metadata["llm_contract"]["accepted"] is True
+    assert draft.metadata["llm_contract"]["strict_json"] is True
+    assert draft.metadata["llm_contract"]["raw_output"]["text"] == "好，我来问问。"
     payload = json.loads(client.calls[0]["messages"][1]["content"])
     assert payload["task"] == "reply_draft_contract_v1"
     assert payload["input"]["validated_action"]["effective_action"] == "queue_invites"
@@ -272,6 +275,11 @@ def test_reply_policy_falls_back_when_llm_contract_is_invalid() -> None:
 
     assert draft.source == ActionSource.RULES
     assert draft.text == "好的，我帮你问问。"
+    assert draft.metadata["llm_contract"]["accepted"] is False
+    assert draft.metadata["llm_contract"]["parse_error"] == (
+        "reply draft LLM output must be a single JSON object with no surrounding text."
+    )
+    assert draft.metadata["llm_contract"]["raw_output"] == "不是 JSON"
 
 
 def test_reply_policy_rejects_json_fragment_by_default() -> None:
@@ -294,6 +302,8 @@ def test_reply_policy_rejects_json_fragment_by_default() -> None:
 
     assert draft.source == ActionSource.RULES
     assert draft.text == "好的，我帮你问问。"
+    assert draft.metadata["llm_contract"]["accepted"] is False
+    assert draft.metadata["llm_contract"]["raw_output"].startswith("建议如下")
 
 
 def test_reply_policy_can_opt_into_legacy_json_fragment_extraction() -> None:

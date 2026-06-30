@@ -10,6 +10,7 @@ from mahjong_agent.core import AgentCore
 from mahjong_agent.memory import InMemoryShortTermMemoryStore, ShortTermMemoryRecord
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
 from mahjong_agent.observability import InMemoryTraceRecorder, TraceStep, validate_controlled_trace_completeness
+from mahjong_agent.reply_policy import ReplyPolicy
 from mahjong_agent.semantic_resolver import SemanticResolver
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore
 from mahjong_agent.workflow_models import ActionName, GameRequirement, GameWorkflowStatus, SlotSource, SlotValue, ToolName, UserMessage
@@ -31,6 +32,28 @@ class FakeSemanticLLMClient:
         trace_id: str,
         timeout_seconds: float,
     ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "messages": messages,
+                "trace_id": trace_id,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return self.output
+
+
+class FakeReplyLLMClient:
+    def __init__(self, output: str | dict[str, Any]) -> None:
+        self.output = output
+        self.calls: list[dict[str, Any]] = []
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        trace_id: str,
+        timeout_seconds: float,
+    ) -> str | dict[str, Any]:
         self.calls.append(
             {
                 "messages": messages,
@@ -341,3 +364,27 @@ def test_controlled_workflow_trace_line_uses_required_format() -> None:
     line = result.trace_events[0].format_log_line()
     assert line.startswith("trace_format-2026-06-30 16:00:00-INFO: ")
     assert '"text": "人齐开吧，有烟无烟都行"' in line
+
+
+def test_controlled_workflow_traces_rejected_reply_llm_contract() -> None:
+    core = AgentCore()
+    seed_customers(core)
+    reply_llm = FakeReplyLLMClient('建议如下：{"text":"好的，我帮你问问。"}')
+    service = ControlledWorkflowService(
+        core=core,
+        context_builder=WorkflowContextBuilder(core),
+        semantic_resolver=SemanticResolver(FakeSemanticLLMClient(complete_create_game_contract())),
+        reply_policy=ReplyPolicy(reply_llm),
+    )
+
+    result = service.handle_message(make_message(), now=NOW, trace_id="trace_reply_contract")
+
+    assert result.final_text == "好的，我帮你问问。"
+    reply_event = next(event for event in result.trace_events if event.step == TraceStep.REPLY_DRAFTED)
+    assert reply_event.level == "WARN"
+    contract = reply_event.content["reply_draft"]["metadata"]["llm_contract"]
+    assert contract["accepted"] is False
+    assert contract["strict_json"] is True
+    assert contract["raw_output"].startswith("建议如下")
+    assert "single JSON object" in contract["parse_error"]
+    assert reply_llm.calls[0]["trace_id"] == "trace_reply_contract"

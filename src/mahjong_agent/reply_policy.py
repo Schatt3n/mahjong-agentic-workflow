@@ -95,29 +95,41 @@ class ReplyPolicy:
             tool_result=tool_result,
             state_transitions=state_transitions or [],
         )
+        llm_contract: dict[str, Any] | None = None
         if self.llm_client is not None:
-            llm_draft = self._draft_with_llm(data)
+            llm_draft, llm_contract = self._draft_with_llm(data)
             if llm_draft is not None:
                 return llm_draft
 
         action = validated_action.effective_action
         if action == ActionName.HUMAN_REVIEW:
-            return self._draft("这个我先转人工确认一下。", data, "高风险或不确定，转人工。", risk=RiskLevel.HIGH)
+            return self._draft(
+                "这个我先转人工确认一下。",
+                data,
+                "高风险或不确定，转人工。",
+                risk=RiskLevel.HIGH,
+                llm_contract=llm_contract,
+            )
         if action == ActionName.IGNORE:
-            return self._draft("", data, "无需回复。", status=ReplyStatus.DRAFT)
+            return self._draft("", data, "无需回复。", status=ReplyStatus.DRAFT, llm_contract=llm_contract)
         if action == ActionName.ASK_CLARIFICATION:
-            return self._draft(self._clarification_text(validated_action.missing_slots), data, validated_action.reason)
+            return self._draft(
+                self._clarification_text(validated_action.missing_slots),
+                data,
+                validated_action.reason,
+                llm_contract=llm_contract,
+            )
         if action == ActionName.ASK_CREATE_CONFIRMATION:
-            return self._draft("现在没有合适的，要组一个吗？", data, validated_action.reason)
+            return self._draft("现在没有合适的，要组一个吗？", data, validated_action.reason, llm_contract=llm_contract)
         if action == ActionName.MATCH_EXISTING_GAME:
-            return self._draft(self._existing_game_text(tool_result), data, validated_action.reason)
+            return self._draft(self._existing_game_text(tool_result), data, validated_action.reason, llm_contract=llm_contract)
         if action == ActionName.QUEUE_INVITES:
-            return self._draft(self._queue_invites_text(tool_result), data, validated_action.reason)
+            return self._draft(self._queue_invites_text(tool_result), data, validated_action.reason, llm_contract=llm_contract)
         if action == ActionName.ACCEPT_SEAT:
-            return self._draft("好的，先帮你确认这桌。", data, validated_action.reason)
+            return self._draft("好的，先帮你确认这桌。", data, validated_action.reason, llm_contract=llm_contract)
         if action == ActionName.CLOSE_GAME:
-            return self._draft("收到，我先标记这桌需要处理。", data, validated_action.reason)
-        return self._draft("我先确认一下。", data, f"未覆盖的有效动作：{action.value}")
+            return self._draft("收到，我先标记这桌需要处理。", data, validated_action.reason, llm_contract=llm_contract)
+        return self._draft("我先确认一下。", data, f"未覆盖的有效动作：{action.value}", llm_contract=llm_contract)
 
     def build_messages(self, data: ReplyPolicyInput) -> list[dict[str, str]]:
         return [
@@ -135,7 +147,7 @@ class ReplyPolicy:
             },
         ]
 
-    def _draft_with_llm(self, data: ReplyPolicyInput) -> ReplyDraft | None:
+    def _draft_with_llm(self, data: ReplyPolicyInput) -> tuple[ReplyDraft | None, dict[str, Any] | None]:
         messages = self.build_messages(data)
         trace_id = data.context.current_message.trace_id
         try:
@@ -144,20 +156,40 @@ class ReplyPolicy:
                 trace_id=trace_id,
                 timeout_seconds=self.config.timeout_seconds,
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, self._llm_contract_audit(
+                messages=messages,
+                accepted=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         raw, parse_error = _parse_reply_contract(
             raw_output,
             allow_json_fragment_extraction=self.config.allow_json_fragment_extraction,
         )
         if parse_error:
-            return None
+            return None, self._llm_contract_audit(
+                messages=messages,
+                accepted=False,
+                parse_error=parse_error,
+                raw_output=raw_output,
+            )
         text = _optional_str(raw.get("text")) or _optional_str(raw.get("reply_text"))
         if text is None:
-            return None
+            return None, self._llm_contract_audit(
+                messages=messages,
+                accepted=False,
+                parse_error="reply draft LLM contract missing required text field.",
+                raw_output=raw,
+            )
+        llm_contract = self._llm_contract_audit(
+            messages=messages,
+            accepted=True,
+            raw_output=raw,
+        )
         metadata: dict[str, Any] = {
             "schema": "reply_draft_contract_v1",
             "model_output": raw,
+            "llm_contract": llm_contract,
             "effective_action": data.validated_action.effective_action.value,
             "validation_code": data.validated_action.code,
         }
@@ -170,7 +202,7 @@ class ReplyPolicy:
             source=ActionSource.LLM,
             risk_level=_risk_from_raw(raw.get("risk_level"), default=data.validated_action.risk_level),
             metadata=metadata,
-        )
+        ), llm_contract
 
     def _prompt_text(self) -> str:
         if self._prompt_cache is None:
@@ -229,37 +261,66 @@ class ReplyPolicy:
         *,
         status: ReplyStatus = ReplyStatus.NEEDS_APPROVAL,
         risk: RiskLevel | None = None,
+        llm_contract: dict[str, Any] | None = None,
     ) -> ReplyDraft:
+        metadata: dict[str, Any] = {
+            "effective_action": data.validated_action.effective_action.value,
+            "validation_code": data.validated_action.code,
+            "tool_results": [
+                {
+                    "tool_name": item.request.tool_name.value,
+                    "called": item.called,
+                    "allowed": item.allowed,
+                    "error": item.error,
+                }
+                for item in data.tool_result.tool_results
+            ],
+            "state_transitions": [
+                {
+                    "entity_type": item.entity_type,
+                    "entity_id": item.entity_id,
+                    "from_status": item.from_status,
+                    "to_status": item.to_status,
+                    "allowed": item.allowed,
+                }
+                for item in data.state_transitions
+            ],
+        }
+        if llm_contract is not None:
+            metadata["llm_contract"] = llm_contract
         return ReplyDraft(
             text=text,
             status=status,
             reasoning_summary=reasoning_summary,
             source=ActionSource.RULES,
             risk_level=risk or data.validated_action.risk_level,
-            metadata={
-                "effective_action": data.validated_action.effective_action.value,
-                "validation_code": data.validated_action.code,
-                "tool_results": [
-                    {
-                        "tool_name": item.request.tool_name.value,
-                        "called": item.called,
-                        "allowed": item.allowed,
-                        "error": item.error,
-                    }
-                    for item in data.tool_result.tool_results
-                ],
-                "state_transitions": [
-                    {
-                        "entity_type": item.entity_type,
-                        "entity_id": item.entity_id,
-                        "from_status": item.from_status,
-                        "to_status": item.to_status,
-                        "allowed": item.allowed,
-                    }
-                    for item in data.state_transitions
-                ],
-            },
+            metadata=metadata,
         )
+
+    def _llm_contract_audit(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        accepted: bool,
+        raw_output: Any | None = None,
+        parse_error: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        audit: dict[str, Any] = {
+            "schema": "reply_draft_contract_v1",
+            "attempted": True,
+            "accepted": accepted,
+            "strict_json": not self.config.allow_json_fragment_extraction,
+        }
+        if raw_output is not None:
+            audit["raw_output"] = raw_output
+        if parse_error:
+            audit["parse_error"] = parse_error
+        if error:
+            audit["error"] = error
+        if self.config.include_prompt_in_metadata:
+            audit["prompt_messages"] = list(messages)
+        return audit
 
     def _clarification_text(self, missing_slots: list[str]) -> str:
         questions = [MISSING_SLOT_QUESTIONS.get(slot, f"{slot} 再确认一下？") for slot in missing_slots[:3]]
