@@ -52,6 +52,7 @@ from mahjong_agent import (  # noqa: E402
     TrialControlledPersistenceAdapter,
     TrialControlledRequestBuilder,
     TrialControlledResponseAdapter,
+    TrialManualGameAdapter,
     TrialOutboxDeliveryAdapter,
     TrialOrganizerFollowupAdapter,
     build_controlled_runtime,
@@ -5357,115 +5358,22 @@ class BossTrialService:
         return {**followup, "approval": approval, "approval_status": approval_status_label(approval.get("status"))}
 
     def manual_create_game(self, payload: dict[str, Any]) -> dict[str, Any]:
-        trace_id = str(payload.get("trace_id") or make_trace_id())
-        now = parse_dt(payload.get("now")) or now_tz()
-        organizer_id = str(payload.get("organizer_id") or "boss_manual").strip() or "boss_manual"
-        organizer_name = str(payload.get("organizer_name") or "老板手动创建").strip() or "老板手动创建"
-        game_id = str(payload.get("game_id") or f"manual_{hashlib.sha256(f'manual-game:{trace_id}'.encode('utf-8')).hexdigest()[:12]}")
-        game_type = self._manual_game_type(payload)
-        game_label = GAME_TYPE_LABELS.get(game_type, "杭麻")
-        variant = str(payload.get("variant") or "").strip() or None
-        variant_label = VARIANT_LABELS.get(variant or "", variant)
-        level = str(payload.get("level") or "").strip()
-        if not level:
-            raise ValueError("手动创建局需要填写档位")
-        start_at = self._manual_start_at(payload, now)
-        if start_at is None:
-            raise ValueError("手动创建局需要填写开局时间")
-        current_player_count, missing_count = self._manual_player_counts(payload)
-        rules = self._manual_rules(payload, game_label, variant_label)
-        duration_hours = self._safe_float(payload.get("duration_hours"))
-        if duration_hours is None or duration_hours <= 0:
-            raise ValueError("手动创建局需要填写预计时长")
-        source_text = str(payload.get("source_text") or "").strip()
-        if not source_text:
-            source_text = self._manual_source_text(game_label, level, start_at, missing_count, rules)
-        status = str(payload.get("status") or "").strip() or ("已满" if missing_count <= 0 else "待组局")
-        if status not in ACTIVE_GAME_STATUSES and status not in FINAL_GAME_STATUSES and status != "已满":
-            status = "待组局"
-        parsed = {
-            "id": game_id,
-            "status": "open" if status not in FINAL_GAME_STATUSES else "closed",
-            "game_type": game_type,
-            "game_label": " ".join(part for part in [game_label, variant_label] if part),
-            "ruleset": game_type,
-            "variant": variant,
-            "variant_label": variant_label,
-            "level": level,
-            "base_score": self._safe_float(level) if "-" not in level else None,
-            "cap_score": None,
-            "start_at": start_at.isoformat(),
-            "start_time": start_at.strftime("%H:%M"),
-            "duration_hours": duration_hours,
-            "current_player_count": current_player_count,
-            "missing_count": missing_count,
-            "rules": rules,
-            "play_options": [variant_label] if variant_label else [],
-            "ambiguities": [],
-            "notes": ["老板手动创建，用于电话/线下消息等非文本入口"],
-            "summary": self._manual_summary(game_label, variant_label, level, start_at, missing_count, rules),
-            "intent_action": "manual_create_game",
-            "user_intent": "老板手动创建局",
-        }
-        action = self._workflow_state_action_record(
-            trace_id=trace_id,
-            stage="manual_create_game",
-            action_name="create_game",
-            arguments={
-                "game_id": game_id,
-                "status": status,
-                "organizer_id": organizer_id,
-                "organizer_name": organizer_name,
-                "start_at": start_at.isoformat(),
-                "level": level,
-                "current_player_count": current_player_count,
-                "missing_count": missing_count,
-                "duration_hours": duration_hours,
-                "rules": rules,
-            },
-            proposed_by="boss_manual",
-            source="boss_manual",
-            risk_level="medium",
-            approval_required=True,
-            reason="老板手动创建局，用于电话、线下口头消息等非文本入口。",
-            now=now,
-            validation={
-                "allowed": True,
-                "code": "manual_approved",
-                "reason": "老板手动创建局，视为已审批。",
-                "notes": ["内部看板写入，不会自动外发消息。"],
-            },
-        )
-        create_result = self._execute_controlled_action(
-            action,
-            lambda: self._manual_create_game_state_write(
-                game_id=game_id,
-                status=status,
-                organizer_id=organizer_id,
-                organizer_name=organizer_name,
-                source_text=source_text,
-                parsed=parsed,
-                notes=[
-                    *parsed["notes"],
-                    {
-                        "kind": "controlled_action",
-                        "action": self._compact_action_record(action),
-                    },
-                ],
-            ),
-        )
-        if create_result.get("ok"):
-            self._cache_existing_game(game_id)
-        created = next((item for item in self.store.games(include_final=True) if item.get("id") == game_id), None)
-        return {
-            "ok": bool(create_result.get("ok")),
-            "deduplicated": bool(create_result.get("deduplicated")),
-            "game": created or {"id": game_id, "parsed": parsed},
-            "agent_actions": [
-                self._single_action_plan_view(stage="manual_create_game", source="boss_manual", action=action)
-            ],
-            "state": self.state(now=now),
-        }
+        return TrialManualGameAdapter(
+            action_record_factory=self._workflow_state_action_record,
+            action_executor=self._execute_controlled_action,
+            action_plan_projector=self._single_action_plan_view,
+            game_state_writer=self._manual_create_game_state_write,
+            game_lookup=self._game_by_id,
+            state_loader=lambda now: self.state(now=now),
+            trace_id_factory=make_trace_id,
+            now_factory=now_tz,
+            parse_datetime=parse_dt,
+            timezone=TZ,
+            action_compactor=self._compact_action_record,
+            active_game_statuses=set(ACTIVE_GAME_STATUSES),
+            final_game_statuses=set(FINAL_GAME_STATUSES),
+            game_cache_updater=self._cache_existing_game,
+        ).create(payload)
 
     def _manual_create_game_state_write(
         self,
@@ -5491,125 +5399,19 @@ class BossTrialService:
         )
         return {"ok": True, "game_id": game_id, "status": status}
 
-    def _manual_game_type(self, payload: dict[str, Any]) -> str:
-        raw = str(payload.get("game_type") or payload.get("game_label") or "hangzhou_mahjong").strip()
-        mapping = {
-            "杭麻": "hangzhou_mahjong",
-            "财敲": "hangzhou_mahjong",
-            "川麻": "sichuan_mahjong",
-            "四川麻将": "sichuan_mahjong",
-            "红中": "hongzhong_mahjong",
-            "红中麻将": "hongzhong_mahjong",
-            "捉鸡": "zhuoji_mahjong",
-            "湖南麻将": "hunan_mahjong",
-        }
-        return mapping.get(raw, raw if raw in GAME_TYPE_LABELS else "hangzhou_mahjong")
-
-    def _manual_start_at(self, payload: dict[str, Any], now: datetime) -> datetime | None:
-        explicit = parse_dt(str(payload.get("start_at") or ""))
-        if explicit:
-            return explicit
-        raw = str(payload.get("start_time") or "").strip()
-        match = re.search(r"(\d{1,2})[:：](\d{1,2})", raw)
-        if not match:
-            match = re.search(r"(\d{1,2})\s*点(?:半|(\d{1,2})分?)?", raw)
-        if not match:
-            return None
-        hour = int(match.group(1))
-        minute_text = match.group(2)
-        minute = 30 if "半" in raw and minute_text is None else int(minute_text or 0)
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            return None
-        candidate = datetime(now.year, now.month, now.day, hour, minute, tzinfo=TZ)
-        if candidate < now - timedelta(minutes=30):
-            candidate += timedelta(days=1)
-        return candidate
-
-    def _manual_player_counts(self, payload: dict[str, Any]) -> tuple[int, int]:
-        current = self._safe_int(payload.get("current_player_count"))
-        missing = self._safe_int(payload.get("missing_count"))
-        if current is None and missing is None:
-            current, missing = 3, 1
-        elif current is None:
-            missing = max(0, min(4, missing or 0))
-            current = max(0, 4 - missing)
-        elif missing is None:
-            current = max(0, min(4, current))
-            missing = max(0, 4 - current)
-        else:
-            current = max(0, min(4, current))
-            missing = max(0, min(4, missing))
-        return current, missing
-
-    def _manual_rules(self, payload: dict[str, Any], game_label: str, variant_label: str | None) -> list[str]:
-        rules = [game_label]
-        if variant_label:
-            rules.append(variant_label)
-        smoke = str(payload.get("smoke") or payload.get("smoke_preference") or "").strip()
-        smoke_mapping = {
-            "no_smoke": "无烟",
-            "无烟": "无烟",
-            "smoke_ok": "可吸烟",
-            "有烟": "可吸烟",
-            "可吸烟": "可吸烟",
-            "any": "烟况都可",
-            "都可": "烟况都可",
-            "烟况都可": "烟况都可",
-        }
-        smoke_rule = smoke_mapping.get(smoke)
-        if smoke_rule:
-            rules.append(smoke_rule)
-        extra = payload.get("rules") or []
-        if isinstance(extra, str):
-            extra = re.split(r"[,，、\s]+", extra)
-        for item in extra:
-            value = str(item or "").strip()
-            if value:
-                rules.append(value)
-        return self._unique_strings(rules)
-
-    def _manual_source_text(
-        self,
-        game_label: str,
-        level: str,
-        start_at: datetime,
-        missing_count: int,
-        rules: list[str],
-    ) -> str:
-        return "老板手动创建：" + self._manual_summary(game_label, None, level, start_at, missing_count, rules)
-
-    def _manual_summary(
-        self,
-        game_label: str,
-        variant_label: str | None,
-        level: str,
-        start_at: datetime,
-        missing_count: int,
-        rules: list[str],
-    ) -> str:
-        label = " ".join(part for part in [game_label, variant_label] if part)
-        parts = [
-            label,
-            f"{level}档" if level else "",
-            start_at.strftime("%H:%M"),
-            f"缺{missing_count}",
-            self._smoke_text_from_rules(rules),
-        ]
-        return " ".join(part for part in parts if part)
-
-    def _safe_int(self, value: Any) -> int | None:
-        if value in (None, ""):
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
     def _safe_float(self, value: Any) -> float | None:
         if value in (None, ""):
             return None
         try:
             return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_int(self, value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(float(value))
         except (TypeError, ValueError):
             return None
 

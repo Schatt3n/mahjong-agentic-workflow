@@ -116,6 +116,7 @@ src/mahjong_agent/
 - `approval.py` 已新增 `PendingOutboxApprovalService`，作为老板人工审批的受控入口：使用 `ToolExecutionLedger` 记录 `record_approval_decision`，支持审批禁用策略、幂等重试、终态冲突拦截和老板改写最终文案；它不调用 LLM，也不触发真实发送。
 - `trial_approval.py` 已新增 `TrialApprovalDecisionAdapter`，把试用台 `/api/approval-decision` 的 payload 解析、受控 action 记录、执行委托和响应投影移出 `scripts/run_boss_trial_app.py`；当前仍写 legacy `approval_requests/outbox` 表，作为迁移期持久化桥接，后续可切换为 runtime 暴露的 `PendingOutboxApprovalService`。
 - `trial_delivery.py` 已新增 `TrialOutboxDeliveryAdapter`，把试用台 `/api/send-outbox` 的发送前校验、delivery 幂等键、受控 action 记录、执行委托和响应投影移出脚本；当前仍写 legacy `message_delivery_attempts/outbox/feedback` 表，后续应切到独立发送网关。
+- `trial_manual_game.py` 已新增 `TrialManualGameAdapter`，把老板电话/线下手动建局入口的 payload 解析、局 parsed 物化、受控 `create_game` action、幂等执行委托和响应投影移出脚本；当前仍通过脚本注入 legacy SQLite 写入回调，后续可接入统一 `StateMachine`/`WorkflowStateStore`。
 - `trial_candidate.py` 已新增 `TrialCandidateMessageAdapter`，把试用台 `/api/candidate-message` 的请求解析、候选人语义提案调用、状态写入委托、followup 合并和响应投影移出脚本。
 - `candidate_semantics.py` 已新增 `CandidateSemanticProposalAdapter`、`CandidateSemanticProposalResult` 和 `CandidateSemanticResolverService`，把候选人回复的 LLM/fallback 语义提案收敛成单一 contract：模型只提出 `semantic_type/proposed_action/reply_text/confidence/reasoning_summary`，后端 validator 再决定是否允许写状态；候选人 `semantic_type/proposed_action/feedback_type` 的白名单、别名映射、LLM prompt、候选人上下文 payload 和提案归一化都已从脚本移入 contract 层。
 - `candidate_reply_facts.py` 已新增 `CandidateReplyFactService`，把候选人回复的安全降级分类、改时间/改时长本地探测、自然时间标签和 LLM `extracted_facts` 合并从脚本移出；它不调用 LLM、不写库、不发消息，只为 semantic fallback 和 validator 提供事实解析。
