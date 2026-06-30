@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from mahjong_agent.action_validator import ActionValidator
-from mahjong_agent.state_machine import InMemoryWorkflowStateStore, StateMachine
+from mahjong_agent.state_machine import InMemoryWorkflowStateStore, SQLiteWorkflowStateStore, StateMachine
 from mahjong_agent.workflow_models import (
     ActionName,
     ActionSource,
@@ -248,3 +248,49 @@ def test_workflow_state_store_applies_and_audits_transitions() -> None:
     assert stale.allowed is False
     assert stale.metadata["store_rejected_reason"] == "state_store_status_mismatch"
     assert len(store.transition_history(entity_type="game", entity_id="game_1")) == 3
+
+
+def test_sqlite_workflow_state_store_persists_status_and_history(tmp_path) -> None:
+    machine = StateMachine()
+    path = tmp_path / "workflow_state.sqlite3"
+    store = SQLiteWorkflowStateStore(path)
+
+    opened = store.apply_transition(
+        machine.validate_game_transition(
+            entity_id="game_sqlite",
+            from_status=None,
+            to_status=GameWorkflowStatus.OPEN,
+            reason="create pending game",
+        )
+    )
+    negotiating = store.apply_transition(
+        machine.validate_game_transition(
+            entity_id="game_sqlite",
+            from_status=GameWorkflowStatus.OPEN,
+            to_status=GameWorkflowStatus.NEGOTIATING,
+            reason="pending outbox created",
+        )
+    )
+
+    reloaded = SQLiteWorkflowStateStore(path)
+    stale = reloaded.apply_transition(
+        machine.validate_game_transition(
+            entity_id="game_sqlite",
+            from_status=GameWorkflowStatus.OPEN,
+            to_status=GameWorkflowStatus.CANCELLED,
+            reason="stale close attempt",
+        )
+    )
+    history = reloaded.transition_history(entity_type="game", entity_id="game_sqlite")
+
+    assert opened.metadata["store_backend"] == "sqlite"
+    assert negotiating.metadata["store_applied"] is True
+    assert reloaded.current_status("game", "game_sqlite") == GameWorkflowStatus.NEGOTIATING.value
+    assert stale.allowed is False
+    assert stale.metadata["store_rejected_reason"] == "state_store_status_mismatch"
+    assert [item.to_status for item in history] == [
+        GameWorkflowStatus.OPEN.value,
+        GameWorkflowStatus.NEGOTIATING.value,
+        GameWorkflowStatus.CANCELLED.value,
+    ]
+    assert history[-1].allowed is False

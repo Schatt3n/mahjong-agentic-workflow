@@ -71,6 +71,7 @@ from .signals import IntentEvidence, extract_intent_evidence, message_for_intent
 from .state_machine import (
     STATE_MACHINE_VERSION as CONTROLLED_STATE_MACHINE_VERSION,
     InMemoryWorkflowStateStore,
+    SQLiteWorkflowStateStore,
     StateMachine,
     WorkflowStateStore,
 )
@@ -202,6 +203,7 @@ __all__ = [
     "SemanticResolverConfig",
     "CONTROLLED_STATE_MACHINE_VERSION",
     "InMemoryWorkflowStateStore",
+    "SQLiteWorkflowStateStore",
     "StateMachine",
     "WorkflowStateStore",
     "InMemoryToolExecutionLedger",

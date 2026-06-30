@@ -15,7 +15,7 @@ from .observability import JsonlTraceRecorder, TraceRecorder
 from .reply_guard import ReplyGuard
 from .reply_policy import ReplyDraftLLMClient, ReplyPolicy
 from .semantic_resolver import SemanticLLMClient, SemanticResolver, SemanticResolverConfig
-from .state_machine import InMemoryWorkflowStateStore, StateMachine, WorkflowStateStore
+from .state_machine import InMemoryWorkflowStateStore, SQLiteWorkflowStateStore, StateMachine, WorkflowStateStore
 from .tool_orchestrator import InMemoryToolExecutionLedger, ToolExecutionLedger, ToolOrchestrator, ToolOrchestratorConfig
 
 
@@ -26,6 +26,7 @@ DEFAULT_TRACE_PATH = ROOT / "logs" / "controlled_workflow_trace.jsonl"
 @dataclass(slots=True)
 class ControlledRuntimeConfig:
     trace_jsonl_path: Path = DEFAULT_TRACE_PATH
+    state_sqlite_path: Path | None = None
     short_memory_ttl_seconds: int = 30 * 60
     short_memory_max_records: int = 20
     llm_timeout_seconds: float | None = None
@@ -35,6 +36,9 @@ class ControlledRuntimeConfig:
     def from_env(cls) -> "ControlledRuntimeConfig":
         return cls(
             trace_jsonl_path=Path(os.getenv("MAHJONG_TRACE_JSONL_PATH", str(DEFAULT_TRACE_PATH))),
+            state_sqlite_path=Path(os.environ["MAHJONG_STATE_SQLITE_PATH"])
+            if os.getenv("MAHJONG_STATE_SQLITE_PATH")
+            else None,
             short_memory_ttl_seconds=int(os.getenv("MAHJONG_SHORT_MEMORY_TTL_SECONDS", str(30 * 60))),
             short_memory_max_records=int(os.getenv("MAHJONG_SHORT_MEMORY_MAX_RECORDS", "20")),
             llm_timeout_seconds=_env_float("MAHJONG_LLM_TIMEOUT_SECONDS"),
@@ -89,7 +93,7 @@ def build_controlled_runtime(
         ttl_seconds=runtime_config.short_memory_ttl_seconds,
         max_records_per_scope=runtime_config.short_memory_max_records,
     )
-    workflow_state_store = state_store or InMemoryWorkflowStateStore()
+    workflow_state_store = state_store or _state_store_from_config(runtime_config)
     workflow_tool_ledger = tool_ledger or InMemoryToolExecutionLedger()
     semantic_client = llm_client or _llm_client_from_env(recorder, runtime_config, stage_name="semantic")
     reply_client = reply_llm_client
@@ -168,6 +172,12 @@ def _optional_llm_client_from_env(
         ),
         stage_name=stage_name,
     )
+
+
+def _state_store_from_config(config: ControlledRuntimeConfig) -> WorkflowStateStore:
+    if config.state_sqlite_path is not None:
+        return SQLiteWorkflowStateStore(config.state_sqlite_path)
+    return InMemoryWorkflowStateStore()
 
 
 def _env_bool(name: str, default: bool) -> bool:

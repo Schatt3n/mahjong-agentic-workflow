@@ -110,7 +110,7 @@ src/mahjong_agent/
 - `tool_orchestrator.py` 和 `tools/` 已新增，负责按 `ValidatedAction.required_tools` 执行受控工具；副作用工具当前只创建待审批结果，不直接外发。
 - `tool_orchestrator.py` 已新增 `ToolExecutionLedger` 协议和 `InMemoryToolExecutionLedger`，只读工具可重复执行，`create_pending_outbox` 等副作用工具按后端生成的 idempotency key 复用结果，防止重试时重复创建草稿。
 - `reply_policy.py`、`reply_guard.py` 和 `prompts/reply_draft.md` 已新增，负责基于最终动作和工具结果生成回复草稿并做安全一致性检查；`ReplyPolicy` 已支持可选 `reply_draft_contract_v1` 模型调用，模型只生成结构化回复草稿，后端仍负责工具、状态和 guard。
-- `state_machine.py` 已新增 `WorkflowStateStore` 协议和 `InMemoryWorkflowStateStore`，受控链路会把允许的状态迁移应用到账本；后续 SQLite/Redis 落库应实现同一接口，而不是把状态写回 `ControlledWorkflowService`。
+- `state_machine.py` 已新增 `WorkflowStateStore` 协议、`InMemoryWorkflowStateStore` 和 `SQLiteWorkflowStateStore`；受控链路会把允许的状态迁移应用到账本，本地生产可通过 `MAHJONG_STATE_SQLITE_PATH` 启用 SQLite 状态落库，后续 Redis/PostgreSQL 也应实现同一接口。
 - `observability.py` 已新增 `controlled_trace.v1` contract、受控链路必需 trace step 列表和完整性校验函数；`final_output` 会携带 `trace_completeness`，回归评估可直接断言每轮链路是否可回放。
 - `scripts/run_evals.py` 已新增，统一运行当前场景评估和 boss trial golden 回归。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
