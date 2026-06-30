@@ -17,6 +17,7 @@
 - 发现系统回复明显不对：先写入 `badcases/badcases.jsonl`。
 - 发现真实老板表达方式很常见，但当前评估集没有覆盖：写入 `badcases/badcases.jsonl`，修复后提升到 `golden/scenario_golden.jsonl` 或 `regression/`。
 - 修复一个 badcase 后：把稳定预期整理成 golden case，并保留原 badcase 的 `source_scenario_id` 或备注。
+- 标记 `triage_status=fixed` 的 badcase 必须补 `regression_refs`，指向 `boss_trial_golden`、`scenario_golden`、`controlled_workflow_regression` 或具体 `pytest` 用例；`scripts/run_evals.py` 会运行 `scripts/check_badcase_regression_coverage.py` 审计这些引用，防止 fixed badcase 只停留在日志里。
 - 新增玩法、规则、通道、状态机能力时：同步补 golden case，避免后续改坏。
 - 发现“页面建议回复/老板话术/候选展示”这类试用台问题：先写入 `badcases/badcases.jsonl`，修复后补到 `golden/boss_trial_golden.jsonl`，并让 `scripts/run_tests.py` 跑过。
 - 老板确认某句回复“像我会说的话”：写入 `few_shot_examples.jsonl`，用于改善后续回复风格。
@@ -72,6 +73,8 @@ PYTHONPATH=src python scripts/run_controlled_workflow_eval.py
 ```bash
 PYTHONPATH=src python scripts/run_evals.py
 ```
+
+`run_evals.py` 会依次运行场景 golden、受控工作流 regression、fixed badcase 回归覆盖审计，以及评估集结构测试。真正的 `pytest` 回归用例仍由 `PYTHONPATH=src pytest -q` 统一执行。
 
 使用指定数据集：
 

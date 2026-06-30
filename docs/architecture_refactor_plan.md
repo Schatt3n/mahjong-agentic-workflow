@@ -140,6 +140,7 @@ src/mahjong_agent/
 - `state_machine.py` 已新增 `WorkflowStateStore` 协议、`InMemoryWorkflowStateStore` 和 `SQLiteWorkflowStateStore`；受控链路会把允许的状态迁移应用到账本，本地生产可通过 `MAHJONG_STATE_SQLITE_PATH` 启用 SQLite 状态落库，后续 Redis/PostgreSQL 也应实现同一接口。
 - `observability.py` 已新增 `controlled_trace.v1` contract、受控链路必需 trace step 列表和完整性校验函数；`final_output` 会携带 `trace_completeness`，回归评估可直接断言每轮链路是否可回放。
 - `scripts/run_evals.py` 已新增，统一运行当前场景评估和 boss trial golden 回归。
+- `scripts/check_badcase_regression_coverage.py` 已新增并接入 `scripts/run_evals.py`：所有 `triage_status=fixed` 的 badcase 必须声明 `regression_refs`，并指向存在的 golden、controlled regression 或 pytest 用例；`triage_status=new` 的 badcase 保留为待处理队列，不作为发布阻塞。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
 - 受控工作流接入试用台已拆成 `TrialControlledEntryAdapter`、`trial_projection.py`、`TrialControlledPersistenceAdapter`、`TrialControlledResponseAdapter` 几层迁移桥接，用于证明 `HTTP 输入 -> Message -> LLM contract -> ActionValidator -> ToolOrchestrator -> StateMachine -> 待审批 outbox` 可以闭环；后续应继续把试用台脚本收缩为 HTTP/UI 壳。
 - 试用台 `/api/analyze` 默认走受控工作流；如需对照旧链路，可显式传 `use_controlled_workflow=false`，或设置 `MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW=0`。这保证日常老板试用和回归测试优先验证目标架构，而不是继续落到 legacy `BossTrialService.analyze()`。
