@@ -61,6 +61,7 @@ from .signals import IntentEvidence, extract_intent_evidence, message_for_intent
 from .state_machine import STATE_MACHINE_VERSION as CONTROLLED_STATE_MACHINE_VERSION, StateMachine
 from .tool_orchestrator import ToolOrchestrationResult, ToolOrchestrator, ToolOrchestratorConfig
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
+from .trial_projection import project_controlled_result_for_trial
 from .workflow_models import (
     ActionName,
     ActionSource,
@@ -170,6 +171,7 @@ __all__ = [
     "CandidateSearchTool",
     "CurrentGameSearchTool",
     "PendingOutboxTool",
+    "project_controlled_result_for_trial",
     "IntentEvidence",
     "extract_intent_evidence",
     "message_for_intent",
