@@ -111,7 +111,7 @@ src/mahjong_agent/
 - `reply_policy.py`、`reply_guard.py` 和 `prompts/reply_draft.md` 已新增，负责基于最终动作和工具结果生成回复草稿并做安全一致性检查，但尚未接管 Web 试用台主链路。
 - `scripts/run_evals.py` 已新增，统一运行当前场景评估和 boss trial golden 回归。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
-- 受控工作流在试用台里的 SQLite 落库目前是迁移桥接层，用于证明 `LLM contract -> ActionValidator -> ToolOrchestrator -> StateMachine -> 待审批 outbox` 可以闭环；下一步应抽成独立 persistence adapter，避免继续在试用台脚本堆业务逻辑。
+- 受控工作流在试用台里的 SQLite 落库已抽成 `TrialControlledPersistenceAdapter` 迁移桥接层，用于证明 `LLM contract -> ActionValidator -> ToolOrchestrator -> StateMachine -> 待审批 outbox` 可以闭环；后续应继续把试用台脚本收缩为 HTTP/UI 壳。
 
 ## 核心数据模型
 
