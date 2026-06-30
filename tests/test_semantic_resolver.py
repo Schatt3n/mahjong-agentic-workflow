@@ -158,7 +158,7 @@ def test_semantic_resolver_builds_prompt_from_conversation_context() -> None:
     assert not party_size.usable
 
 
-def test_semantic_resolver_maps_action_from_intent_when_action_missing() -> None:
+def test_semantic_resolver_rejects_missing_required_action_contract() -> None:
     client = FakeSemanticLLMClient(
         {
             "intent": "inquire_existing_game",
@@ -170,9 +170,14 @@ def test_semantic_resolver_maps_action_from_intent_when_action_missing() -> None
 
     resolution = SemanticResolver(client).resolve(make_context())
 
-    assert resolution.intent == UserIntent.INQUIRE_EXISTING_GAME
-    assert resolution.proposed_action.name == ActionName.SEARCH_EXISTING_GAMES
-    assert resolution.game_requirement.slot("stake").value == "0.5"
+    assert resolution.needs_human_review is True
+    assert resolution.intent == UserIntent.UNKNOWN
+    assert resolution.proposed_action.name == ActionName.HUMAN_REVIEW
+    assert "missing required field 'proposed_action'" in resolution.reasoning_summary
+    assert resolution.raw_response["llm_contract"]["accepted"] is False
+    assert resolution.raw_response["llm_contract"]["contract_errors"] == [
+        "missing required field 'proposed_action'"
+    ]
 
 
 def test_semantic_resolver_bad_json_goes_to_human_review() -> None:
@@ -208,7 +213,10 @@ def test_semantic_resolver_rejects_json_fragment_by_default() -> None:
 
 def test_semantic_resolver_can_opt_into_legacy_json_fragment_extraction() -> None:
     client = FakeSemanticLLMClient(
-        '好的，解析如下：{"intent":"find_players","proposed_action":"create_game","confidence":0.9}'
+        (
+            '好的，解析如下：{"intent":"find_players","proposed_action":"create_game",'
+            '"confidence":0.9,"reasoning_summary":"用户确认要组局。","slots":{}}'
+        )
     )
 
     resolution = SemanticResolver(
@@ -218,6 +226,33 @@ def test_semantic_resolver_can_opt_into_legacy_json_fragment_extraction() -> Non
 
     assert resolution.intent == UserIntent.FIND_PLAYERS
     assert resolution.proposed_action.name == ActionName.CREATE_GAME
+
+
+def test_semantic_resolver_rejects_invalid_contract_types() -> None:
+    client = FakeSemanticLLMClient(
+        {
+            "intent": "find_players",
+            "proposed_action": "create_game",
+            "confidence": "high",
+            "needs_human_review": "no",
+            "reasoning_summary": "",
+            "slots": [],
+            "action_arguments": [],
+            "profile_observations": {},
+        }
+    )
+
+    resolution = SemanticResolver(client).resolve(make_context())
+
+    assert resolution.needs_human_review is True
+    assert resolution.proposed_action.name == ActionName.HUMAN_REVIEW
+    errors = resolution.raw_response["llm_contract"]["contract_errors"]
+    assert "invalid confidence 'high'" in errors
+    assert "reasoning_summary must be a non-empty string" in errors
+    assert "slots must be an object" in errors
+    assert "needs_human_review must be a boolean when provided" in errors
+    assert "action_arguments must be an object when provided" in errors
+    assert "profile_observations must be an array when provided" in errors
 
 
 def test_semantic_resolver_timeout_goes_to_human_review() -> None:

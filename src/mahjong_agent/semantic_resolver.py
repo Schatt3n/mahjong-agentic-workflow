@@ -110,6 +110,23 @@ class SemanticResolver:
                 },
                 prompt_messages=messages,
             )
+        contract_errors = _validate_semantic_contract(raw)
+        if contract_errors:
+            reason = "LLM semantic resolver contract invalid: " + "; ".join(contract_errors)
+            return self._failure_resolution(
+                reason=reason,
+                raw_response={
+                    "raw_output": raw_output,
+                    "contract_errors": contract_errors,
+                    "llm_contract": self._llm_contract_audit(
+                        messages=messages,
+                        accepted=False,
+                        raw_output=raw_output,
+                        contract_errors=contract_errors,
+                    ),
+                },
+                prompt_messages=messages,
+            )
         return self._resolution_from_raw(raw, prompt_messages=messages)
 
     def build_messages(self, context: ConversationContext) -> list[dict[str, str]]:
@@ -210,6 +227,7 @@ class SemanticResolver:
         accepted: bool,
         raw_output: Any | None = None,
         parse_error: str | None = None,
+        contract_errors: list[str] | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
         audit: dict[str, Any] = {
@@ -222,6 +240,8 @@ class SemanticResolver:
             audit["raw_output"] = raw_output
         if parse_error:
             audit["parse_error"] = parse_error
+        if contract_errors:
+            audit["contract_errors"] = list(contract_errors)
         if error:
             audit["error"] = error
         if self.config.include_prompt_in_raw_response:
@@ -250,6 +270,62 @@ class SemanticResolver:
             reasoning_summary=reason,
             raw_response=raw_response,
         )
+
+
+SEMANTIC_REQUIRED_FIELDS: tuple[str, ...] = (
+    "intent",
+    "proposed_action",
+    "confidence",
+    "reasoning_summary",
+    "slots",
+)
+
+SEMANTIC_ALLOWED_INTENTS = frozenset(item.value for item in UserIntent)
+SEMANTIC_ALLOWED_ACTIONS = frozenset(item.value for item in ActionName)
+
+
+def _validate_semantic_contract(raw: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field in SEMANTIC_REQUIRED_FIELDS:
+        if field not in raw:
+            errors.append(f"missing required field {field!r}")
+
+    intent = raw.get("intent")
+    if "intent" in raw and str(intent or "").strip() not in SEMANTIC_ALLOWED_INTENTS:
+        errors.append(f"invalid intent {intent!r}")
+
+    proposed_action = raw.get("proposed_action")
+    if "proposed_action" in raw and str(proposed_action or "").strip() not in SEMANTIC_ALLOWED_ACTIONS:
+        errors.append(f"invalid proposed_action {proposed_action!r}")
+
+    confidence = raw.get("confidence")
+    if "confidence" in raw:
+        try:
+            numeric_confidence = float(confidence)
+        except (TypeError, ValueError):
+            errors.append(f"invalid confidence {confidence!r}")
+        else:
+            if numeric_confidence < 0 or numeric_confidence > 1:
+                errors.append(f"confidence out of range {confidence!r}")
+
+    reasoning_summary = raw.get("reasoning_summary")
+    if "reasoning_summary" in raw and not _optional_str(reasoning_summary):
+        errors.append("reasoning_summary must be a non-empty string")
+
+    slots = raw.get("slots")
+    if "slots" in raw and not isinstance(slots, dict):
+        errors.append("slots must be an object")
+
+    if "needs_human_review" in raw and not isinstance(raw.get("needs_human_review"), bool):
+        errors.append("needs_human_review must be a boolean when provided")
+
+    if "action_arguments" in raw and not isinstance(raw.get("action_arguments"), dict):
+        errors.append("action_arguments must be an object when provided")
+
+    if "profile_observations" in raw and not isinstance(raw.get("profile_observations"), list):
+        errors.append("profile_observations must be an array when provided")
+
+    return errors
 
 
 def _slot_from_raw(name: str, raw: Any, *, default_confidence: float) -> SlotValue:
