@@ -27,6 +27,7 @@ from mahjong_agent import (  # noqa: E402
     PendingOutboxTool,
     PlayPreference,
     ReplyApprovalQueue,
+    ReplyPolicy,
     SemanticResolver,
     ToolOrchestrator,
     ToolOrchestratorConfig,
@@ -64,6 +65,8 @@ class ControlledStep:
     sender_name: str
     conversation_id: str
     semantic_output: dict[str, Any]
+    reply_output: Any = None
+    use_reply_output: bool = False
     expected: dict[str, Any] = field(default_factory=dict)
     now: datetime = DEFAULT_NOW
 
@@ -90,6 +93,29 @@ class FixedSemanticLLMClient:
         trace_id: str,
         timeout_seconds: float,
     ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "messages": messages,
+                "trace_id": trace_id,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return replace_placeholders(self.output, self.bindings)
+
+
+class FixedReplyLLMClient:
+    def __init__(self, output: Any, bindings: dict[str, Any] | None = None) -> None:
+        self.output = output
+        self.bindings = bindings if bindings is not None else {}
+        self.calls: list[dict[str, Any]] = []
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        trace_id: str,
+        timeout_seconds: float,
+    ) -> str | dict[str, Any]:
         self.calls.append(
             {
                 "messages": messages,
@@ -146,6 +172,8 @@ def scenario_from_record(record: dict[str, Any]) -> ControlledScenario:
                 "sender_name": record.get("sender_name"),
                 "conversation_id": record.get("conversation_id"),
                 "semantic_output": record.get("semantic_output"),
+                "reply_output": record.get("reply_output"),
+                "use_reply_output": "reply_output" in record,
                 "expected": record.get("expected") or {},
                 "now": record.get("now"),
             }
@@ -170,6 +198,8 @@ def step_from_record(record: dict[str, Any]) -> ControlledStep:
         sender_name=str(record.get("sender_name") or record.get("sender_id") or "张哥"),
         conversation_id=str(record.get("conversation_id") or "controlled_eval"),
         semantic_output=semantic_output,
+        reply_output=record.get("reply_output"),
+        use_reply_output=bool(record.get("use_reply_output", "reply_output" in record)),
         expected=dict(record.get("expected") or {}),
         now=parse_dt(record.get("now")) or DEFAULT_NOW,
     )
@@ -303,6 +333,11 @@ def run_scenario(scenario: ControlledScenario) -> tuple[int, int]:
     for step_index, step in enumerate(scenario.steps, start=1):
         trace_id = f"eval_{scenario.id}_{step_index}"
         llm_client = FixedSemanticLLMClient(step.semantic_output, bindings)
+        reply_policy = (
+            ReplyPolicy(FixedReplyLLMClient(step.reply_output, bindings))
+            if step.use_reply_output
+            else None
+        )
         service = ControlledWorkflowService(
             core=core,
             context_builder=WorkflowContextBuilder(core, memory, state_store=state_store),
@@ -316,6 +351,7 @@ def run_scenario(scenario: ControlledScenario) -> tuple[int, int]:
             memory_store=memory,
             trace_recorder=trace_recorder,
             reply_approval_queue=ReplyApprovalQueue(outbox_store),
+            reply_policy=reply_policy,
         )
         result = service.handle_message(make_message(step, trace_id=trace_id), now=step.now, trace_id=trace_id)
         update_bindings(bindings, result)
@@ -351,6 +387,10 @@ def validate_result(expected: dict[str, Any], result: Any) -> list[str]:
         actual_tools = [tool.value for tool in validated.required_tools]
         if actual_tools != list(expected["required_tools"]):
             errors.append(f"required_tools={actual_tools}, expected={expected['required_tools']}")
+    if expected.get("tool_result_count") is not None:
+        actual_count = len(result.tool_orchestration.tool_results)
+        if actual_count != int(expected["tool_result_count"]):
+            errors.append(f"tool_result_count={actual_count}, expected={expected['tool_result_count']}")
     if expected.get("slot_values"):
         for name, value in dict(expected["slot_values"]).items():
             slot = semantic.game_requirement.slot(name)
@@ -375,6 +415,10 @@ def validate_result(expected: dict[str, Any], result: Any) -> list[str]:
         statuses = [transition.to_status for transition in result.run.state_transitions]
         if statuses != list(expected["state_statuses"]):
             errors.append(f"state_statuses={statuses}, expected={expected['state_statuses']}")
+    if expected.get("state_transition_count") is not None:
+        actual_count = len(result.run.state_transitions)
+        if actual_count != int(expected["state_transition_count"]):
+            errors.append(f"state_transition_count={actual_count}, expected={expected['state_transition_count']}")
     if expected.get("state_slot_values"):
         latest_transition = result.run.state_transitions[-1] if result.run.state_transitions else None
         slots = {}
@@ -398,11 +442,42 @@ def validate_result(expected: dict[str, Any], result: Any) -> list[str]:
         sources = [str(item.get("source") or "") for item in (result.reply_approval.outbox_items if result.reply_approval else [])]
         if expected["reply_approval_source"] not in sources:
             errors.append(f"reply_approval_source={sources}, expected contains {expected['reply_approval_source']}")
+    if expected.get("reply_source") is not None:
+        actual = result.run.reply_draft.source.value if result.run.reply_draft else None
+        if actual != expected["reply_source"]:
+            errors.append(f"reply_source={actual}, expected={expected['reply_source']}")
+    if expected.get("semantic_contract_accepted") is not None:
+        contract = _semantic_contract(result)
+        actual = contract.get("accepted") if isinstance(contract, dict) else None
+        if bool(actual) != bool(expected["semantic_contract_accepted"]):
+            errors.append(f"semantic_contract_accepted={actual}, expected={expected['semantic_contract_accepted']}")
+    for fragment in expected.get("semantic_contract_errors_contains") or []:
+        errors_list = (_semantic_contract(result) or {}).get("contract_errors") or []
+        if not any(fragment in str(error) for error in errors_list):
+            errors.append(f"semantic_contract_errors missing {fragment!r}: {errors_list}")
+    if expected.get("reply_contract_accepted") is not None:
+        contract = _reply_contract(result)
+        actual = contract.get("accepted") if isinstance(contract, dict) else None
+        if bool(actual) != bool(expected["reply_contract_accepted"]):
+            errors.append(f"reply_contract_accepted={actual}, expected={expected['reply_contract_accepted']}")
+    for fragment in expected.get("reply_contract_errors_contains") or []:
+        errors_list = (_reply_contract(result) or {}).get("contract_errors") or []
+        if not any(fragment in str(error) for error in errors_list):
+            errors.append(f"reply_contract_errors missing {fragment!r}: {errors_list}")
     if expected.get("trace_steps_contains") is not None:
         steps = [event.step.value if hasattr(event.step, "value") else str(event.step) for event in result.trace_events]
         for step in expected["trace_steps_contains"]:
             if step not in steps:
                 errors.append(f"trace missing step {step!r}")
+    if expected.get("trace_step_levels") is not None:
+        for step_name, expected_level in dict(expected["trace_step_levels"]).items():
+            matching_levels = [
+                event.level
+                for event in result.trace_events
+                if (event.step.value if hasattr(event.step, "value") else str(event.step)) == step_name
+            ]
+            if str(expected_level).upper() not in matching_levels:
+                errors.append(f"trace step {step_name!r} levels={matching_levels}, expected contains {expected_level!r}")
     if expected.get("trace_complete") is not None:
         report = validate_controlled_trace_completeness(result.trace_events)
         if bool(report.complete) != bool(expected["trace_complete"]):
@@ -417,6 +492,33 @@ def validate_result(expected: dict[str, Any], result: Any) -> list[str]:
         if bool(actual) != bool(expected["should_treat_as_followup"]):
             errors.append(f"should_treat_as_followup={actual}, expected={expected['should_treat_as_followup']}")
     return errors
+
+
+def _semantic_contract(result: Any) -> dict[str, Any] | None:
+    event = _event_for_step(result, "llm_response")
+    raw_response = event.content.get("raw_response") if event else None
+    if isinstance(raw_response, dict):
+        contract = raw_response.get("llm_contract")
+        return contract if isinstance(contract, dict) else None
+    return None
+
+
+def _reply_contract(result: Any) -> dict[str, Any] | None:
+    event = _event_for_step(result, "reply_drafted")
+    reply_draft = event.content.get("reply_draft") if event else None
+    metadata = reply_draft.get("metadata") if isinstance(reply_draft, dict) else None
+    if isinstance(metadata, dict):
+        contract = metadata.get("llm_contract")
+        return contract if isinstance(contract, dict) else None
+    return None
+
+
+def _event_for_step(result: Any, step_name: str) -> Any | None:
+    for event in result.trace_events:
+        actual = event.step.value if hasattr(event.step, "value") else str(event.step)
+        if actual == step_name:
+            return event
+    return None
 
 
 def count_checks(scenarios: list[ControlledScenario]) -> int:
