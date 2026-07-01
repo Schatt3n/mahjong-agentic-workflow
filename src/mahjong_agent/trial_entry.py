@@ -66,19 +66,40 @@ class TrialControlledRequestBuilder:
             or payload.get("conversationId")
             or "boss_trial"
         ).strip() or "boss_trial"
+        channel_id = str(payload.get("channel_id") or payload.get("channelId") or conversation_id).strip() or conversation_id
+        channel_type = _channel_type(payload.get("channel_type") or payload.get("channelType"))
+        source_message_id = _first_text(
+            payload,
+            "source_message_id",
+            "sourceMessageId",
+            "message_id",
+            "messageId",
+            "platform_message_id",
+            "platformMessageId",
+        )
+        sequence = _first_value(payload, "sequence", "seq", "message_sequence", "messageSequence")
+        tenant_id = _first_text(payload, "tenant_id", "tenantId", "store_id", "storeId")
         now = self.parse_datetime(payload.get("now")) or self.now_factory()
+        metadata = {
+            "conversation_id": conversation_id,
+            "trace_id": trace_id,
+            "source": "boss_trial_controlled",
+        }
+        if source_message_id:
+            metadata["source_message_id"] = source_message_id
+            metadata["message_id"] = source_message_id
+        if sequence is not None:
+            metadata["sequence"] = sequence
+        if tenant_id:
+            metadata["tenant_id"] = tenant_id
         message = Message(
             text=text,
             sender_id=sender_id,
             sender_name=sender_name,
-            channel_id=conversation_id,
-            channel_type=ChannelType.WEB_CONSOLE,
+            channel_id=channel_id,
+            channel_type=channel_type,
             sent_at=now,
-            metadata={
-                "conversation_id": conversation_id,
-                "trace_id": trace_id,
-                "source": "boss_trial_controlled",
-            },
+            metadata=metadata,
         )
         return TrialControlledAnalyzeRequest(
             text=text,
@@ -127,6 +148,30 @@ def default_trial_now() -> datetime:
 def parse_iso_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
+
+
+def _channel_type(value: Any) -> ChannelType:
+    if value in (None, ""):
+        return ChannelType.WEB_CONSOLE
+    try:
+        return ChannelType(str(value).strip())
+    except ValueError:
+        return ChannelType.WEB_CONSOLE
+
+
+def _first_text(payload: dict[str, Any], *keys: str) -> str | None:
+    value = _first_value(payload, *keys)
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_value(payload: dict[str, Any], *keys: str) -> Any | None:
+    for key in keys:
+        if key in payload:
+            return payload.get(key)
+    return None
     try:
         text = str(value).strip()
         if text.endswith("Z"):
