@@ -64,7 +64,12 @@ from mahjong_agent import (  # noqa: E402
     TrialCreateGameStateInput,
     TrialGameStateCreationAdapter,
     TrialGameStateCreationCallbacks,
+    RUNTIME_POLICY_VERSION,
+    DEFAULT_RUNTIME_POLICY,
+    STATE_WRITE_STAGES,
+    default_runtime_policy,
     env_bool,
+    trusted_action_proposer,
     use_controlled_trial_workflow,
     TrialShortMemoryTextMerger,
     TrialToolGateway,
@@ -139,29 +144,6 @@ TOOL_REGISTRY_VERSION = "tool_registry.v1"
 STATE_MACHINE_VERSION = "state_machine.v1"
 TRACE_EVENT_SCHEMA_VERSION = "trace_events.v1"
 STATE_TRANSITION_EVENT_SCHEMA_VERSION = "state_transition_events.v1"
-RUNTIME_POLICY_VERSION = "runtime_policy.v1"
-DEFAULT_RUNTIME_POLICY: dict[str, Any] = {
-    "policy_version": RUNTIME_POLICY_VERSION,
-    "controlled_agent_mode": "trial",
-    "read_only_mode": False,
-    "state_writes_enabled": True,
-    "delivery_enabled": True,
-    "approval_enabled": True,
-    "eval_writes_enabled": True,
-    "llm_required_for_side_effect_tools": False,
-    "llm_required_for_state_writes": False,
-    "reason": "默认试用策略：允许人工审批后的受控写入和手动发送。",
-}
-STATE_WRITE_STAGES = {
-    "candidate_feedback",
-    "create_game",
-    "manual_create_game",
-    "manual_feedback",
-    "profile_update",
-    "approval_decision",
-    "message_delivery",
-    "clear_board",
-}
 APPROVAL_STATUS_LABELS = {
     "pending": "待审批",
     "approved": "已审批",
@@ -213,30 +195,6 @@ TOOL_STAGE_POLICY: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
-def default_runtime_policy() -> dict[str, Any]:
-    policy = dict(DEFAULT_RUNTIME_POLICY)
-    mode = str(os.getenv("MAHJONG_CONTROLLED_AGENT_MODE") or policy["controlled_agent_mode"]).strip().lower()
-    if mode in {"prod", "production", "controlled", "strict"}:
-        policy["controlled_agent_mode"] = "production"
-        policy["llm_required_for_side_effect_tools"] = True
-        policy["llm_required_for_state_writes"] = True
-        policy["reason"] = "生产受控策略：副作用工具和业务状态写入必须由 LLM 或人工明确提案。"
-    else:
-        policy["controlled_agent_mode"] = "trial"
-    policy["llm_required_for_side_effect_tools"] = env_bool(
-        "MAHJONG_LLM_REQUIRED_FOR_SIDE_EFFECT_TOOLS",
-        bool(policy["llm_required_for_side_effect_tools"]),
-    )
-    policy["llm_required_for_state_writes"] = env_bool(
-        "MAHJONG_LLM_REQUIRED_FOR_STATE_WRITES",
-        bool(policy["llm_required_for_state_writes"]),
-    )
-    return policy
-
-
-def trusted_action_proposer(*values: Any) -> bool:
-    trusted = {"llm", "boss_manual", "human", "operator"}
-    return any(str(value or "").strip().lower() in trusted for value in values)
 GAME_STATUS_TRANSITIONS: dict[str, set[str]] = {
     "待补充": {"待补充", "待组局", "邀约中", "已满", "已成局", "已取消"},
     "待组局": {"待补充", "待组局", "邀约中", "已满", "已成局", "已取消"},
