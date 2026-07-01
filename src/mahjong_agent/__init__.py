@@ -207,6 +207,7 @@ from .trial_state_policy import (
     require_state_transition,
     state_transition_verdict,
 )
+from .trial_store_schema import TRIAL_STORE_SCHEMA_SQL, ensure_column, ensure_trial_store_schema
 from .trial_tool_registry import (
     TOOL_REGISTRY,
     TOOL_REGISTRY_VERSION,
@@ -471,6 +472,9 @@ __all__ = [
     "approval_status_label",
     "require_state_transition",
     "state_transition_verdict",
+    "TRIAL_STORE_SCHEMA_SQL",
+    "ensure_column",
+    "ensure_trial_store_schema",
     "TOOL_REGISTRY",
     "TOOL_REGISTRY_VERSION",
     "TOOL_STAGE_POLICY",
