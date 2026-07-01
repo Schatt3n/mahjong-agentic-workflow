@@ -146,6 +146,13 @@ from .trial_game_state import (
     TrialGameStateCreationAdapter,
     TrialGameStateCreationCallbacks,
 )
+from .trial_http_logging import (
+    recent_log_lines as recent_trial_log_lines,
+    render_log_page as render_trial_log_page,
+    summarize_http_input,
+    summarize_http_output,
+    truncate_text as truncate_trial_log_text,
+)
 from .trial_manual_game import TrialManualGameAdapter
 from .trial_observability import (
     TRACE_EVENT_SCHEMA_VERSION,
@@ -387,6 +394,11 @@ __all__ = [
     "TrialCreateGameStateResult",
     "TrialGameStateCreationAdapter",
     "TrialGameStateCreationCallbacks",
+    "recent_trial_log_lines",
+    "render_trial_log_page",
+    "summarize_http_input",
+    "summarize_http_output",
+    "truncate_trial_log_text",
     "TrialManualGameAdapter",
     "TRACE_EVENT_SCHEMA_VERSION",
     "TrialTraceLogger",
