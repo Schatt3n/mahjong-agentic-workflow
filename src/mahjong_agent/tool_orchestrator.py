@@ -12,6 +12,7 @@ from .customer_repository import CustomerProfileRepository
 from .models import DEFAULT_TZ, CustomerProfile as LegacyCustomerProfile
 from .observability import to_trace_payload
 from .profile_observation_contract import normalize_profile_observation_for_storage
+from .tool_permissions import tool_allowed_for_action
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
 from .workflow_models import (
     ActionName,
@@ -37,29 +38,6 @@ class ToolOrchestratorConfig:
     allow_create_pending: bool = True
     allow_state_write: bool = False
     allow_direct_send: bool = False
-
-
-_ALLOWED_TOOLS_BY_ACTION: dict[ActionName, set[ToolName]] = {
-    ActionName.SEARCH_EXISTING_GAMES: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
-    ActionName.ASK_CREATE_CONFIRMATION: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
-    ActionName.MATCH_EXISTING_GAME: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
-    ActionName.QUEUE_INVITES: {
-        ToolName.SEARCH_CURRENT_OPEN_GAMES,
-        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
-        ToolName.CREATE_PENDING_OUTBOX,
-        ToolName.CREATE_GAME,
-    },
-    ActionName.CREATE_GAME: {
-        ToolName.SEARCH_CURRENT_OPEN_GAMES,
-        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
-        ToolName.CREATE_PENDING_OUTBOX,
-        ToolName.CREATE_GAME,
-    },
-    ActionName.ACCEPT_SEAT: {ToolName.RECORD_SEAT_ACCEPTANCE},
-    ActionName.JOIN_GAME: {ToolName.RECORD_SEAT_ACCEPTANCE},
-    ActionName.CANCEL_GAME: {ToolName.CLOSE_GAME},
-    ActionName.CLOSE_GAME: {ToolName.CLOSE_GAME},
-}
 
 
 @dataclass(slots=True)
@@ -464,10 +442,7 @@ class ToolOrchestrator:
         return None
 
     def _tool_action_error(self, request: ToolCallRequest, validated_action: ValidatedAction) -> str | None:
-        if request.tool_name == ToolName.PROFILE_UPDATE:
-            return None
-        allowed_tools = _ALLOWED_TOOLS_BY_ACTION.get(validated_action.effective_action, set())
-        if request.tool_name not in allowed_tools:
+        if not tool_allowed_for_action(request.tool_name, validated_action.effective_action):
             return (
                 f"Tool {request.tool_name.value} is not allowed for effective action "
                 f"{validated_action.effective_action.value}."

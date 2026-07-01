@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from mahjong_agent.action_validator import ActionValidator
+from mahjong_agent.action_validator import ActionValidationInput, ActionValidator
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore, SQLiteWorkflowStateStore, StateMachine
+from mahjong_agent.tool_permissions import tool_allowed_for_action, validate_required_tools_for_action
 from mahjong_agent.workflow_models import (
     ActionName,
     ActionSource,
@@ -170,6 +171,38 @@ def test_invalid_action_arguments_are_rejected_before_tool_orchestration() -> No
     assert result.code == "action_arguments_contract_invalid"
     assert result.required_tools == []
     assert "action_arguments.game_id is not allowed for create_game" in result.reason
+
+
+def test_tool_permission_contract_allows_only_tools_for_effective_action() -> None:
+    assert tool_allowed_for_action(ToolName.SEARCH_CANDIDATE_CUSTOMERS, ActionName.QUEUE_INVITES)
+    assert tool_allowed_for_action(ToolName.PROFILE_UPDATE, ActionName.ASK_CLARIFICATION)
+    assert not tool_allowed_for_action(ToolName.SEND_MESSAGE, ActionName.QUEUE_INVITES)
+    assert validate_required_tools_for_action(
+        ActionName.MATCH_EXISTING_GAME,
+        [ToolName.SEARCH_CURRENT_OPEN_GAMES, ToolName.CREATE_PENDING_OUTBOX],
+    ) == ["tool create_pending_outbox is not allowed for action match_existing_game"]
+
+
+def test_action_validator_rejects_required_tools_outside_effective_action_permission() -> None:
+    validator = ActionValidator()
+    context = make_context()
+    resolution = make_resolution(ActionName.CREATE_GAME, complete_requirement())
+
+    result = validator._validated(
+        ActionValidationInput(context=context, semantic_resolution=resolution),
+        effective_action=ActionName.QUEUE_INVITES,
+        allowed=True,
+        code="test_invalid_tool",
+        reason="test invalid tool",
+        required_tools=[ToolName.SEND_MESSAGE],
+    )
+
+    assert result.allowed is False
+    assert result.effective_action == ActionName.HUMAN_REVIEW
+    assert result.code == "tool_permission_denied"
+    assert result.risk_level == RiskLevel.HIGH
+    assert result.required_tools == []
+    assert "tool send_message is not allowed for action queue_invites" in result.reason
 
 
 def test_create_game_missing_critical_slots_downgrades_to_clarification() -> None:

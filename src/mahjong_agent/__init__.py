@@ -108,6 +108,12 @@ from .tool_orchestrator import (
     ToolOrchestrator,
     ToolOrchestratorConfig,
 )
+from .tool_permissions import (
+    ALLOWED_TOOLS_BY_ACTION,
+    allowed_tools_for_action,
+    tool_allowed_for_action,
+    validate_required_tools_for_action,
+)
 from .tools import (
     CandidateSearchTool,
     CurrentGameSearchTool,
@@ -396,6 +402,10 @@ __all__ = [
     "ToolOrchestrationResult",
     "ToolOrchestrator",
     "ToolOrchestratorConfig",
+    "ALLOWED_TOOLS_BY_ACTION",
+    "allowed_tools_for_action",
+    "tool_allowed_for_action",
+    "validate_required_tools_for_action",
     "CandidateSearchTool",
     "CurrentGameSearchTool",
     "InMemoryPendingOutboxStore",

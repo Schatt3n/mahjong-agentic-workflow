@@ -8,6 +8,7 @@ from typing import Any
 from .action_arguments_contract import validate_action_arguments_contract
 from .slot_matching import slot_values_compatible
 from .state_machine import StateMachine
+from .tool_permissions import validate_required_tools_for_action
 from .workflow_models import (
     ActionName,
     ConversationContext,
@@ -341,6 +342,21 @@ class ActionValidator:
         if allowed and risk != RiskLevel.HIGH and self._has_profile_observations(data):
             if ToolName.PROFILE_UPDATE not in final_required_tools:
                 final_required_tools.append(ToolName.PROFILE_UPDATE)
+        tool_permission_errors = validate_required_tools_for_action(effective_action, final_required_tools)
+        if tool_permission_errors:
+            return ValidatedAction(
+                proposed_action=data.semantic_resolution.proposed_action,
+                effective_action=ActionName.HUMAN_REVIEW,
+                allowed=False,
+                code="tool_permission_denied",
+                reason="后端工具权限校验失败：" + "；".join(tool_permission_errors),
+                missing_slots=missing_slots or [],
+                approval_required=True,
+                risk_level=RiskLevel.HIGH,
+                idempotency_key=self._idempotency_key(data, ActionName.HUMAN_REVIEW),
+                notes=[*(notes or []), *tool_permission_errors],
+                required_tools=[],
+            )
         return ValidatedAction(
             proposed_action=data.semantic_resolution.proposed_action,
             effective_action=effective_action,
