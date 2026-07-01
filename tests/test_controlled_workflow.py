@@ -17,6 +17,7 @@ from mahjong_agent.reply_policy import ReplyPolicy
 from mahjong_agent.semantic_resolver import SemanticResolver
 from mahjong_agent.state_machine import InMemoryWorkflowStateStore, StateMachine
 from mahjong_agent.tool_orchestrator import ToolOrchestrationResult
+from mahjong_agent.tool_result_contract import TOOL_RESULT_CONTRACT_VERSION, tool_result_contract
 from mahjong_agent.workflow_models import (
     ActionName,
     GameRequirement,
@@ -401,9 +402,16 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
         ToolName.CREATE_GAME,
     ]
     assert result.tool_orchestration.result_for(ToolName.CREATE_PENDING_OUTBOX).result["drafts"]
+    current_game_result = result.tool_orchestration.result_for(ToolName.SEARCH_CURRENT_OPEN_GAMES)
+    current_game_contract = tool_result_contract(current_game_result.result)
+    assert current_game_contract["schema_version"] == TOOL_RESULT_CONTRACT_VERSION
+    assert current_game_contract["tool_name"] == "search_current_open_games"
+    assert current_game_contract["result_type"] == "current_game_matches"
+    assert current_game_contract["side_effect"] == "none"
     create_game_result = result.tool_orchestration.result_for(ToolName.CREATE_GAME)
     assert create_game_result.called is True
     assert create_game_result.allowed is True
+    assert tool_result_contract(create_game_result.result)["side_effect"] == "state_write_intent_only"
     assert create_game_result.result["state_write_intent"]["kind"] == "create_game"
     assert create_game_result.result["state_write_intent"]["target_status"] == GameWorkflowStatus.NEGOTIATING.value
 
@@ -431,6 +439,22 @@ def test_controlled_workflow_records_full_trace_and_queues_pending_invites() -> 
     assert TraceStep.REPLY_APPROVAL in steps
     assert TraceStep.MEMORY_WRITTEN in steps
     assert TraceStep.FINAL_OUTPUT in steps
+    tool_events = [event for event in result.trace_events if event.step == TraceStep.TOOL_CALLED]
+    assert tool_events
+    traced_contracts = [
+        event.content["tool_result"]["result"]["contract"]
+        for event in tool_events
+        if isinstance(event.content.get("tool_result"), dict)
+        and isinstance(event.content["tool_result"].get("result"), dict)
+        and isinstance(event.content["tool_result"]["result"].get("contract"), dict)
+    ]
+    assert [item["tool_name"] for item in traced_contracts] == [
+        "search_current_open_games",
+        "search_candidate_customers",
+        "create_pending_outbox",
+        "create_game",
+    ]
+    assert traced_contracts[-1]["side_effect"] == "state_write_intent_only"
     completeness = validate_controlled_trace_completeness(result.trace_events)
     assert completeness.complete is True
     final_event = next(event for event in result.trace_events if event.step == TraceStep.FINAL_OUTPUT)
