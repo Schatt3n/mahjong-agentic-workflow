@@ -126,6 +126,13 @@ from .trial_entry import (
     default_trial_now,
     parse_iso_datetime,
 )
+from .trial_app_config import (
+    DEFAULT_REDIS_URL,
+    build_redis_cache_from_env,
+    load_local_env,
+    redact_redis_url,
+    trial_cache_prefix_from_env,
+)
 from .trial_approval import TrialApprovalDecisionAdapter
 from .trial_candidate import TrialCandidateMessageAdapter
 from .trial_delivery import TrialOutboxDeliveryAdapter, delivery_message_hash
@@ -387,6 +394,11 @@ __all__ = [
     "TrialControlledRequestBuilder",
     "default_trial_now",
     "parse_iso_datetime",
+    "DEFAULT_REDIS_URL",
+    "build_redis_cache_from_env",
+    "load_local_env",
+    "redact_redis_url",
+    "trial_cache_prefix_from_env",
     "TrialApprovalDecisionAdapter",
     "TrialCandidateMessageAdapter",
     "TrialOutboxDeliveryAdapter",

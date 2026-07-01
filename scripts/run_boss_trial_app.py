@@ -71,6 +71,7 @@ from mahjong_agent import (  # noqa: E402
     STATE_MACHINE_VERSION,
     SEED_CUSTOMERS,
     approval_status_label,
+    build_redis_cache_from_env,
     default_runtime_policy,
     env_bool,
     require_state_transition,
@@ -93,6 +94,7 @@ from mahjong_agent import (  # noqa: E402
     read_jsonl_records,
     recent_trial_log_lines,
     render_trial_log_page,
+    load_local_env,
     summarize_http_input,
     summarize_http_output,
     trace_payload_from_content,
@@ -100,6 +102,7 @@ from mahjong_agent import (  # noqa: E402
     TRIAL_GAME_TYPE_LABELS,
     TRIAL_VARIANT_LABELS,
     truncate_trial_log_text,
+    trial_cache_prefix_from_env,
     use_controlled_trial_workflow,
     TrialShortMemoryTextMerger,
     TrialToolGateway,
@@ -129,8 +132,7 @@ BOSS_TRIAL_GOLDEN_PATH = EVAL_DIR / "golden" / "boss_trial_golden.jsonl"
 BADCASE_PATH = EVAL_DIR / "badcases" / "badcases.jsonl"
 FEW_SHOT_EXAMPLES_PATH = EVAL_DIR / "few_shot_examples.jsonl"
 SKILL_LIBRARY_PATH = DEFAULT_SKILL_LIBRARY_PATH
-DEFAULT_REDIS_URL = "redis://127.0.0.1:6379/0"
-CACHE_PREFIX = os.environ.get("MAHJONG_CACHE_PREFIX", "mahjong:trial").strip(":")
+CACHE_PREFIX = trial_cache_prefix_from_env()
 STATE_CACHE_TTL_SECONDS = 5 * 60
 GAME_CACHE_TTL_SECONDS = 24 * 60 * 60
 SHORT_MEMORY_TTL_SECONDS = 2 * 60 * 60
@@ -8904,49 +8906,8 @@ class BossTrialHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def build_redis_cache_from_env() -> RedisCache | None:
-    redis_url = os.environ.get("MAHJONG_REDIS_URL", DEFAULT_REDIS_URL).strip()
-    if redis_url.lower() in {"", "0", "false", "off", "none", "disabled"}:
-        print("Redis cache disabled by MAHJONG_REDIS_URL.")
-        return None
-    timeout = float(os.environ.get("MAHJONG_REDIS_TIMEOUT_SECONDS", "0.3"))
-    try:
-        cache = RedisCache.from_url(redis_url, timeout_seconds=timeout)
-        cache.ping()
-    except (RedisCacheError, ValueError) as exc:
-        print(f"Redis cache unavailable, continue with SQLite only: {exc}")
-        return None
-    print(f"Redis cache enabled: {_redact_redis_url(redis_url)}")
-    return cache
-
-
-def _redact_redis_url(redis_url: str) -> str:
-    parsed = urlparse(redis_url)
-    if not parsed.password:
-        return redis_url
-    username = parsed.username or ""
-    auth = f"{username}:***@" if username else "***@"
-    host = parsed.hostname or "127.0.0.1"
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{auth}{host}{port}{parsed.path or ''}"
-
-
-def load_local_env(path: pathlib.Path = ROOT / ".env") -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or key in os.environ:
-            continue
-        os.environ[key] = value.strip().strip('"').strip("'")
-
-
 def main() -> None:
-    load_local_env()
+    load_local_env(ROOT / ".env")
     store = TrialStore(DB_PATH)
     cache = build_redis_cache_from_env()
     BossTrialHandler.service = BossTrialService(store, cache=cache)
