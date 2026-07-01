@@ -148,6 +148,13 @@ from .trial_runtime_policy import (
     default_runtime_policy,
     trusted_action_proposer,
 )
+from .trial_tool_registry import (
+    TOOL_REGISTRY,
+    TOOL_REGISTRY_VERSION,
+    TOOL_STAGE_POLICY,
+    tool_spec_for_stage,
+    tool_specs_for_stage,
+)
 from .trial_reply import (
     TrialReplyDraftAdapter,
     TrialReplyDraftCallbacks,
@@ -357,6 +364,11 @@ __all__ = [
     "STATE_WRITE_STAGES",
     "default_runtime_policy",
     "trusted_action_proposer",
+    "TOOL_REGISTRY",
+    "TOOL_REGISTRY_VERSION",
+    "TOOL_STAGE_POLICY",
+    "tool_spec_for_stage",
+    "tool_specs_for_stage",
     "TrialReplyDraftAdapter",
     "TrialReplyDraftCallbacks",
     "TrialReplyDraftInput",
