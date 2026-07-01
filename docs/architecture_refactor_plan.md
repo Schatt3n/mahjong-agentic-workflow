@@ -178,6 +178,7 @@ src/mahjong_agent/
 - `trial_seed_data.py` 已新增，负责试用台 50 条初始客户画像数据。`scripts/run_boss_trial_app.py` 不再直接定义 mock 客户列表，只在启动时通过 `SEED_CUSTOMERS` 做初始导入；后续老板试用数据、画像导入和测试 fixture 可以共用这一层，而不是继续把静态画像堆在 HTTP/UI 脚本里。
 - `trial_app_config.py` 已新增，负责试用台本地 `.env` 加载、Redis cache 构建、Redis URL 脱敏和 cache prefix 读取。`scripts/run_boss_trial_app.py` 不再直接实现启动配置细节，只在 `main()` 中装配 store、cache 和 HTTP server。
 - `trial_semantic_slots.py` 已新增，负责试用台旧链路读取 `SemanticResolver` 输出的 slot contract：统一支持 dict 和 `SlotValue`，并根据 `source/confidence/needs_confirmation` 判断槽位是否可用。它只做 contract 访问，不做麻将业务推断，避免在 service 方法里继续散落 slot 解释逻辑。
+- `trial_web_ui.py` 已新增，负责试用台静态 HTML/JS 页面资源。`scripts/run_boss_trial_app.py` 不再内嵌整段页面，只在 `/` 路由返回 `TRIAL_WEB_HTML`，继续把脚本收缩为启动和 HTTP 路由壳。
 - 试用台受控入口已开始透传生产通道元数据：`tenant_id/store_id`、`source_message_id/message_id/platform_message_id`、`sequence/message_sequence`、`channel_id/channel_type` 会进入 `Message.metadata`，供 `InputGate` 做幂等、去重和同会话保序。入口层只标准化外部消息引用，不判断麻将语义。
 
 ## 核心数据模型

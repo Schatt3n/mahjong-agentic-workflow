@@ -189,6 +189,7 @@ from .trial_semantic_slots import (
     semantic_slot_usable,
     semantic_slot_value,
 )
+from .trial_web_ui import TRIAL_WEB_HTML
 from .trial_runtime_policy import (
     DEFAULT_RUNTIME_POLICY,
     RUNTIME_POLICY_VERSION,
@@ -455,6 +456,7 @@ __all__ = [
     "semantic_slot_source",
     "semantic_slot_usable",
     "semantic_slot_value",
+    "TRIAL_WEB_HTML",
     "DEFAULT_RUNTIME_POLICY",
     "RUNTIME_POLICY_VERSION",
     "STATE_WRITE_STAGES",
