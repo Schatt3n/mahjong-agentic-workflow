@@ -13,6 +13,7 @@ from .models import DEFAULT_TZ, CustomerProfile as LegacyCustomerProfile
 from .observability import to_trace_payload
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
 from .workflow_models import (
+    ActionName,
     ConversationContext,
     EntityType,
     GameRequirement,
@@ -35,6 +36,29 @@ class ToolOrchestratorConfig:
     allow_create_pending: bool = True
     allow_state_write: bool = False
     allow_direct_send: bool = False
+
+
+_ALLOWED_TOOLS_BY_ACTION: dict[ActionName, set[ToolName]] = {
+    ActionName.SEARCH_EXISTING_GAMES: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
+    ActionName.ASK_CREATE_CONFIRMATION: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
+    ActionName.MATCH_EXISTING_GAME: {ToolName.SEARCH_CURRENT_OPEN_GAMES},
+    ActionName.QUEUE_INVITES: {
+        ToolName.SEARCH_CURRENT_OPEN_GAMES,
+        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+        ToolName.CREATE_PENDING_OUTBOX,
+        ToolName.CREATE_GAME,
+    },
+    ActionName.CREATE_GAME: {
+        ToolName.SEARCH_CURRENT_OPEN_GAMES,
+        ToolName.SEARCH_CANDIDATE_CUSTOMERS,
+        ToolName.CREATE_PENDING_OUTBOX,
+        ToolName.CREATE_GAME,
+    },
+    ActionName.ACCEPT_SEAT: {ToolName.RECORD_SEAT_ACCEPTANCE},
+    ActionName.JOIN_GAME: {ToolName.RECORD_SEAT_ACCEPTANCE},
+    ActionName.CANCEL_GAME: {ToolName.CLOSE_GAME},
+    ActionName.CLOSE_GAME: {ToolName.CLOSE_GAME},
+}
 
 
 @dataclass(slots=True)
@@ -423,6 +447,9 @@ class ToolOrchestrator:
     def _permission_error(self, request: ToolCallRequest, validated_action: ValidatedAction) -> str | None:
         if request.risk_level == RiskLevel.HIGH:
             return "High risk tool call requires human review."
+        action_error = self._tool_action_error(request, validated_action)
+        if action_error:
+            return action_error
         if request.execution_mode == ToolExecutionMode.READ_ONLY and not self.config.allow_read_only:
             return "Read-only tools are disabled."
         if request.execution_mode == ToolExecutionMode.CREATE_PENDING and not self.config.allow_create_pending:
@@ -433,6 +460,17 @@ class ToolOrchestrator:
             return "Direct-send tools are not allowed without explicit human approval." if not self.config.allow_direct_send else None
         if validated_action.risk_level == RiskLevel.HIGH:
             return "Validated action is high risk and cannot call tools automatically."
+        return None
+
+    def _tool_action_error(self, request: ToolCallRequest, validated_action: ValidatedAction) -> str | None:
+        if request.tool_name == ToolName.PROFILE_UPDATE:
+            return None
+        allowed_tools = _ALLOWED_TOOLS_BY_ACTION.get(validated_action.effective_action, set())
+        if request.tool_name not in allowed_tools:
+            return (
+                f"Tool {request.tool_name.value} is not allowed for effective action "
+                f"{validated_action.effective_action.value}."
+            )
         return None
 
     def _mode_for_tool(self, tool_name: ToolName) -> ToolExecutionMode:

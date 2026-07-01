@@ -276,7 +276,11 @@ def test_orchestrator_blocks_state_write_when_disabled() -> None:
     ).run(
         context=make_context(),
         semantic_resolution=make_resolution(),
-        validated_action=make_validated([ToolName.CLOSE_GAME]),
+        validated_action=make_validated(
+            [ToolName.CLOSE_GAME],
+            effective_action=ActionName.CLOSE_GAME,
+            risk_level=RiskLevel.MEDIUM,
+        ),
         now=NOW,
     )
 
@@ -284,6 +288,29 @@ def test_orchestrator_blocks_state_write_when_disabled() -> None:
     assert result.tool_results[0].allowed is False
     assert result.tool_results[0].request.execution_mode == ToolExecutionMode.STATE_WRITE
     assert "State-write tools are disabled" in result.tool_results[0].error
+
+
+def test_orchestrator_blocks_tool_not_allowed_for_effective_action() -> None:
+    result = ToolOrchestrator(
+        AgentCore(),
+        config=ToolOrchestratorConfig(allow_state_write=True),
+    ).run(
+        context=make_context(),
+        semantic_resolution=make_resolution(),
+        validated_action=make_validated(
+            [ToolName.CREATE_GAME],
+            effective_action=ActionName.ASK_CREATE_CONFIRMATION,
+            risk_level=RiskLevel.LOW,
+        ),
+        now=NOW,
+    )
+
+    tool_result = result.result_for(ToolName.CREATE_GAME)
+    assert tool_result is not None
+    assert tool_result.called is False
+    assert tool_result.allowed is False
+    assert tool_result.result == {}
+    assert tool_result.error == "Tool create_game is not allowed for effective action ask_create_confirmation."
 
 
 def test_orchestrator_creates_game_state_write_intent_after_outbox() -> None:
