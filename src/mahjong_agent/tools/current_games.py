@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..slot_matching import slot_values_compatible
 from ..workflow_models import ConversationContext, GameRequirement
 
 
@@ -45,11 +46,7 @@ class CurrentGameSearchTool:
                 continue
             if not offered or not offered.usable:
                 continue
-            if slot_name == "smoke" and requested.value == "any":
-                score += weight
-                reasons.append("烟况不限，可匹配")
-                continue
-            if requested.value == offered.value:
+            if slot_values_compatible(requested, offered, slot_name=slot_name):
                 score += weight
                 reasons.append(f"{slot_name}匹配")
             else:

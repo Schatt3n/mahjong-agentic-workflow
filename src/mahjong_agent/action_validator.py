@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .slot_matching import slot_values_compatible
 from .state_machine import StateMachine
 from .workflow_models import (
     ActionName,
@@ -276,9 +277,13 @@ class ActionValidator:
         for slot_name in ("game_type", "stake", "smoke"):
             requested = requirement.slot(slot_name)
             offered = open_game.slot(slot_name)
-            if requested and requested.usable and offered and offered.usable and requested.value != offered.value:
-                if slot_name == "smoke" and requested.value == "any":
-                    continue
+            if (
+                requested
+                and requested.usable
+                and offered
+                and offered.usable
+                and not slot_values_compatible(requested, offered, slot_name=slot_name)
+            ):
                 return False
         missing = open_game.slot("missing_count")
         if missing is None or not missing.usable:

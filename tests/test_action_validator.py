@@ -242,6 +242,26 @@ def test_existing_game_preferred_over_new_create() -> None:
     assert result.required_tools == [ToolName.SEARCH_CURRENT_OPEN_GAMES]
 
 
+def test_existing_game_preferred_when_request_has_acceptable_ranges() -> None:
+    open_game = complete_requirement()
+    open_game.set_slot(confirmed_slot("stake", "0.5", source=SlotSource.TOOL))
+    open_game.set_slot(confirmed_slot("smoke", "no_smoke", source=SlotSource.TOOL))
+    open_game.set_slot(confirmed_slot("missing_count", 1, source=SlotSource.TOOL))
+
+    requested = complete_requirement()
+    requested.set_slot(confirmed_slot("stake", ["0.5", "1"]))
+    requested.set_slot(confirmed_slot("smoke", "any"))
+
+    result = ActionValidator().validate(
+        make_context(text="0.5或者1都行，有烟无烟都可", open_games=[open_game]),
+        make_resolution(ActionName.CREATE_GAME, requested),
+    )
+
+    assert result.allowed is True
+    assert result.effective_action == ActionName.MATCH_EXISTING_GAME
+    assert result.code == "existing_game_preferred"
+
+
 def test_low_confidence_state_action_downgrades_to_clarification() -> None:
     result = ActionValidator().validate(
         make_context(),

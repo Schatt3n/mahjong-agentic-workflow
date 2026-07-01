@@ -213,6 +213,30 @@ def test_orchestrator_runs_current_game_search_as_read_only_tool() -> None:
     assert tool_result.result["result_count"] == 1
 
 
+def test_orchestrator_current_game_search_matches_acceptable_ranges() -> None:
+    open_game = complete_requirement()
+    open_game.set_slot(confirmed_slot("stake", "0.5", source=SlotSource.TOOL))
+    open_game.set_slot(confirmed_slot("smoke", "no_smoke", source=SlotSource.TOOL))
+    open_game.set_slot(confirmed_slot("missing_count", 1, source=SlotSource.TOOL))
+    requested = complete_requirement()
+    requested.set_slot(confirmed_slot("stake", ["0.5", "1"]))
+    requested.set_slot(confirmed_slot("smoke", "any"))
+    orchestrator = ToolOrchestrator(AgentCore())
+
+    result = orchestrator.run(
+        context=make_context(open_games=[open_game]),
+        semantic_resolution=make_resolution(requested),
+        validated_action=make_validated([ToolName.SEARCH_CURRENT_OPEN_GAMES]),
+        now=NOW,
+    )
+
+    tool_result = result.tool_results[0]
+    assert tool_result.called is True
+    assert tool_result.allowed is True
+    assert tool_result.result["result_count"] == 1
+    assert tool_result.result["matches"][0]["score"] > 0
+
+
 def test_orchestrator_searches_candidates_then_creates_pending_outbox() -> None:
     core = AgentCore()
     seed_customers(core)
