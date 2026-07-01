@@ -101,6 +101,7 @@
 - 不确定就不要硬填；宁可提出 `ask_clarification`。
 - 如果用户本轮明确表达和上下文冲突，以本轮用户明说为准。
 - `profile_observations` 只记录低风险、可回溯的观察事实；不要输出敏感、侮辱、健康、资金、纠纷类画像。
-- 画像观察必须有 `evidence`，置信度不足 0.65 时不要输出。
+- 画像观察必须有 `field/value/confidence/source/evidence/risk`；`source` 只能是 `current_message` 或 `context`；`risk` 只能是 `low` 或 `medium`；置信度不足 0.65 时不要输出。
+- 后端会把不合法的 `profile_observations` 视为语义 contract 失败，而不是悄悄忽略后继续执行。
 
 只返回一个 JSON object，不要输出 Markdown、代码块、前后解释或任何 JSON 之外的文字。后端会把非纯 JSON 输出视为 contract 失败并转人工或规则兜底。

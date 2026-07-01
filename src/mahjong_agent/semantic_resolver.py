@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .profile_observation_contract import validate_profile_observation_contract
 from .workflow_models import (
     ActionName,
     ActionSource,
@@ -333,8 +334,13 @@ def _validate_semantic_contract(raw: dict[str, Any]) -> list[str]:
     if "action_arguments" in raw and not isinstance(raw.get("action_arguments"), dict):
         errors.append("action_arguments must be an object when provided")
 
-    if "profile_observations" in raw and not isinstance(raw.get("profile_observations"), list):
-        errors.append("profile_observations must be an array when provided")
+    profile_observations = raw.get("profile_observations")
+    if "profile_observations" in raw:
+        if not isinstance(profile_observations, list):
+            errors.append("profile_observations must be an array when provided")
+        else:
+            for index, observation in enumerate(profile_observations):
+                errors.extend(validate_profile_observation_contract(observation, index=index))
 
     return errors
 

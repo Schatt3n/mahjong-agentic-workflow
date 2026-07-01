@@ -323,6 +323,51 @@ def test_semantic_resolver_rejects_invalid_slot_contracts() -> None:
     assert "slot 'start_time_mode' confirmed and needs_confirmation are inconsistent" in errors
 
 
+def test_semantic_resolver_rejects_invalid_profile_observation_contracts() -> None:
+    client = FakeSemanticLLMClient(
+        {
+            "intent": "find_players",
+            "proposed_action": "create_game",
+            "confidence": 0.86,
+            "needs_human_review": False,
+            "reasoning_summary": "用户确认要组局，同时模型输出了不合法画像观察。",
+            "slots": {},
+            "profile_observations": [
+                "smoke any",
+                {
+                    "field": "private_health",
+                    "value": "敏感内容",
+                    "confidence": 0.8,
+                    "source": "current_message",
+                    "evidence": "用户没有说",
+                    "risk": "low",
+                },
+                {
+                    "field": "smoke_preference",
+                    "value": "",
+                    "confidence": 0.5,
+                    "source": "guess",
+                    "evidence": "",
+                    "risk": "high",
+                },
+            ],
+        }
+    )
+
+    resolution = SemanticResolver(client).resolve(make_context())
+
+    assert resolution.needs_human_review is True
+    assert resolution.proposed_action.name == ActionName.HUMAN_REVIEW
+    errors = resolution.raw_response["llm_contract"]["contract_errors"]
+    assert "profile_observations[0] must be an object" in errors
+    assert "profile_observations[1].field invalid 'private_health'" in errors
+    assert "profile_observations[2].value must be non-empty" in errors
+    assert "profile_observations[2].confidence below writable threshold 0.5" in errors
+    assert "profile_observations[2].source invalid 'guess'" in errors
+    assert "profile_observations[2].evidence must be non-empty" in errors
+    assert "profile_observations[2].risk invalid 'high'" in errors
+
+
 def test_semantic_resolver_timeout_goes_to_human_review() -> None:
     client = FakeSemanticLLMClient(TimeoutError("model timeout"))
 

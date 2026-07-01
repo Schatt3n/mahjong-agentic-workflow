@@ -11,6 +11,7 @@ from .core import AgentCore
 from .customer_repository import CustomerProfileRepository
 from .models import DEFAULT_TZ, CustomerProfile as LegacyCustomerProfile
 from .observability import to_trace_payload
+from .profile_observation_contract import normalize_profile_observation_for_storage
 from .tools import CandidateSearchTool, CurrentGameSearchTool, PendingOutboxTool
 from .workflow_models import (
     ActionName,
@@ -804,22 +805,6 @@ def _loads_dict(raw: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"value": payload}
 
 
-PROFILE_OBSERVATION_FIELDS: set[str] = {
-    "preferred_level",
-    "preferred_game_type",
-    "preferred_variant",
-    "preferred_play_option",
-    "smoke_preference",
-    "usual_party_size",
-    "usual_start_time",
-    "duration_preference",
-    "response_preference",
-    "contact_preference",
-    "fatigue_preference",
-    "note",
-}
-
-
 def _profile_observations_from_resolution(semantic_resolution: SemanticResolution) -> list[dict[str, Any]]:
     model_output = semantic_resolution.raw_response.get("model_output")
     if not isinstance(model_output, dict):
@@ -831,40 +816,7 @@ def _profile_observations_from_resolution(semantic_resolution: SemanticResolutio
 
 
 def _normalize_profile_observation(raw: Any) -> tuple[dict[str, Any], str | None]:
-    if not isinstance(raw, dict):
-        return {}, "observation_not_object"
-    field = str(raw.get("field") or "").strip()
-    if field not in PROFILE_OBSERVATION_FIELDS:
-        return {}, f"field_not_allowed:{field or '<empty>'}"
-    confidence = _safe_confidence(raw.get("confidence"), default=0.0)
-    if confidence < 0.65:
-        return {}, "confidence_below_threshold"
-    risk = str(raw.get("risk") or "low").strip().lower()
-    if risk not in {"low", "medium"}:
-        return {}, "risk_not_allowed"
-    value = to_trace_payload(raw.get("value"))
-    if value in (None, "", [], {}):
-        return {}, "empty_value"
-    evidence = str(raw.get("evidence") or "").strip()
-    if not evidence:
-        return {}, "missing_evidence"
-    return {
-        "field": field,
-        "value": value,
-        "confidence": confidence,
-        "source": str(raw.get("source") or "llm_observation"),
-        "evidence": evidence[:240],
-        "risk": risk,
-        "created_at": datetime.now(DEFAULT_TZ).isoformat(),
-    }, None
-
-
-def _safe_confidence(value: Any, *, default: float) -> float:
-    try:
-        parsed = float(default if value is None else value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(0.0, min(1.0, parsed))
+    return normalize_profile_observation_for_storage(raw)
 
 
 def _profile_observation_exists(profile: LegacyCustomerProfile, observation: dict[str, Any]) -> bool:
