@@ -208,6 +208,13 @@ from .trial_state_policy import (
     state_transition_verdict,
 )
 from .trial_store_schema import TRIAL_STORE_SCHEMA_SQL, ensure_column, ensure_trial_store_schema
+from .trial_store_rows import (
+    approval_from_row,
+    customer_from_row,
+    delivery_attempt_from_row,
+    state_transition_event_from_row,
+    trace_event_from_row,
+)
 from .trial_tool_registry import (
     TOOL_REGISTRY,
     TOOL_REGISTRY_VERSION,
@@ -475,6 +482,11 @@ __all__ = [
     "TRIAL_STORE_SCHEMA_SQL",
     "ensure_column",
     "ensure_trial_store_schema",
+    "approval_from_row",
+    "customer_from_row",
+    "delivery_attempt_from_row",
+    "state_transition_event_from_row",
+    "trace_event_from_row",
     "TOOL_REGISTRY",
     "TOOL_REGISTRY_VERSION",
     "TOOL_STAGE_POLICY",

@@ -73,12 +73,17 @@ from mahjong_agent import (  # noqa: E402
     approval_status_label,
     build_redis_cache_from_env,
     default_runtime_policy,
+    approval_from_row as trial_approval_from_row,
+    customer_from_row as trial_customer_from_row,
+    delivery_attempt_from_row as trial_delivery_attempt_from_row,
     env_bool,
     ensure_trial_store_schema,
     require_state_transition,
     semantic_slot_usable,
     semantic_slot_value,
+    state_transition_event_from_row as trial_state_transition_event_from_row,
     state_transition_verdict,
+    trace_event_from_row as trial_trace_event_from_row,
     tool_spec_for_stage,
     tool_specs_for_stage,
     TRACE_EVENT_SCHEMA_VERSION,
@@ -553,11 +558,11 @@ class TrialStore:
 
     def customers(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM customers ORDER BY display_name").fetchall()
-        return [self._customer_from_row(row) for row in rows]
+        return [trial_customer_from_row(row) for row in rows]
 
     def customer(self, customer_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
-        return self._customer_from_row(row) if row else None
+        return trial_customer_from_row(row) if row else None
 
     def upsert_customer(self, item: dict[str, Any]) -> dict[str, Any]:
         customer_id = self._safe_id(str(item.get("id") or item.get("display_name") or "customer"))
@@ -799,18 +804,18 @@ class TrialStore:
             "SELECT * FROM approval_requests WHERE target_type = ? AND target_id = ?",
             (target_type, target_id),
         ).fetchone()
-        return self._approval_from_row(row) if row else None
+        return trial_approval_from_row(row) if row else None
 
     def approval_request(self, approval_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM approval_requests WHERE id = ?", (approval_id,)).fetchone()
-        return self._approval_from_row(row) if row else None
+        return trial_approval_from_row(row) if row else None
 
     def recent_approvals(self, limit: int = 80) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM approval_requests ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [self._approval_from_row(row) for row in rows]
+        return [trial_approval_from_row(row) for row in rows]
 
     def trace_events(self, trace_id: str, limit: int = 300) -> list[dict[str, Any]]:
         safe_trace_id = str(trace_id or "").strip()
@@ -825,7 +830,7 @@ class TrialStore:
             """,
             (safe_trace_id, max(1, min(int(limit or 300), 1000))),
         ).fetchall()
-        return [self._trace_event_from_row(row) for row in rows]
+        return [trial_trace_event_from_row(row) for row in rows]
 
     def recent_traces(self, limit: int = 40) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -933,35 +938,35 @@ class TrialStore:
             """,
             params,
         ).fetchall()
-        return [self._state_transition_event_from_row(row) for row in rows]
+        return [trial_state_transition_event_from_row(row) for row in rows]
 
     def delivery_attempt(self, delivery_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM message_delivery_attempts WHERE id = ?",
             (delivery_id,),
         ).fetchone()
-        return self._delivery_attempt_from_row(row) if row else None
+        return trial_delivery_attempt_from_row(row) if row else None
 
     def delivery_attempt_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM message_delivery_attempts WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
-        return self._delivery_attempt_from_row(row) if row else None
+        return trial_delivery_attempt_from_row(row) if row else None
 
     def delivery_attempts_for_outbox(self, outbox_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM message_delivery_attempts WHERE outbox_id = ? ORDER BY created_at DESC",
             (outbox_id,),
         ).fetchall()
-        return [self._delivery_attempt_from_row(row) for row in rows]
+        return [trial_delivery_attempt_from_row(row) for row in rows]
 
     def recent_delivery_attempts(self, limit: int = 80) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM message_delivery_attempts ORDER BY created_at DESC LIMIT ?",
             (max(1, min(int(limit or 80), 300)),),
         ).fetchall()
-        return [self._delivery_attempt_from_row(row) for row in rows]
+        return [trial_delivery_attempt_from_row(row) for row in rows]
 
     def execute_outbox_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
         outbox_id = str(payload.get("outbox_id") or "").strip()
@@ -1755,31 +1760,6 @@ class TrialStore:
             "do_not_disturb": "别再打扰",
         }.get(feedback_type, feedback_type or "已反馈")
 
-    def _customer_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "id": row["id"],
-            "display_name": row["display_name"],
-            "contact": row["contact"],
-            "preferred_games": json_loads(row["preferred_games"], []),
-            "preferred_levels": json_loads(row["preferred_levels"], []),
-            "usual_start_hours": json_loads(row["usual_start_hours"], []),
-            "gender": normalize_gender(row["gender"]),
-            "gender_label": gender_label(row["gender"]),
-            "smoke_preference": row["smoke_preference"],
-            "response_speed": row["response_speed"],
-            "response_rate": row["response_rate"],
-            "last_invited_at": row["last_invited_at"],
-            "last_arrived_at": row["last_arrived_at"],
-            "invite_count": row["invite_count"],
-            "response_count": row["response_count"],
-            "arrival_count": row["arrival_count"],
-            "fatigue_score": row["fatigue_score"],
-            "no_contact": bool(row["no_contact"]),
-            "notes": row["notes"],
-            "usual_party_size": row["usual_party_size"],
-            "usual_party_size_confidence": row["usual_party_size_confidence"],
-        }
-
     def _game_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         game = {
             "id": row["id"],
@@ -1928,78 +1908,6 @@ class TrialStore:
             "reason": row["reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-        }
-
-    def _approval_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "id": row["id"],
-            "target_type": row["target_type"],
-            "target_id": row["target_id"],
-            "action_id": row["action_id"],
-            "idempotency_key": row["idempotency_key"],
-            "risk_level": row["risk_level"],
-            "status": row["status"],
-            "reviewer_id": row["reviewer_id"],
-            "reviewer_name": row["reviewer_name"],
-            "decision_reason": row["decision_reason"],
-            "original_message_text": row["original_message_text"],
-            "final_message_text": row["final_message_text"],
-            "metadata": json_loads(row["metadata_json"], {}),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "decided_at": row["decided_at"],
-        }
-
-    def _trace_event_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "id": int(row["id"]),
-            "trace_id": row["trace_id"],
-            "created_at": row["created_at"],
-            "level": row["level"],
-            "direction": row["direction"],
-            "event": row["event"],
-            "stage": row["stage"],
-            "schema_version": row["schema_version"],
-            "payload": json_loads(row["payload_json"], {}),
-            "content": row["content"],
-        }
-
-    def _state_transition_event_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "id": int(row["id"]),
-            "created_at": row["created_at"],
-            "entity_type": row["entity_type"],
-            "entity_id": row["entity_id"],
-            "from_status": row["from_status"],
-            "to_status": row["to_status"],
-            "event": row["event"],
-            "allowed": bool(row["allowed"]),
-            "reason": row["reason"],
-            "trace_id": row["trace_id"],
-            "action_id": row["action_id"],
-            "state_machine_version": row["state_machine_version"],
-            "schema_version": row["schema_version"],
-            "metadata": json_loads(row["metadata_json"], {}),
-        }
-
-    def _delivery_attempt_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "id": row["id"],
-            "outbox_id": row["outbox_id"],
-            "approval_id": row["approval_id"],
-            "channel": row["channel"],
-            "recipient_id": row["recipient_id"],
-            "recipient_name": row["recipient_name"],
-            "message_text": row["message_text"],
-            "status": row["status"],
-            "idempotency_key": row["idempotency_key"],
-            "action_id": row["action_id"],
-            "trace_id": row["trace_id"],
-            "error": row["error"],
-            "metadata": json_loads(row["metadata_json"], {}),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "delivered_at": row["delivered_at"],
         }
 
     def _candidate_conversation_for_outbox(self, outbox_id: str) -> list[dict[str, Any]]:
