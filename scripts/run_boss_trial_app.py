@@ -80,10 +80,15 @@ from mahjong_agent import (  # noqa: E402
     TrialTraceLogger,
     TrialEvalDataPaths,
     TrialEvalDataStore,
+    GENDER_LABELS,
+    GENDER_NOTE_PREFIX,
     ensure_trace_events_table,
     eval_case_tags,
     few_shot_parsed_text,
     format_io_log_line,
+    gender_label,
+    infer_gender_from_customer_text,
+    normalize_gender,
     read_jsonl_records,
     recent_trial_log_lines,
     render_trial_log_page,
@@ -91,6 +96,8 @@ from mahjong_agent import (  # noqa: E402
     summarize_http_output,
     trace_payload_from_content,
     trusted_action_proposer,
+    TRIAL_GAME_TYPE_LABELS,
+    TRIAL_VARIANT_LABELS,
     truncate_trial_log_text,
     use_controlled_trial_workflow,
     TrialShortMemoryTextMerger,
@@ -133,27 +140,9 @@ TIME_RESOLUTION_CONFIDENCE_THRESHOLD = 0.75
 LOCAL_AFTERNOON_CONTEXT_HOUR = 13
 LOCAL_TIME_MAX_LOOKAHEAD_HOURS = 8
 TRIAL_TRACE_LOGGER = TrialTraceLogger(db_path=DB_PATH, log_path=LOG_PATH)
-GENDER_LABELS = {"male": "男", "female": "女", "unknown": "未知"}
-GENDER_NOTE_PREFIX = "候选人组合偏好："
+GAME_TYPE_LABELS = TRIAL_GAME_TYPE_LABELS
+VARIANT_LABELS = TRIAL_VARIANT_LABELS
 
-
-GAME_TYPE_LABELS = {
-    "mahjong": "麻将",
-    "hangzhou_mahjong": "杭麻",
-    "sichuan_mahjong": "川麻",
-    "hongzhong_mahjong": "红中",
-    "zhuoji_mahjong": "捉鸡",
-    "hunan_mahjong": "湖南麻将",
-    "chongqing_mahjong": "重庆麻将",
-}
-
-VARIANT_LABELS = {
-    "caiqiao": "财敲",
-    "yaoji": "幺鸡",
-    "suji": "素鸡",
-    "yaoji_47": "幺鸡47",
-    "shayu": "鲨鱼",
-}
 
 CRITICAL_FIELDS = {"known_players", "start_time", "stake", "smoke", "duration"}
 FINAL_GAME_STATUSES = {"已成局", "已取消"}
@@ -803,50 +792,6 @@ def json_loads(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return default
-
-
-def normalize_gender(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    mapping = {
-        "male": "male",
-        "m": "male",
-        "man": "male",
-        "男": "male",
-        "男性": "male",
-        "男生": "male",
-        "男士": "male",
-        "female": "female",
-        "f": "female",
-        "woman": "female",
-        "女": "female",
-        "女性": "female",
-        "女生": "female",
-        "女士": "female",
-        "unknown": "unknown",
-        "未知": "unknown",
-        "不确定": "unknown",
-        "": "unknown",
-    }
-    return mapping.get(text, "unknown")
-
-
-def infer_gender_from_customer_text(display_name: str, notes: str = "") -> str:
-    name = display_name.strip()
-    normalized_name = name.lower()
-    note_text = notes.strip()
-    if re.search(r"(^|[；;，,\s])男(性|生|士)?([；;，,\s]|$)", note_text):
-        return "male"
-    if re.search(r"(^|[；;，,\s])女(性|生|士)?([；;，,\s]|$)", note_text):
-        return "female"
-    if name.endswith("哥"):
-        return "male"
-    if name.endswith("姐"):
-        return "female"
-    if normalized_name in {"ben"}:
-        return "male"
-    if normalized_name in {"amy"}:
-        return "female"
-    return "unknown"
 
 
 def make_trace_id() -> str:
@@ -2621,7 +2566,7 @@ class TrialStore:
             "preferred_levels": json_loads(row["preferred_levels"], []),
             "usual_start_hours": json_loads(row["usual_start_hours"], []),
             "gender": normalize_gender(row["gender"]),
-            "gender_label": GENDER_LABELS.get(normalize_gender(row["gender"]), "未知"),
+            "gender_label": gender_label(row["gender"]),
             "smoke_preference": row["smoke_preference"],
             "response_speed": row["response_speed"],
             "response_rate": row["response_rate"],

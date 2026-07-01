@@ -153,6 +153,15 @@ from .trial_http_logging import (
     summarize_http_output,
     truncate_text as truncate_trial_log_text,
 )
+from .trial_labels import (
+    GAME_TYPE_LABELS as TRIAL_GAME_TYPE_LABELS,
+    GENDER_LABELS,
+    GENDER_NOTE_PREFIX,
+    VARIANT_LABELS as TRIAL_VARIANT_LABELS,
+    gender_label,
+    infer_gender_from_customer_text,
+    normalize_gender,
+)
 from .trial_manual_game import TrialManualGameAdapter
 from .trial_observability import (
     TRACE_EVENT_SCHEMA_VERSION,
@@ -399,6 +408,13 @@ __all__ = [
     "summarize_http_input",
     "summarize_http_output",
     "truncate_trial_log_text",
+    "TRIAL_GAME_TYPE_LABELS",
+    "GENDER_LABELS",
+    "GENDER_NOTE_PREFIX",
+    "TRIAL_VARIANT_LABELS",
+    "gender_label",
+    "infer_gender_from_customer_text",
+    "normalize_gender",
     "TrialManualGameAdapter",
     "TRACE_EVENT_SCHEMA_VERSION",
     "TrialTraceLogger",
