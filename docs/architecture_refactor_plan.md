@@ -161,7 +161,7 @@ src/mahjong_agent/
 - `scripts/check_badcase_regression_coverage.py` 已新增并接入 `scripts/run_evals.py`：所有 `triage_status=fixed` 的 badcase 必须声明 `regression_refs`，并指向存在的 golden、controlled regression 或 pytest 用例；`triage_status=new` 的 badcase 保留为待处理队列，不作为发布阻塞。
 - `scripts/run_boss_trial_app.py` 仍是旧试用台入口，后续只应作为 HTTP/UI 壳逐步调用新模块。
 - 受控工作流接入试用台已拆成 `TrialControlledEntryAdapter`、`trial_projection.py`、`TrialControlledPersistenceAdapter`、`TrialControlledResponseAdapter` 几层迁移桥接，用于证明 `HTTP 输入 -> Message -> LLM contract -> ActionValidator -> ToolOrchestrator -> StateMachine -> 待审批 outbox` 可以闭环；后续应继续把试用台脚本收缩为 HTTP/UI 壳。
-- 试用台 `/api/analyze` 默认走受控工作流；如需对照旧链路，可显式传 `use_controlled_workflow=false`，或设置 `MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW=0`。这保证日常老板试用和回归测试优先验证目标架构，而不是继续落到 legacy `BossTrialService.analyze()`。
+- 试用台 `/api/analyze` 默认走受控工作流，并且默认不能被请求体静默切回 legacy。只有显式设置 `MAHJONG_TRIAL_ALLOW_LEGACY_WORKFLOW=1` 后，才允许通过 `use_controlled_workflow=false` 或 `MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW=0` 做旧链路对照。这样保证日常老板试用和回归测试优先验证目标架构，而不是继续落到 legacy `BossTrialService.analyze()`。
 
 ## 核心数据模型
 

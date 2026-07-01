@@ -231,8 +231,18 @@ def use_controlled_trial_workflow(payload: dict[str, Any] | None = None) -> bool
         else payload.get("controlled_workflow")
     )
     if explicit is not None:
-        return env_bool_value(explicit, default=False)
-    return env_bool("MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW", True)
+        requested_controlled = env_bool_value(explicit, default=True)
+        if requested_controlled:
+            return True
+        return not legacy_trial_workflow_allowed()
+    env_requested_controlled = env_bool("MAHJONG_TRIAL_USE_CONTROLLED_WORKFLOW", True)
+    if env_requested_controlled:
+        return True
+    return not legacy_trial_workflow_allowed()
+
+
+def legacy_trial_workflow_allowed() -> bool:
+    return env_bool("MAHJONG_TRIAL_ALLOW_LEGACY_WORKFLOW", False)
 
 
 def env_bool_value(value: Any, default: bool) -> bool:
