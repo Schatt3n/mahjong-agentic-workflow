@@ -1155,6 +1155,79 @@ def test_v2_runtime_marks_deduplicated_tool_transitions_as_replayed_not_new_stat
     assert validate_agent_runtime_trace_completeness(events).complete is True
 
 
+def test_v2_tool_gateway_serializes_concurrent_same_idempotency_key_execution() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorderV2()
+    gateway = SlowCountingToolGateway(store=store, trace_recorder=trace)
+    call = ToolCallV2(
+        name="create_game",
+        arguments={
+            "requirement": {
+                "game_type": "hangzhou_mahjong",
+                "game_type_label": "杭麻",
+                "stake": "1",
+                "start_time_kind": "asap_when_full",
+                "start_time_text": "人齐开",
+                "user_visible_summary": "杭麻 1档 人齐开",
+            },
+            "organizer_id": "zhang",
+            "organizer_name": "张哥",
+            "known_players": [{"customer_id": "zhang", "display_name": "张哥"}],
+        },
+        idempotency_key="model-key-should-not-control-backend-idempotency",
+    )
+    start = threading.Barrier(3)
+    results: list[ToolResultV2] = []
+
+    def worker(trace_id: str) -> None:
+        start.wait()
+        results.append(
+            gateway.execute(
+                call,
+                trace_id=trace_id,
+                conversation_id="concurrent_tool_v2",
+                sender_id="zhang",
+                sender_name="张哥",
+                step_index=101,
+                source_message_id="concurrent-tool-message",
+            )
+        )
+
+    threads = [
+        threading.Thread(target=worker, args=("trace_v2_tool_concurrent_1",)),
+        threading.Thread(target=worker, args=("trace_v2_tool_concurrent_2",)),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert gateway.execution_count == 1
+    assert len(results) == 2
+    assert len(store.games) == 1
+    assert sorted(result.deduplicated for result in results) == [False, True]
+    assert len({result.idempotency_key for result in results}) == 1
+    assert all(
+        result.idempotency_key.startswith("message:concurrent-tool-message:tool:create_game:args:")
+        for result in results
+    )
+    hit_values = []
+    for trace_id in ("trace_v2_tool_concurrent_1", "trace_v2_tool_concurrent_2"):
+        events = trace.get_trace(trace_id)
+        assert [event.step for event in events[:3]] == [
+            "tool_gateway_received",
+            "tool_idempotency_lock_acquired",
+            "tool_idempotency_checked",
+        ]
+        hit_values.extend(
+            event.content["hit"]
+            for event in events
+            if event.step == "tool_idempotency_checked"
+        )
+    assert sorted(hit_values) == [False, True]
+
+
 def test_v2_current_game_search_uses_model_structured_requirement_fields() -> None:
     store = seeded_store()
     store.create_game(
@@ -1910,6 +1983,25 @@ class ConcurrencyProbeClient:
                 "needs_human": False,
             },
             ensure_ascii=False,
+        )
+
+
+class SlowCountingToolGateway(ToolGatewayV2):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._execution_count_lock = threading.Lock()
+        self.execution_count = 0
+
+    def _execute_allowed(self, call, *, trace_id, conversation_id, sender_id, sender_name):
+        with self._execution_count_lock:
+            self.execution_count += 1
+        time.sleep(0.05)
+        return super()._execute_allowed(
+            call,
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
         )
 
 

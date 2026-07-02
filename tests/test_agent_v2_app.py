@@ -116,6 +116,7 @@ def test_agent_v2_manual_badcase_is_recorded_through_tool_gateway_trace() -> Non
         "manual_badcase_input",
         "tool_called",
         "tool_gateway_received",
+        "tool_idempotency_lock_acquired",
         "tool_idempotency_checked",
         "tool_definition_checked",
         "tool_schema_checked",

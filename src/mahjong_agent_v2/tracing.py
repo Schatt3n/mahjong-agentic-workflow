@@ -130,6 +130,7 @@ def validate_agent_runtime_trace_completeness(
             "manual_badcase_input",
             "tool_called",
             "tool_gateway_received",
+            "tool_idempotency_lock_acquired",
             "tool_idempotency_checked",
             "tool_gateway_completed",
             "tool_result",
@@ -169,7 +170,12 @@ def validate_agent_runtime_trace_completeness(
 def _tool_gateway_required_steps(present: list[str]) -> list[str]:
     if "tool_called" not in present:
         return []
-    return ["tool_gateway_received", "tool_idempotency_checked", "tool_gateway_completed"]
+    return [
+        "tool_gateway_received",
+        "tool_idempotency_lock_acquired",
+        "tool_idempotency_checked",
+        "tool_gateway_completed",
+    ]
 
 
 def _reply_review_required_steps(present: list[str]) -> list[str]:
@@ -284,6 +290,8 @@ def _trace_ordering_errors(steps: list[str]) -> list[str]:
             errors.append(f"{before} must occur before {after}")
     for before, after in [
         ("tool_called", "tool_gateway_received"),
+        ("tool_gateway_received", "tool_idempotency_lock_acquired"),
+        ("tool_idempotency_lock_acquired", "tool_idempotency_checked"),
         ("tool_gateway_received", "tool_idempotency_checked"),
         ("tool_idempotency_checked", "tool_definition_checked"),
         ("tool_definition_checked", "tool_schema_checked"),
@@ -393,11 +401,13 @@ def _tool_pairing_errors(events: list[TraceEventV2]) -> list[str]:
     steps = [event.step for event in events]
     called_indexes = [index for index, step in enumerate(steps) if step == "tool_called"]
     received_indexes = [index for index, step in enumerate(steps) if step == "tool_gateway_received"]
+    lock_indexes = [index for index, step in enumerate(steps) if step == "tool_idempotency_lock_acquired"]
     idempotency_indexes = [index for index, step in enumerate(steps) if step == "tool_idempotency_checked"]
     completed_indexes = [index for index, step in enumerate(steps) if step == "tool_gateway_completed"]
     result_indexes = [index for index, step in enumerate(steps) if step == "tool_result"]
     for name, indexes in [
         ("tool_gateway_received", received_indexes),
+        ("tool_idempotency_lock_acquired", lock_indexes),
         ("tool_idempotency_checked", idempotency_indexes),
         ("tool_gateway_completed", completed_indexes),
         ("tool_result", result_indexes),
@@ -407,11 +417,11 @@ def _tool_pairing_errors(events: list[TraceEventV2]) -> list[str]:
     if errors:
         return errors
     for pair_index, indexes in enumerate(
-        zip(called_indexes, received_indexes, idempotency_indexes, completed_indexes, result_indexes),
+        zip(called_indexes, received_indexes, lock_indexes, idempotency_indexes, completed_indexes, result_indexes),
         start=1,
     ):
-        called_index, received_index, idempotency_index, completed_index, result_index = indexes
-        if not (called_index < received_index < idempotency_index < completed_index < result_index):
+        called_index, received_index, lock_index, idempotency_index, completed_index, result_index = indexes
+        if not (called_index < received_index < lock_index < idempotency_index < completed_index < result_index):
             errors.append(f"tool pair {pair_index} gateway events are out of order")
     return errors
 

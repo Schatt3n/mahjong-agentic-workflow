@@ -3,12 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from .eval import EvalRecorderV2, InMemoryEvalRecorderV2
 from .models import ToolCallV2, ToolResultV2
 from .store import InMemoryAgentStoreV2
+
+
+_IDEMPOTENCY_LOCKS: dict[str, threading.RLock] = {}
+_IDEMPOTENCY_LOCKS_GUARD = threading.RLock()
 
 
 @dataclass(slots=True)
@@ -77,156 +82,167 @@ class ToolGatewayV2:
                 ),
             },
         )
-        existing = self.store.idempotent_result(idempotency_key)
-        self._record(
-            trace_id,
-            "tool_idempotency_checked",
-            {
-                "tool_name": call.name,
-                "step_index": step_index,
-                "idempotency_key": idempotency_key,
-                "idempotency_source": (
-                    "message_tool_arguments" if source_message_id else "model_or_trace"
-                ),
-                "hit": existing is not None,
-            },
-        )
-        if existing is not None:
-            return self._complete(
+        lock = idempotency_lock_for_key(idempotency_key)
+        with lock:
+            self._record(
                 trace_id,
-                step_index,
-                ToolResultV2(
-                    name=existing.name,
-                    called=existing.called,
-                    allowed=existing.allowed,
-                    result=dict(existing.result),
-                    error=existing.error,
-                    idempotency_key=idempotency_key,
-                    deduplicated=True,
-                    state_transitions=list(existing.state_transitions),
-                ),
-                outcome="deduplicated",
+                "tool_idempotency_lock_acquired",
+                {
+                    "tool_name": call.name,
+                    "step_index": step_index,
+                    "idempotency_key": idempotency_key,
+                },
             )
-        if definition is None:
+            existing = self.store.idempotent_result(idempotency_key)
+            self._record(
+                trace_id,
+                "tool_idempotency_checked",
+                {
+                    "tool_name": call.name,
+                    "step_index": step_index,
+                    "idempotency_key": idempotency_key,
+                    "idempotency_source": (
+                        "message_tool_arguments" if source_message_id else "model_or_trace"
+                    ),
+                    "hit": existing is not None,
+                },
+            )
+            if existing is not None:
+                return self._complete(
+                    trace_id,
+                    step_index,
+                    ToolResultV2(
+                        name=existing.name,
+                        called=existing.called,
+                        allowed=existing.allowed,
+                        result=dict(existing.result),
+                        error=existing.error,
+                        idempotency_key=idempotency_key,
+                        deduplicated=True,
+                        state_transitions=list(existing.state_transitions),
+                    ),
+                    outcome="deduplicated",
+                )
+            if definition is None:
+                self._record(
+                    trace_id,
+                    "tool_definition_checked",
+                    {"tool_name": call.name, "step_index": step_index, "allowed": False, "error": "unknown_tool"},
+                    level="WARN",
+                )
+                return self._complete(
+                    trace_id,
+                    step_index,
+                    ToolResultV2(
+                        name=call.name,
+                        called=False,
+                        allowed=False,
+                        error=f"unknown tool: {call.name}",
+                        idempotency_key=idempotency_key,
+                    ),
+                    outcome="blocked",
+                    remember_key=idempotency_key,
+                )
             self._record(
                 trace_id,
                 "tool_definition_checked",
-                {"tool_name": call.name, "step_index": step_index, "allowed": False, "error": "unknown_tool"},
-                level="WARN",
+                {
+                    "tool_name": call.name,
+                    "step_index": step_index,
+                    "allowed": True,
+                    "risk_level": definition.risk_level,
+                    "execution_mode": definition.execution_mode,
+                },
             )
-            return self._complete(
-                trace_id,
-                step_index,
-                ToolResultV2(
-                    name=call.name,
-                    called=False,
-                    allowed=False,
-                    error=f"unknown tool: {call.name}",
-                    idempotency_key=idempotency_key,
-                ),
-                outcome="blocked",
-                remember_key=idempotency_key,
-            )
-        self._record(
-            trace_id,
-            "tool_definition_checked",
-            {
-                "tool_name": call.name,
-                "step_index": step_index,
-                "allowed": True,
-                "risk_level": definition.risk_level,
-                "execution_mode": definition.execution_mode,
-            },
-        )
-        schema_error = validate_schema(call.arguments, definition.schema)
-        if schema_error:
+            schema_error = validate_schema(call.arguments, definition.schema)
+            if schema_error:
+                self._record(
+                    trace_id,
+                    "tool_schema_checked",
+                    {"tool_name": call.name, "step_index": step_index, "allowed": False, "error": schema_error},
+                    level="WARN",
+                )
+                return self._complete(
+                    trace_id,
+                    step_index,
+                    ToolResultV2(
+                        name=call.name,
+                        called=False,
+                        allowed=False,
+                        error=schema_error,
+                        idempotency_key=idempotency_key,
+                    ),
+                    outcome="blocked",
+                    remember_key=idempotency_key,
+                )
             self._record(
                 trace_id,
                 "tool_schema_checked",
-                {"tool_name": call.name, "step_index": step_index, "allowed": False, "error": schema_error},
-                level="WARN",
+                {"tool_name": call.name, "step_index": step_index, "allowed": True},
             )
-            return self._complete(
-                trace_id,
-                step_index,
-                ToolResultV2(
-                    name=call.name,
-                    called=False,
-                    allowed=False,
-                    error=schema_error,
-                    idempotency_key=idempotency_key,
-                ),
-                outcome="blocked",
-                remember_key=idempotency_key,
-            )
-        self._record(
-            trace_id,
-            "tool_schema_checked",
-            {"tool_name": call.name, "step_index": step_index, "allowed": True},
-        )
-        permission_error = self._permission_error(definition)
-        if permission_error:
+            permission_error = self._permission_error(definition)
+            if permission_error:
+                self._record(
+                    trace_id,
+                    "tool_permission_checked",
+                    {
+                        "tool_name": call.name,
+                        "step_index": step_index,
+                        "allowed": False,
+                        "risk_level": definition.risk_level,
+                        "execution_mode": definition.execution_mode,
+                        "error": permission_error,
+                    },
+                    level="WARN",
+                )
+                return self._complete(
+                    trace_id,
+                    step_index,
+                    ToolResultV2(
+                        name=call.name,
+                        called=False,
+                        allowed=False,
+                        error=permission_error,
+                        idempotency_key=idempotency_key,
+                    ),
+                    outcome="blocked",
+                    remember_key=idempotency_key,
+                )
             self._record(
                 trace_id,
                 "tool_permission_checked",
                 {
                     "tool_name": call.name,
                     "step_index": step_index,
-                    "allowed": False,
+                    "allowed": True,
                     "risk_level": definition.risk_level,
                     "execution_mode": definition.execution_mode,
-                    "error": permission_error,
                 },
-                level="WARN",
             )
-            return self._complete(
-                trace_id,
-                step_index,
-                ToolResultV2(
+            try:
+                result = self._execute_allowed(
+                    call,
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                )
+            except Exception as exc:
+                result = ToolResultV2(
                     name=call.name,
                     called=False,
                     allowed=False,
-                    error=permission_error,
+                    error=f"{type(exc).__name__}: {exc}",
                     idempotency_key=idempotency_key,
-                ),
-                outcome="blocked",
+                )
+            result.idempotency_key = idempotency_key
+            return self._complete(
+                trace_id,
+                step_index,
+                result,
+                outcome="executed" if result.called and result.allowed else "failed",
                 remember_key=idempotency_key,
             )
-        self._record(
-            trace_id,
-            "tool_permission_checked",
-            {
-                "tool_name": call.name,
-                "step_index": step_index,
-                "allowed": True,
-                "risk_level": definition.risk_level,
-                "execution_mode": definition.execution_mode,
-            },
-        )
-        try:
-            result = self._execute_allowed(
-                call,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-            )
-        except Exception as exc:
-            result = ToolResultV2(
-                name=call.name,
-                called=False,
-                allowed=False,
-                error=f"{type(exc).__name__}: {exc}",
-                idempotency_key=idempotency_key,
-            )
-        result.idempotency_key = idempotency_key
-        return self._complete(
-            trace_id,
-            step_index,
-            result,
-            outcome="executed" if result.called and result.allowed else "failed",
-            remember_key=idempotency_key,
-        )
 
     def _execute_allowed(
         self,
@@ -516,6 +532,15 @@ def backend_tool_idempotency_key(call: ToolCallV2, *, source_message_id: str | N
     normalized = json.dumps(call.arguments or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
     return f"message:{source_message_id}:tool:{call.name}:args:{digest}"
+
+
+def idempotency_lock_for_key(key: str) -> threading.RLock:
+    with _IDEMPOTENCY_LOCKS_GUARD:
+        lock = _IDEMPOTENCY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _IDEMPOTENCY_LOCKS[key] = lock
+        return lock
 
 
 def requirement_schema_v2() -> dict[str, Any]:
