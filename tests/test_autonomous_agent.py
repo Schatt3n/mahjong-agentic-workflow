@@ -7,6 +7,7 @@ from mahjong_agent.core import AgentCore
 from mahjong_agent.controlled_runtime import ControlledRuntimeConfig, build_controlled_runtime
 from mahjong_agent.models import ChannelType, CustomerProfile, Message, PlayPreference
 from mahjong_agent.workflow_models import ActionName, GameWorkflowStatus, ToolName
+from mahjong_agent.autonomous_agent import DEFAULT_AGENT_PROMPT_PATH
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -187,6 +188,61 @@ def test_autonomous_agent_create_game_tool_goes_through_state_machine(tmp_path) 
     assert result.tool_orchestration.result_for(ToolName.CREATE_GAME) is not None
     assert result.run.state_transitions
     assert result.run.state_transitions[-1].to_status == GameWorkflowStatus.OPEN.value
+
+
+def test_autonomous_agent_executes_batch_tool_plan_without_extra_llm(tmp_path) -> None:
+    requirement = complete_requirement_payload()
+    client = SequenceAgentClient(
+        [
+            {
+                "decision": "tool_call",
+                "goal_status": "in_progress",
+                "intent": "find_players",
+                "reasoning_summary": "信息足够，创建局、搜索候选人并生成待审批邀约草稿。",
+                "requirement": requirement,
+                "tool_calls": [
+                    {"tool_name": "create_game", "arguments": {}},
+                    {"tool_name": "search_candidate_customers", "arguments": {}},
+                    {"tool_name": "create_pending_outbox", "arguments": {}},
+                ],
+                "reply_text": "好的，我帮你问问。",
+            }
+        ]
+    )
+    runtime = build_controlled_runtime(
+        core=core_with_customers(8),
+        llm_client=client,
+        config=ControlledRuntimeConfig(
+            trace_jsonl_path=tmp_path / "trace.jsonl",
+            autonomous_agent_enabled=True,
+        ),
+    )
+
+    result = runtime.service.handle_message(
+        message("一个人，1块的"),
+        now=NOW,
+        trace_id="trace_auto_batch_tools",
+    )
+
+    assert result.final_text == "好的，我帮你问问。"
+    assert result.tool_orchestration.result_for(ToolName.CREATE_GAME) is not None
+    assert result.tool_orchestration.result_for(ToolName.SEARCH_CANDIDATE_CUSTOMERS) is not None
+    assert result.tool_orchestration.result_for(ToolName.CREATE_PENDING_OUTBOX) is not None
+    assert result.run.validated_action.effective_action == ActionName.QUEUE_INVITES
+    assert result.run.reply_draft.metadata["agent_steps"][0]["tool_calls"] == [
+        {"tool_name": "create_game", "arguments": {}},
+        {"tool_name": "search_candidate_customers", "arguments": {}},
+        {"tool_name": "create_pending_outbox", "arguments": {}},
+    ]
+    assert len(client.calls) == 1
+
+
+def test_autonomous_agent_prompt_keeps_tool_arguments_compact() -> None:
+    prompt = DEFAULT_AGENT_PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "禁止在 `tool_call.arguments` 或 `tool_calls[].arguments` 里重复" in prompt
+    assert "大多数工具调用的 `arguments` 应该是 `{}`" in prompt
+    assert "输出要尽量小" in prompt
 
 
 def test_autonomous_agent_does_not_feed_private_outbox_counts_to_model(tmp_path) -> None:

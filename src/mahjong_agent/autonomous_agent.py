@@ -61,6 +61,12 @@ class AutonomousAgentConfig:
 
 
 @dataclass(slots=True)
+class AgentToolCall:
+    tool_name: ToolName
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class AgentStep:
     index: int
     decision: str
@@ -70,6 +76,7 @@ class AgentStep:
     requirement: GameRequirement
     tool_name: ToolName | None = None
     tool_arguments: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[AgentToolCall] = field(default_factory=list)
     reply_text: str = ""
     raw_output: dict[str, Any] = field(default_factory=dict)
 
@@ -132,17 +139,43 @@ class AutonomousAgentService(ControlledWorkflowService):
                 self._agent_step_payload(step),
                 now=now,
             )
-            if step.decision == "tool_call" and step.tool_name is not None:
-                tool_result = self._execute_agent_tool(
-                    step,
-                    context=context,
-                    trace_id=trace_id,
-                    current_requirement=current_requirement,
-                    scratch=scratch,
-                    now=now,
-                )
-                tool_results.append(tool_result)
-                self._record_tool_results(trace_id, [tool_result], now=now)
+            if step.decision == "tool_call":
+                step_tool_results: list[ToolResult] = []
+                for tool_index, tool_call in enumerate(_tool_calls_for_step(step), start=1):
+                    tool_step = AgentStep(
+                        index=step.index,
+                        decision=step.decision,
+                        goal_status=step.goal_status,
+                        intent=step.intent,
+                        reasoning_summary=step.reasoning_summary,
+                        requirement=step.requirement,
+                        tool_name=tool_call.tool_name,
+                        tool_arguments=dict(tool_call.arguments),
+                        tool_calls=[tool_call],
+                        reply_text=step.reply_text,
+                        raw_output=step.raw_output,
+                    )
+                    tool_result = self._execute_agent_tool(
+                        tool_step,
+                        context=context,
+                        trace_id=trace_id,
+                        current_requirement=current_requirement,
+                        scratch=scratch,
+                        now=now,
+                        tool_index=tool_index,
+                    )
+                    tool_results.append(tool_result)
+                    step_tool_results.append(tool_result)
+                    self._record_tool_results(trace_id, [tool_result], now=now)
+                    if not tool_result.called or not tool_result.allowed or tool_result.error:
+                        break
+                if (
+                    step.reply_text
+                    and step_tool_results
+                    and all(item.called and item.allowed and not item.error for item in step_tool_results)
+                ):
+                    final_step = step
+                    break
                 continue
             final_step = step
             break
@@ -359,9 +392,10 @@ class AutonomousAgentService(ControlledWorkflowService):
         decision = str(raw.get("decision") or "human_review").strip()
         if decision not in {"tool_call", "final_reply", "wait_user", "human_review", "ignore"}:
             decision = "human_review"
-        tool_call = raw.get("tool_call") if isinstance(raw.get("tool_call"), dict) else {}
-        tool_name = _coerce_tool_name(tool_call.get("tool_name")) if decision == "tool_call" else None
-        if decision == "tool_call" and tool_name == ToolName.UNKNOWN:
+        tool_calls = _tool_calls_from_raw(raw) if decision == "tool_call" else []
+        tool_name = tool_calls[0].tool_name if tool_calls else None
+        tool_arguments = dict(tool_calls[0].arguments) if tool_calls else {}
+        if decision == "tool_call" and not tool_calls:
             decision = "human_review"
         return AgentStep(
             index=step_index,
@@ -371,7 +405,8 @@ class AutonomousAgentService(ControlledWorkflowService):
             reasoning_summary=str(raw.get("reasoning_summary") or ""),
             requirement=_requirement_from_raw(raw.get("requirement"), fallback=fallback_requirement),
             tool_name=tool_name,
-            tool_arguments=dict(tool_call.get("arguments") or {}) if isinstance(tool_call.get("arguments"), dict) else {},
+            tool_arguments=tool_arguments,
+            tool_calls=tool_calls,
             reply_text=str(raw.get("reply_text") or ""),
             raw_output=raw,
         )
@@ -386,7 +421,9 @@ class AutonomousAgentService(ControlledWorkflowService):
             return step
         if _has_successful_tool_result(tool_results, ToolName.SEARCH_CURRENT_OPEN_GAMES):
             return step
-        if step.decision == "tool_call" and step.tool_name == ToolName.SEARCH_CURRENT_OPEN_GAMES:
+        if step.decision == "tool_call" and any(
+            item.tool_name == ToolName.SEARCH_CURRENT_OPEN_GAMES for item in _tool_calls_for_step(step)
+        ):
             return step
         return AgentStep(
             index=step.index,
@@ -413,6 +450,7 @@ class AutonomousAgentService(ControlledWorkflowService):
         current_requirement: GameRequirement,
         scratch: dict[str, Any],
         now: datetime,
+        tool_index: int = 1,
     ) -> ToolResult:
         assert step.tool_name is not None
         request = ToolCallRequest(
@@ -426,7 +464,7 @@ class AutonomousAgentService(ControlledWorkflowService):
             },
             risk_level=_risk_for_tool(step.tool_name),
             execution_mode=_mode_for_tool(step.tool_name),
-            idempotency_key=f"{trace_id}:agent_step_{step.index}:{step.tool_name.value}",
+            idempotency_key=f"{trace_id}:agent_step_{step.index}.{tool_index}:{step.tool_name.value}",
             reason=step.reasoning_summary,
         )
         permission_error = self._agent_tool_permission_error(request)
@@ -563,6 +601,12 @@ class AutonomousAgentService(ControlledWorkflowService):
             "intent": step.intent.value,
             "reasoning_summary": step.reasoning_summary,
             "tool_name": step.tool_name.value if step.tool_name else None,
+            "tool_calls": [
+                {"tool_name": item.tool_name.value, "arguments": dict(item.arguments)}
+                for item in _tool_calls_for_step(step)
+            ]
+            if step.decision == "tool_call"
+            else [],
             "reply_text": step.reply_text,
             "requirement": step.requirement.to_prompt_dict(),
         }
@@ -649,6 +693,41 @@ def _coerce_tool_name(value: Any) -> ToolName:
         return ToolName(str(value or ToolName.UNKNOWN.value))
     except ValueError:
         return ToolName.UNKNOWN
+
+
+def _tool_call_from_raw(raw: Any) -> AgentToolCall | None:
+    if not isinstance(raw, dict):
+        return None
+    tool_name = _coerce_tool_name(raw.get("tool_name"))
+    if tool_name == ToolName.UNKNOWN:
+        return None
+    arguments = raw.get("arguments")
+    return AgentToolCall(
+        tool_name=tool_name,
+        arguments=dict(arguments) if isinstance(arguments, dict) else {},
+    )
+
+
+def _tool_calls_from_raw(raw: dict[str, Any]) -> list[AgentToolCall]:
+    calls: list[AgentToolCall] = []
+    raw_calls = raw.get("tool_calls")
+    if isinstance(raw_calls, list):
+        for item in raw_calls:
+            call = _tool_call_from_raw(item)
+            if call is not None:
+                calls.append(call)
+    single_call = _tool_call_from_raw(raw.get("tool_call"))
+    if single_call is not None and not calls:
+        calls.append(single_call)
+    return calls
+
+
+def _tool_calls_for_step(step: AgentStep) -> list[AgentToolCall]:
+    if step.tool_calls:
+        return list(step.tool_calls)
+    if step.tool_name is None:
+        return []
+    return [AgentToolCall(step.tool_name, dict(step.tool_arguments))]
 
 
 def _action_from_step(step: AgentStep) -> ActionName:
