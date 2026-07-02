@@ -232,6 +232,7 @@ class AgentActionV3:
     reply_to_user: str = ""
     tool_calls: list[ToolCallV3] = field(default_factory=list)
     needs_human: bool = False
+    stop_reason: dict[str, Any] = field(default_factory=dict)
     badcase: dict[str, Any] | None = None
 
     @classmethod
@@ -260,6 +261,7 @@ class AgentActionV3:
             reply_to_user=str(payload.get("reply_to_user") or ""),
             tool_calls=calls,
             needs_human=bool(payload.get("needs_human")),
+            stop_reason=dict(payload.get("stop_reason") or {}) if isinstance(payload.get("stop_reason"), dict) else {},
             badcase=badcase,
         )
 
@@ -271,6 +273,7 @@ class AgentActionV3:
             "reply_to_user": self.reply_to_user,
             "tool_calls": [item.to_dict() for item in self.tool_calls],
             "needs_human": self.needs_human,
+            "stop_reason": dict(self.stop_reason),
             "badcase": self.badcase,
         }
 

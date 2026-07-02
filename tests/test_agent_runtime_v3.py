@@ -432,6 +432,46 @@ def test_v3_action_contract_rejects_terminal_status_without_customer_reply() -> 
     assert "completed requires non-empty reply_to_user" in contract_event.content["errors"]
 
 
+def test_v3_action_contract_requires_auditable_stop_reason() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorderV3()
+    client = StaticAgentClientV3(
+        [
+            json.dumps(
+                {
+                    "goal": "测试提前停止",
+                    "objective_status": "completed",
+                    "reasoning_summary": "模型直接说完成，但没有解释为什么可以停。",
+                    "reply_to_user": "好的，我先看看。",
+                    "tool_calls": [],
+                    "needs_human": False,
+                    "badcase": None,
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    runtime = AgentRuntimeV3(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_stop_reason_contract",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="帮我组一个",
+            message_id="msg_v3_stop_reason_contract",
+        ),
+        trace_id="trace_v3_stop_reason_contract",
+    )
+
+    assert result.final_reply == "这个我先转人工确认一下。"
+    assert result.tool_results == []
+    assert store.games == {}
+    contract_event = next(event for event in trace.get_trace("trace_v3_stop_reason_contract") if event.step == "action_contract_error")
+    assert "missing required key: stop_reason" in contract_event.content["errors"]
+    assert "stop_reason must be object" in contract_event.content["errors"]
+
+
 def test_v3_action_contract_rejects_unknown_tool_calls_and_human_flag_conflict() -> None:
     store = seeded_store()
     trace = InMemoryTraceRecorderV3()
@@ -1223,8 +1263,24 @@ def action_json(
     reply_to_user: str = "",
     tool_calls: list[dict[str, Any]] | None = None,
     needs_human: bool = False,
+    stop_reason: dict[str, Any] | None = None,
     badcase: dict[str, Any] | None = None,
 ) -> str:
+    if stop_reason is None:
+        if objective_status == "needs_tool":
+            stop_reason = {
+                "can_stop": False,
+                "why": "还需要执行工具才能继续。",
+                "pending_work": [call.get("name", "tool") for call in tool_calls or []],
+                "depends_on_tool_results": False,
+            }
+        else:
+            stop_reason = {
+                "can_stop": True,
+                "why": "本轮已经可以停止并回复用户。",
+                "pending_work": [],
+                "depends_on_tool_results": False,
+            }
     return json.dumps(
         {
             "goal": "测试 V3 agent 主链路",
@@ -1233,6 +1289,7 @@ def action_json(
             "reply_to_user": reply_to_user,
             "tool_calls": tool_calls or [],
             "needs_human": needs_human,
+            "stop_reason": stop_reason,
             "badcase": badcase,
         },
         ensure_ascii=False,

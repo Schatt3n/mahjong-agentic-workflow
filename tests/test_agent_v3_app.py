@@ -43,6 +43,12 @@ def test_v3_manual_badcase_is_recorded_through_tool_gateway(tmp_path) -> None:
                         "reply_to_user": "好的，我先帮你留意下。",
                         "tool_calls": [],
                         "needs_human": False,
+                        "stop_reason": {
+                            "can_stop": True,
+                            "why": "测试场景模拟模型提前停止，后续由人工 badcase 入口归档。",
+                            "pending_work": [],
+                            "depends_on_tool_results": False,
+                        },
                         "badcase": None,
                     },
                     ensure_ascii=False,

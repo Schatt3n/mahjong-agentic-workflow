@@ -102,6 +102,7 @@ def output_contract_v3() -> dict[str, Any]:
             "reply_to_user",
             "tool_calls",
             "needs_human",
+            "stop_reason",
         ],
         "objective_status_values": ["needs_tool", "waiting_user", "completed", "needs_human", "unknown"],
         "field_types": {
@@ -111,7 +112,14 @@ def output_contract_v3() -> dict[str, Any]:
             "reply_to_user": "string",
             "tool_calls": "array",
             "needs_human": "boolean",
+            "stop_reason": "object",
             "badcase": "null; deprecated side-channel, call record_badcase tool instead",
+        },
+        "stop_reason_contract": {
+            "can_stop": "required boolean; false when objective_status=needs_tool, true for terminal statuses",
+            "why": "required non-empty string explaining why the agent can stop now or why it must continue with tools",
+            "pending_work": "required array of strings; non-empty when can_stop=false",
+            "depends_on_tool_results": "required boolean; true if the decision depends on previous_tool_results or system state",
         },
         "tool_call_contract": {
             "name": "required non-empty string",
@@ -126,6 +134,8 @@ def output_contract_v3() -> dict[str, Any]:
             "objective_status=waiting_user|completed|needs_human|unknown requires non-empty reply_to_user",
             "objective_status=needs_human requires needs_human=true",
             "needs_human=true requires objective_status=needs_human",
+            "objective_status=needs_tool requires stop_reason.can_stop=false and non-empty pending_work",
+            "objective_status=waiting_user|completed|needs_human|unknown requires stop_reason.can_stop=true",
             "invalid contract means backend will not execute any tool",
             "badcase must be null; badcase/eval writes must use record_badcase tool_call",
         ],

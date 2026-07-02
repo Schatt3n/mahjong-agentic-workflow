@@ -54,11 +54,15 @@ flowchart TD
 
 - 每轮上下文都会包含 `output_contract`，明确要求模型只输出 JSON object，并声明字段类型、合法 `objective_status` 和停止协议。
 - `goal`、`objective_status`、`reasoning_summary`、`reply_to_user` 必须是字符串；`tool_calls` 必须是数组；`needs_human` 必须是布尔值；`badcase` 是废弃旁路字段，只能为 null。
+- `stop_reason` 必须是对象，用来记录模型为什么此刻可以停、或者为什么不能停而必须继续调用工具。
+- `stop_reason.can_stop` 是布尔值；`stop_reason.why` 是非空字符串；`stop_reason.pending_work` 是字符串数组；`stop_reason.depends_on_tool_results` 是布尔值。
 - `needs_tool` 必须携带至少一个工具调用，并且 `reply_to_user` 必须为空，避免“调用工具”和“客户回复”混在同一步。
+- `needs_tool` 必须声明 `stop_reason.can_stop=false`，并列出非空 `pending_work`，避免模型把没有工具副作用的模糊承诺当作完成。
 - 每个工具调用必须包含非空 `name`、`arguments` 对象和非空 `reason`；`reason` 会进入 trace，用于审计模型为什么选择这个工具。
 - `idempotency_key` 如果出现只能是字符串或 null；真正生效的工具幂等键仍由后端根据消息 ID、工具名和 canonical arguments 派生。
 - `waiting_user`、`completed`、`needs_human`、`unknown` 不能同时携带工具调用。
 - `waiting_user`、`completed`、`needs_human`、`unknown` 都必须给出非空 `reply_to_user`，否则视为合同错误，避免产生空回复。
+- `waiting_user`、`completed`、`needs_human`、`unknown` 必须声明 `stop_reason.can_stop=true`，让每一次停止都有审计依据。
 - `objective_status=needs_human` 时 `needs_human` 必须为 true，否则视为合同错误。
 - `needs_human=true` 时 `objective_status` 也必须是 `needs_human`，避免模型状态和人工介入标志不一致。
 - 合同错误会写入 `action_contract_error` trace，后端不会执行任何工具，也不会创建局、创建邀约或写业务状态。

@@ -193,7 +193,7 @@ def parse_action(raw_response: str) -> tuple[AgentActionV3, list[str]]:
 
 def validate_action_contract(payload: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    for key in ["goal", "objective_status", "reasoning_summary", "reply_to_user", "tool_calls", "needs_human"]:
+    for key in ["goal", "objective_status", "reasoning_summary", "reply_to_user", "tool_calls", "needs_human", "stop_reason"]:
         if key not in payload:
             errors.append(f"missing required key: {key}")
     for key in ["goal", "objective_status", "reasoning_summary", "reply_to_user"]:
@@ -201,6 +201,11 @@ def validate_action_contract(payload: dict[str, Any]) -> list[str]:
             errors.append(f"{key} must be string")
     if "needs_human" in payload and not isinstance(payload.get("needs_human"), bool):
         errors.append("needs_human must be boolean")
+    stop_reason = payload.get("stop_reason")
+    if not isinstance(stop_reason, dict):
+        errors.append("stop_reason must be object")
+        stop_reason = {}
+    errors.extend(validate_stop_reason_contract(stop_reason, payload.get("objective_status")))
     if "badcase" in payload and payload.get("badcase") is not None:
         errors.append("badcase side-channel is not allowed; call record_badcase tool instead")
     if payload.get("objective_status") not in {"needs_tool", "waiting_user", "completed", "needs_human", "unknown"}:
@@ -240,6 +245,36 @@ def validate_action_contract(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_stop_reason_contract(stop_reason: dict[str, Any], status: Any) -> list[str]:
+    errors: list[str] = []
+    for key in ["can_stop", "why", "pending_work", "depends_on_tool_results"]:
+        if key not in stop_reason:
+            errors.append(f"stop_reason.{key} is required")
+    can_stop = stop_reason.get("can_stop")
+    if "can_stop" in stop_reason and not isinstance(can_stop, bool):
+        errors.append("stop_reason.can_stop must be boolean")
+    why = stop_reason.get("why")
+    if "why" in stop_reason and (not isinstance(why, str) or not why.strip()):
+        errors.append("stop_reason.why must be non-empty string")
+    pending_work = stop_reason.get("pending_work")
+    if "pending_work" in stop_reason and not isinstance(pending_work, list):
+        errors.append("stop_reason.pending_work must be array")
+        pending_work = []
+    if isinstance(pending_work, list) and any(not isinstance(item, str) or not item.strip() for item in pending_work):
+        errors.append("stop_reason.pending_work items must be non-empty strings")
+    depends_on_tool_results = stop_reason.get("depends_on_tool_results")
+    if "depends_on_tool_results" in stop_reason and not isinstance(depends_on_tool_results, bool):
+        errors.append("stop_reason.depends_on_tool_results must be boolean")
+    if status == "needs_tool":
+        if can_stop is not False:
+            errors.append("needs_tool requires stop_reason.can_stop=false")
+        if isinstance(pending_work, list) and not pending_work:
+            errors.append("needs_tool requires non-empty stop_reason.pending_work")
+    if status in {"waiting_user", "completed", "needs_human", "unknown"} and can_stop is not True:
+        errors.append(f"{status} requires stop_reason.can_stop=true")
+    return errors
+
+
 def contract_error_action() -> AgentActionV3:
     return AgentActionV3(
         goal="contract_error",
@@ -247,4 +282,10 @@ def contract_error_action() -> AgentActionV3:
         reasoning_summary="模型输出不符合 AgentActionV3 合同，后端拒绝执行。",
         reply_to_user="这个我先转人工确认一下。",
         needs_human=True,
+        stop_reason={
+            "can_stop": True,
+            "why": "模型输出合同错误，后端不能安全继续执行。",
+            "pending_work": [],
+            "depends_on_tool_results": False,
+        },
     )
