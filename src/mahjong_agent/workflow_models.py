@@ -390,14 +390,7 @@ class WorkflowTurn:
             "system_reply": self.system_reply,
             "game_requirement": self.game_requirement.to_prompt_dict() if self.game_requirement else None,
             "tool_results": [
-                {
-                    "tool_name": result.request.tool_name.value,
-                    "called": result.called,
-                    "allowed": result.allowed,
-                    "result": dict(result.result),
-                    "error": result.error,
-                    "deduplicated": result.deduplicated,
-                }
+                _tool_result_prompt_summary(result)
                 for result in self.tool_results
             ],
             "at": self.at.isoformat(),
@@ -456,6 +449,42 @@ class ConversationContext:
             "followup_context": dict(self.followup_context),
             "trace_notes": list(self.trace_notes),
         }
+
+
+def _tool_result_prompt_summary(result: ToolResult) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "tool_name": result.request.tool_name.value,
+        "called": result.called,
+        "allowed": result.allowed,
+        "error": result.error,
+        "deduplicated": result.deduplicated,
+    }
+    summary: dict[str, Any] = {}
+    if "result_count" in result.result:
+        summary["result_count"] = result.result.get("result_count")
+    if "applied_count" in result.result:
+        summary["applied_count"] = result.result.get("applied_count")
+    if "rejected_count" in result.result:
+        summary["rejected_count"] = result.result.get("rejected_count")
+    matches = result.result.get("matches")
+    if isinstance(matches, list):
+        summary["matches"] = [
+            {
+                "summary": item.get("summary"),
+                "game_id": item.get("game_id") or item.get("id"),
+            }
+            for item in matches[:3]
+            if isinstance(item, dict)
+        ]
+    drafts = result.result.get("drafts")
+    if isinstance(drafts, list):
+        summary["draft_count"] = len(drafts)
+    outbox = result.result.get("outbox")
+    if isinstance(outbox, list):
+        summary["outbox_count"] = len(outbox)
+    if summary:
+        payload["result_summary"] = summary
+    return payload
 
 
 @dataclass(slots=True)

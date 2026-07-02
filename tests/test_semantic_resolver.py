@@ -379,6 +379,44 @@ def test_semantic_resolver_allows_unknown_intent_to_ignore() -> None:
     assert resolution.raw_response["llm_contract"]["accepted"] is True
 
 
+def test_semantic_resolver_normalizes_duration_alias_slot() -> None:
+    client = FakeSemanticLLMClient(
+        {
+            "intent": "find_players",
+            "proposed_action": "create_game",
+            "confidence": 0.95,
+            "needs_human_review": False,
+            "reasoning_summary": "用户补充了通宵局信息。",
+            "slots": {
+                "duration": {
+                    "value": "overnight",
+                    "source": "context",
+                    "confidence": 0.95,
+                    "confirmed": True,
+                    "needs_confirmation": False,
+                    "evidence": "用户上一轮说通宵局",
+                },
+                "party_size": {
+                    "value": 1,
+                    "source": "explicit",
+                    "confidence": 0.98,
+                    "confirmed": True,
+                    "needs_confirmation": False,
+                    "evidence": "用户说我一个人",
+                },
+            },
+        }
+    )
+
+    resolution = SemanticResolver(client).resolve(make_context())
+
+    assert resolution.game_requirement.slot("duration") is None
+    assert resolution.game_requirement.slot("duration_mode").value == "overnight"
+    assert resolution.game_requirement.slot("duration_mode").metadata["normalized_from_slot"] == "duration"
+    assert "duration_mode" not in resolution.game_requirement.missing_required_slots(("duration_mode",))
+    assert "party_size" not in resolution.game_requirement.missing_required_slots(("party_size",))
+
+
 def test_semantic_resolver_rejects_invalid_slot_contracts() -> None:
     client = FakeSemanticLLMClient(
         {

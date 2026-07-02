@@ -199,7 +199,8 @@ class SemanticResolver:
         game_requirement = GameRequirement()
         slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else {}
         for name, slot_raw in slots.items():
-            game_requirement.set_slot(_slot_from_raw(str(name), slot_raw, default_confidence=confidence))
+            for slot in _normalized_slots_from_raw(str(name), slot_raw, default_confidence=confidence):
+                game_requirement.set_slot(slot)
 
         raw_response = {
             "model_output": raw,
@@ -459,6 +460,29 @@ def _validate_slot_contracts(slots: dict[str, Any]) -> list[str]:
         if "metadata" in raw_slot and not isinstance(raw_slot.get("metadata"), dict):
             errors.append(f"slot {name!r} metadata must be an object when provided")
     return errors
+
+
+def _normalized_slots_from_raw(name: str, raw: Any, *, default_confidence: float) -> list[SlotValue]:
+    slot = _slot_from_raw(name, raw, default_confidence=default_confidence)
+    normalized = _normalize_slot_alias(slot)
+    return [normalized]
+
+
+def _normalize_slot_alias(slot: SlotValue) -> SlotValue:
+    if slot.name == "duration":
+        value = str(slot.value or "").strip().lower()
+        if value in {"overnight", "all_night", "通宵", "整晚"}:
+            return SlotValue(
+                name="duration_mode",
+                value="overnight",
+                source=slot.source,
+                confidence=slot.confidence,
+                confirmed=slot.confirmed,
+                needs_confirmation=slot.needs_confirmation,
+                evidence=slot.evidence,
+                metadata={**slot.metadata, "normalized_from_slot": slot.name},
+            )
+    return slot
 
 
 def _slot_from_raw(name: str, raw: Any, *, default_confidence: float) -> SlotValue:

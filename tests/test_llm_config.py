@@ -237,6 +237,13 @@ def test_llm_budget_manager_denies_when_call_budget_is_used() -> None:
     assert "调用次数预算" in second.reason
 
 
+def test_llm_budget_default_per_call_limit_is_large_enough_for_short_multi_turn_context() -> None:
+    with patched_env(MAHJONG_LLM_MAX_TOKENS_PER_CALL=None):
+        limits = LLMBudgetLimits.from_env()
+
+    assert limits.max_tokens_per_call == 16_000
+
+
 def test_llm_resolver_fails_closed_when_budget_denies() -> None:
     resolver = OpenAICompatibleLLMResolver(
         LLMConfig(api_key="test-key", model="test-model"),

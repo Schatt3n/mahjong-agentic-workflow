@@ -32,7 +32,7 @@ class LLMBudgetLimits:
     max_calls_per_day: int | None = 1000
     max_tokens_per_day: int | None = 200_000
     max_cost_per_day: float | None = None
-    max_tokens_per_call: int | None = 8000
+    max_tokens_per_call: int | None = 16_000
     input_price_per_1k: float = 0.0
     output_price_per_1k: float = 0.0
 
@@ -42,7 +42,7 @@ class LLMBudgetLimits:
             max_calls_per_day=_env_int("MAHJONG_LLM_MAX_CALLS_PER_DAY", 1000),
             max_tokens_per_day=_env_int("MAHJONG_LLM_MAX_TOKENS_PER_DAY", 200_000),
             max_cost_per_day=_env_float("MAHJONG_LLM_MAX_COST_PER_DAY", None),
-            max_tokens_per_call=_env_int("MAHJONG_LLM_MAX_TOKENS_PER_CALL", 8000),
+            max_tokens_per_call=_env_int("MAHJONG_LLM_MAX_TOKENS_PER_CALL", 16_000),
             input_price_per_1k=_env_float("MAHJONG_LLM_INPUT_PRICE_PER_1K", 0.0) or 0.0,
             output_price_per_1k=_env_float("MAHJONG_LLM_OUTPUT_PRICE_PER_1K", 0.0) or 0.0,
         )

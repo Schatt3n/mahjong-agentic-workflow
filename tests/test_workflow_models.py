@@ -11,6 +11,7 @@ from mahjong_agent.workflow_models import (
     SlotValue,
     ToolCallRequest,
     ToolName,
+    ToolResult,
     UserIntent,
     UserMessage,
     WorkflowTurn,
@@ -138,6 +139,37 @@ def test_conversation_context_prompt_contract_includes_previous_reply_and_requir
     assert prompt_dict["previous_game_requirement"]["slots"]["smoke"]["value"] == "any"
     assert prompt_dict["customer_profile"]["preferred_slots"]["stake"]["source"] == "profile"
     assert "要新组" in prompt_dict["memory_summary"]
+
+
+def test_workflow_turn_prompt_summarizes_tool_results_without_large_payloads() -> None:
+    turn = WorkflowTurn(
+        user_message=UserMessage(
+            text="通宵局有人吗",
+            sender_id="zhang",
+            sender_name="张哥",
+            conversation_id="test01",
+            trace_id="trace_prev",
+        ),
+        tool_results=[
+            ToolResult(
+                request=ToolCallRequest(tool_name=ToolName.SEARCH_CURRENT_OPEN_GAMES),
+                called=True,
+                allowed=True,
+                result={
+                    "result_count": 0,
+                    "matches": [],
+                    "query": {"large": "x" * 5000},
+                    "contract": {"verbose": "y" * 5000},
+                },
+            )
+        ],
+    )
+
+    prompt_turn = turn.to_prompt_dict()
+    tool_payload = prompt_turn["tool_results"][0]
+
+    assert "result" not in tool_payload
+    assert tool_payload["result_summary"] == {"result_count": 0, "matches": []}
 
 
 def test_contract_coerces_unknown_llm_values_instead_of_crashing() -> None:
