@@ -33,6 +33,7 @@ flowchart TD
 - Runtime: `src/mahjong_agent_v2/runtime.py`
 - Context: `src/mahjong_agent_v2/context.py`
 - Tool Gateway: `src/mahjong_agent_v2/tools.py`
+- State Policy: `src/mahjong_agent_v2/state_policy.py`
 - Store: `src/mahjong_agent_v2/store.py`
 - SQLite Store: `src/mahjong_agent_v2/sqlite_store.py`
 - LLM Client: `src/mahjong_agent_v2/llm.py`
@@ -66,6 +67,17 @@ LLM 决定是否调用这些工具。后端只做：
 - 工具结果会给模型返回 `requirement_public_summary`，用于后续自然语言回复和候选人邀约。
 - `create_invite_drafts.message_text` 是客户可见文案，schema 会拒绝 snake_case、JSON 等内部表示。
 - 如果工具参数不合法，Runtime 会把 `tool_result.error` 放回下一轮上下文，让模型修正工具调用；不在后端硬编码某一句回复。
+
+## State Policy
+
+V2 的状态机边界由 `StatePolicyV2` 负责，不由 LLM 决定。
+
+当前规则：
+
+- `game`: `null -> forming -> inviting -> ready -> finished/cancelled`，已结束或已取消的局不能继续写入邀约。
+- `invite_draft`: `pending_approval/sent/negotiating/no_reply` 可以进入 `confirmed/declined/negotiating/no_reply` 等允许状态；`confirmed` 和 `declined` 是终态。
+- `record_candidate_reply` 必须绑定已有 `invite_draft`，不能让模型凭空把一个客户加入某个局。
+- 状态机拒绝时，工具返回 `called=false, allowed=false, error=...`，Runtime 把错误放进下一轮上下文交给模型处理或转人工。
 
 ## Trace
 

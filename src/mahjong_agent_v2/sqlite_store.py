@@ -23,6 +23,7 @@ from .models import (
     ToolResultV2,
     new_id,
 )
+from .state_policy import StatePolicyV2
 from .store import _score_customer, _score_requirement
 
 
@@ -37,6 +38,7 @@ class SQLiteAgentStoreV2:
     """
 
     path: str | Path
+    state_policy: StatePolicyV2 = field(default_factory=StatePolicyV2.default)
     _connection: sqlite3.Connection = field(init=False, repr=False)
     _lock: threading.RLock = field(init=False, repr=False)
 
@@ -277,6 +279,7 @@ class SQLiteAgentStoreV2:
                 requirement=dict(requirement),
                 participants=[],
             )
+            self.state_policy.ensure_game_transition(None, game.status)
             players = list(known_players or [])
             if not players:
                 players = [{"customer_id": organizer_id, "display_name": organizer_name, "source": "organizer"}]
@@ -316,8 +319,7 @@ class SQLiteAgentStoreV2:
             game = self._game_by_id(game_id)
             if game is None:
                 raise ValueError(f"game_id not found: {game_id}")
-            if game.status not in {GameStatusV2.FORMING, GameStatusV2.INVITING}:
-                raise ValueError(f"game status {game.status.value} cannot create invite drafts")
+            self.state_policy.ensure_can_create_invite_drafts(game)
             drafts: list[InviteDraftV2] = []
             transitions: list[StateTransitionV2] = []
             customers = self.customers
@@ -342,6 +344,7 @@ class SQLiteAgentStoreV2:
                 drafts.append(draft)
             if drafts and game.status == GameStatusV2.FORMING:
                 from_status = game.status.value
+                self.state_policy.ensure_game_transition(game.status, GameStatusV2.INVITING)
                 game.status = GameStatusV2.INVITING
                 game.updated_at = datetime.now(DEFAULT_TZ_V2)
                 self._upsert_game(game)
@@ -376,7 +379,11 @@ class SQLiteAgentStoreV2:
                 for draft in self.invite_drafts.values()
                 if draft.game_id == game_id and draft.customer_id == customer_id
             ]
+            self.state_policy.ensure_candidate_reply_allowed(game, drafts)
             for draft in drafts:
+                self.state_policy.ensure_invite_transition(draft.status, next_status)
+                if draft.status == next_status:
+                    continue
                 from_status = draft.status.value
                 draft.status = next_status
                 draft.updated_at = datetime.now(DEFAULT_TZ_V2)
@@ -405,6 +412,7 @@ class SQLiteAgentStoreV2:
                 )
             if game.remaining_seats() == 0 and game.status != GameStatusV2.READY:
                 from_status = game.status.value
+                self.state_policy.ensure_game_transition(game.status, GameStatusV2.READY)
                 game.status = GameStatusV2.READY
                 game.updated_at = datetime.now(DEFAULT_TZ_V2)
                 transitions.append(
@@ -422,7 +430,7 @@ class SQLiteAgentStoreV2:
 
     def active_game_for_customer(self, customer_id: str) -> GameV2 | None:
         for game in self.games.values():
-            if game.status not in {GameStatusV2.FORMING, GameStatusV2.INVITING, GameStatusV2.READY}:
+            if game.status not in self.state_policy.active_game_statuses:
                 continue
             if any(
                 participant.customer_id == customer_id and participant.status in {"joined", "confirmed"}
@@ -431,13 +439,10 @@ class SQLiteAgentStoreV2:
                 return game
         for draft in self.invite_drafts.values():
             if draft.customer_id == customer_id and draft.status in {
-                InviteStatusV2.PENDING_APPROVAL,
-                InviteStatusV2.SENT,
-                InviteStatusV2.CONFIRMED,
-                InviteStatusV2.NEGOTIATING,
+                *self.state_policy.occupied_invite_statuses,
             }:
                 game = self.games.get(draft.game_id)
-                if game and game.status in {GameStatusV2.FORMING, GameStatusV2.INVITING, GameStatusV2.READY}:
+                if game and game.status in self.state_policy.active_game_statuses:
                     return game
         return None
 

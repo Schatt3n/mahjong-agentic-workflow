@@ -378,6 +378,132 @@ def test_v2_gateway_enforces_tool_execution_mode_permissions() -> None:
     assert "tool execution_mode not allowed" in client.calls[1]["messages"][1]["content"]
 
 
+def test_v2_state_policy_rejects_candidate_reply_without_existing_invite_draft() -> None:
+    store = seeded_store()
+    game, _ = store.create_game(
+        conversation_id="boss_v2",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"user_visible_summary": "杭麻 1档 人齐开"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_v2_state_no_draft",
+    )
+    store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[{"customer_id": "he", "message_text": "何哥，人齐开，1块，打吗？"}],
+        trace_id="trace_v2_state_no_draft",
+    )
+    client = StaticAgentClientV2(
+        outputs=[
+            json.dumps(
+                {
+                    "goal": "记录候选人确认",
+                    "reasoning_summary": "模型试图记录一个没有邀约草稿的候选人。",
+                    "reply_to_user": "",
+                    "tool_calls": [
+                        {
+                            "name": "record_candidate_reply",
+                            "arguments": {
+                                "game_id": game.game_id,
+                                "customer_id": "ran",
+                                "status": "confirmed",
+                            },
+                        }
+                    ],
+                    "needs_human": False,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "goal": "提示人工确认",
+                    "reasoning_summary": "工具返回没有邀约草稿，不能凭空确认候选人。",
+                    "reply_to_user": "这个确认没有对应邀约记录，我先转人工核一下。",
+                    "tool_calls": [],
+                    "needs_human": True,
+                },
+                ensure_ascii=False,
+            ),
+        ],
+        calls=[],
+    )
+    runtime = AgentRuntimeV2(llm_client=client, store=store)
+
+    result = runtime.handle_user_message(message("冉姐说来"), trace_id="trace_v2_state_no_draft")
+
+    assert result.final_reply == "这个确认没有对应邀约记录，我先转人工核一下。"
+    assert result.tool_results[0].called is False
+    assert result.tool_results[0].allowed is False
+    assert "candidate reply requires an existing invite draft" in str(result.tool_results[0].error)
+    assert all(participant.customer_id != "ran" for participant in store.games[game.game_id].participants)
+
+
+def test_v2_state_policy_rejects_illegal_invite_status_transition() -> None:
+    store = seeded_store()
+    game, _ = store.create_game(
+        conversation_id="boss_v2",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"user_visible_summary": "杭麻 1档 人齐开"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_v2_state_transition",
+    )
+    store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[{"customer_id": "ran", "message_text": "冉姐，人齐开，1块，打吗？"}],
+        trace_id="trace_v2_state_transition",
+    )
+    store.record_candidate_reply(
+        game_id=game.game_id,
+        customer_id="ran",
+        status="confirmed",
+        trace_id="trace_v2_state_transition",
+    )
+    client = StaticAgentClientV2(
+        outputs=[
+            json.dumps(
+                {
+                    "goal": "非法改写候选人状态",
+                    "reasoning_summary": "模型试图把已确认邀约改成拒绝。",
+                    "reply_to_user": "",
+                    "tool_calls": [
+                        {
+                            "name": "record_candidate_reply",
+                            "arguments": {
+                                "game_id": game.game_id,
+                                "customer_id": "ran",
+                                "status": "declined",
+                            },
+                        }
+                    ],
+                    "needs_human": False,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "goal": "状态机拒绝后转人工",
+                    "reasoning_summary": "工具返回已确认不能直接改成拒绝。",
+                    "reply_to_user": "这个状态变更不合法，我先转人工确认。",
+                    "tool_calls": [],
+                    "needs_human": True,
+                },
+                ensure_ascii=False,
+            ),
+        ],
+        calls=[],
+    )
+    runtime = AgentRuntimeV2(llm_client=client, store=store)
+
+    result = runtime.handle_user_message(message("冉姐又说不来了"), trace_id="trace_v2_state_transition_retry")
+
+    assert result.final_reply == "这个状态变更不合法，我先转人工确认。"
+    assert result.tool_results[0].called is False
+    assert result.tool_results[0].allowed is False
+    assert "illegal invite status transition: confirmed -> declined" in str(result.tool_results[0].error)
+    assert any(participant.customer_id == "ran" for participant in store.games[game.game_id].participants)
+
+
 def test_v2_runtime_records_badcase_when_model_reports_it() -> None:
     store = seeded_store()
     eval_recorder = InMemoryEvalRecorderV2()
@@ -622,6 +748,8 @@ def test_v2_runtime_source_does_not_import_legacy_parser_workflow_or_guard() -> 
     import mahjong_agent_v2.context as context
     import mahjong_agent_v2.runtime as runtime
     import mahjong_agent_v2.sqlite_store as sqlite_store
+    import mahjong_agent_v2.state_policy as state_policy
+    import mahjong_agent_v2.store as store
     import mahjong_agent_v2.tools as tools
 
     source = "\n".join(
@@ -629,6 +757,8 @@ def test_v2_runtime_source_does_not_import_legacy_parser_workflow_or_guard() -> 
             inspect.getsource(context),
             inspect.getsource(runtime),
             inspect.getsource(sqlite_store),
+            inspect.getsource(state_policy),
+            inspect.getsource(store),
             inspect.getsource(tools),
         ]
     )

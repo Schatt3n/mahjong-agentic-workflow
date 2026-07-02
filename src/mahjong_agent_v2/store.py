@@ -19,6 +19,7 @@ from .models import (
     ToolResultV2,
     new_id,
 )
+from .state_policy import StatePolicyV2
 
 
 @dataclass(slots=True)
@@ -37,6 +38,7 @@ class InMemoryAgentStoreV2:
     idempotency_ledger: dict[str, ToolResultV2] = field(default_factory=dict)
     message_result_ledger: dict[str, Any] = field(default_factory=dict)
     transitions: list[StateTransitionV2] = field(default_factory=list)
+    state_policy: StatePolicyV2 = field(default_factory=StatePolicyV2.default)
     _lock: threading.RLock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -92,7 +94,7 @@ class InMemoryAgentStoreV2:
             games = [
                 game
                 for game in self.games.values()
-                if game.status in {GameStatusV2.FORMING, GameStatusV2.INVITING, GameStatusV2.READY}
+                if game.status in self.state_policy.active_game_statuses
             ]
             if conversation_id:
                 scoped = [game for game in games if game.conversation_id == conversation_id]
@@ -184,6 +186,7 @@ class InMemoryAgentStoreV2:
                 requirement=dict(requirement),
                 participants=[],
             )
+            self.state_policy.ensure_game_transition(None, game.status)
             players = list(known_players or [])
             if not players:
                 players = [{"customer_id": organizer_id, "display_name": organizer_name, "source": "organizer"}]
@@ -223,8 +226,7 @@ class InMemoryAgentStoreV2:
             game = self.games.get(game_id)
             if game is None:
                 raise ValueError(f"game_id not found: {game_id}")
-            if game.status not in {GameStatusV2.FORMING, GameStatusV2.INVITING}:
-                raise ValueError(f"game status {game.status.value} cannot create invite drafts")
+            self.state_policy.ensure_can_create_invite_drafts(game)
             drafts: list[InviteDraftV2] = []
             transitions: list[StateTransitionV2] = []
             for invitation in invitations:
@@ -248,6 +250,7 @@ class InMemoryAgentStoreV2:
                 drafts.append(draft)
             if drafts and game.status == GameStatusV2.FORMING:
                 from_status = game.status.value
+                self.state_policy.ensure_game_transition(game.status, GameStatusV2.INVITING)
                 game.status = GameStatusV2.INVITING
                 game.updated_at = datetime.now(DEFAULT_TZ_V2)
                 transitions.append(
@@ -274,23 +277,32 @@ class InMemoryAgentStoreV2:
             game = self.games.get(game_id)
             if game is None:
                 raise ValueError(f"game_id not found: {game_id}")
+            next_status = InviteStatusV2(status)
             transitions: list[StateTransitionV2] = []
-            for draft in self.invite_drafts.values():
-                if draft.game_id == game_id and draft.customer_id == customer_id:
-                    from_status = draft.status.value
-                    draft.status = InviteStatusV2(status)
-                    draft.updated_at = datetime.now(DEFAULT_TZ_V2)
-                    transitions.append(
-                        self._transition(
-                            entity_type="invite_draft",
-                            entity_id=draft.draft_id,
-                            from_status=from_status,
-                            to_status=draft.status.value,
-                            reason="candidate_reply",
-                            trace_id=trace_id,
-                        )
+            drafts = [
+                draft
+                for draft in self.invite_drafts.values()
+                if draft.game_id == game_id and draft.customer_id == customer_id
+            ]
+            self.state_policy.ensure_candidate_reply_allowed(game, drafts)
+            for draft in drafts:
+                self.state_policy.ensure_invite_transition(draft.status, next_status)
+                if draft.status == next_status:
+                    continue
+                from_status = draft.status.value
+                draft.status = next_status
+                draft.updated_at = datetime.now(DEFAULT_TZ_V2)
+                transitions.append(
+                    self._transition(
+                        entity_type="invite_draft",
+                        entity_id=draft.draft_id,
+                        from_status=from_status,
+                        to_status=draft.status.value,
+                        reason="candidate_reply",
+                        trace_id=trace_id,
                     )
-            if status == InviteStatusV2.CONFIRMED.value and not any(
+                )
+            if next_status == InviteStatusV2.CONFIRMED and not any(
                 participant.customer_id == customer_id for participant in game.participants
             ):
                 profile = self.customers.get(customer_id)
@@ -304,6 +316,7 @@ class InMemoryAgentStoreV2:
                 )
             if game.remaining_seats() == 0 and game.status != GameStatusV2.READY:
                 from_status = game.status.value
+                self.state_policy.ensure_game_transition(game.status, GameStatusV2.READY)
                 game.status = GameStatusV2.READY
                 game.updated_at = datetime.now(DEFAULT_TZ_V2)
                 transitions.append(
@@ -320,7 +333,7 @@ class InMemoryAgentStoreV2:
 
     def active_game_for_customer(self, customer_id: str) -> GameV2 | None:
         for game in self.games.values():
-            if game.status not in {GameStatusV2.FORMING, GameStatusV2.INVITING, GameStatusV2.READY}:
+            if game.status not in self.state_policy.active_game_statuses:
                 continue
             if any(
                 participant.customer_id == customer_id and participant.status in {"joined", "confirmed"}
@@ -329,13 +342,10 @@ class InMemoryAgentStoreV2:
                 return game
         for draft in self.invite_drafts.values():
             if draft.customer_id == customer_id and draft.status in {
-                InviteStatusV2.PENDING_APPROVAL,
-                InviteStatusV2.SENT,
-                InviteStatusV2.CONFIRMED,
-                InviteStatusV2.NEGOTIATING,
+                *self.state_policy.occupied_invite_statuses,
             }:
                 game = self.games.get(draft.game_id)
-                if game and game.status in {GameStatusV2.FORMING, GameStatusV2.INVITING, GameStatusV2.READY}:
+                if game and game.status in self.state_policy.active_game_statuses:
                     return game
         return None
 
