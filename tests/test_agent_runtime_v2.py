@@ -1110,6 +1110,8 @@ def test_v2_system_prompt_separates_customer_reply_from_operator_notes() -> None
     assert "approved" in review_prompt
     assert "badcase" in review_prompt
     assert "不负责硬编码改写某一句话" in review_prompt
+    assert "不要一次性追问多个槽位" in review_prompt
+    assert "不要无必要地反复问“杭麻还是川麻”" in review_prompt
 
 
 def seeded_store() -> InMemoryAgentStoreV2:
