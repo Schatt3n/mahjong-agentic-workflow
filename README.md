@@ -10,6 +10,35 @@
 
 代码里的 `mahjong_agent` 包名和 `AgentRuntime` 等类名暂时保留为历史实现名，后续可以做无破坏兼容迁移；对外产品名和仓库名建议使用 `mahjong-ops-workflow`。
 
+## Agent Runtime V2
+
+项目已经新增一条独立 V2 主链路，用来重做“模型自主决策工具”的 Agent 版本。V2 不复用旧 parser、旧 workflow、旧 guard 作为主执行链路；旧系统只作为业务参考。
+
+V2 原则：
+
+- LLM 负责理解用户、判断目标、决定调用哪些工具。
+- 后端负责工具 schema 校验、权限、幂等、状态机、并发、预算、日志审计。
+- 不再用业务 if-else 修麻将语义。
+- 每一次模型输入、模型输出、工具调用、工具结果、状态变化都可追溯。
+- 回复不对进入 eval/badcase，不直接硬编码修一句话。
+
+V2 文档见 [docs/agent_runtime_v2.md](docs/agent_runtime_v2.md)。
+
+本地启动：
+
+```bash
+set -a
+source .env
+set +a
+/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v2_app.py
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:8791/
+```
+
 ## 解决的问题
 
 线下麻将馆的运营本质上是一个高频、多线程、强上下文的人力调度问题：

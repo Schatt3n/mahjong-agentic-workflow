@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from .context import ContextBuilderV2
+from .llm import AgentLLMClientV2
+from .models import AgentDecisionV2, AgentRuntimeResultV2, ToolResultV2, UserMessageV2
+from .store import InMemoryAgentStoreV2
+from .tools import ToolGatewayV2
+from .tracing import InMemoryTraceRecorderV2
+
+
+@dataclass(slots=True)
+class BudgetDecisionV2:
+    allowed: bool
+    reason: str
+    estimated_tokens: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "estimated_tokens": self.estimated_tokens,
+        }
+
+
+@dataclass(slots=True)
+class TokenBudgetV2:
+    max_tokens_per_call: int = 24_000
+    max_calls_per_turn: int = 6
+    calls_this_turn: int = 0
+
+    def reserve(self, messages: list[dict[str, str]]) -> BudgetDecisionV2:
+        self.calls_this_turn += 1
+        estimated_tokens = estimate_tokens(messages)
+        if self.calls_this_turn > self.max_calls_per_turn:
+            return BudgetDecisionV2(
+                allowed=False,
+                reason=f"turn llm call limit exceeded: {self.max_calls_per_turn}",
+                estimated_tokens=estimated_tokens,
+            )
+        if estimated_tokens > self.max_tokens_per_call:
+            return BudgetDecisionV2(
+                allowed=False,
+                reason=f"single call token estimate exceeded: {estimated_tokens}>{self.max_tokens_per_call}",
+                estimated_tokens=estimated_tokens,
+            )
+        return BudgetDecisionV2(allowed=True, reason="budget_reserved", estimated_tokens=estimated_tokens)
+
+
+@dataclass(slots=True)
+class AgentRuntimeV2:
+    llm_client: AgentLLMClientV2
+    store: InMemoryAgentStoreV2 = field(default_factory=InMemoryAgentStoreV2)
+    tool_gateway: ToolGatewayV2 | None = None
+    trace_recorder: Any = field(default_factory=InMemoryTraceRecorderV2)
+    max_steps: int = 6
+    llm_timeout_seconds: float = 45.0
+    token_budget: TokenBudgetV2 = field(default_factory=TokenBudgetV2)
+    context_builder: ContextBuilderV2 = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.tool_gateway is None:
+            self.tool_gateway = ToolGatewayV2(self.store)
+        self.context_builder = ContextBuilderV2(self.store, self.tool_gateway)
+
+    def handle_user_message(self, message: UserMessageV2, *, trace_id: str | None = None) -> AgentRuntimeResultV2:
+        actual_trace_id = trace_id or f"trace_v2_{uuid.uuid4().hex[:12]}"
+        self.token_budget.calls_this_turn = 0
+        self.trace_recorder.record(actual_trace_id, "user_input", {"message": message.to_dict()})
+        self.store.append_user_turn(message, actual_trace_id)
+
+        decisions: list[AgentDecisionV2] = []
+        tool_results: list[ToolResultV2] = []
+        pending_tool_results: list[ToolResultV2] = []
+        final_reply = ""
+
+        for step_index in range(1, self.max_steps + 1):
+            built = self.context_builder.build(message, trace_id=actual_trace_id, previous_tool_results=pending_tool_results)
+            self.trace_recorder.record(actual_trace_id, "context_built", built.payload)
+            self.trace_recorder.record(actual_trace_id, "llm_prompt", {"messages": built.messages})
+            budget_decision = self.token_budget.reserve(built.messages)
+            self.trace_recorder.record(actual_trace_id, "budget_checked", budget_decision.to_dict())
+            if not budget_decision.allowed:
+                final_reply = "这个我先转人工确认一下。"
+                self.trace_recorder.record(actual_trace_id, "final_output", {"reply": final_reply, "reason": budget_decision.reason})
+                break
+
+            raw_response = self.llm_client.complete(
+                built.messages,
+                trace_id=actual_trace_id,
+                timeout_seconds=self.llm_timeout_seconds,
+            )
+            self.trace_recorder.record(actual_trace_id, "llm_response", {"content": raw_response})
+            decision = self._parse_decision(raw_response)
+            decisions.append(decision)
+            self.trace_recorder.record(actual_trace_id, "action_proposed", decision.to_dict())
+
+            if decision.badcase:
+                badcase_call = {
+                    "name": "record_badcase",
+                    "arguments": decision.badcase,
+                    "reason": "model reported badcase",
+                }
+                decision.tool_calls.append(self._tool_call_from_dict(badcase_call))
+
+            if decision.tool_calls:
+                pending_tool_results = []
+                for call_index, call in enumerate(decision.tool_calls, start=1):
+                    result = self.tool_gateway.execute(
+                        call,
+                        trace_id=actual_trace_id,
+                        conversation_id=message.conversation_id,
+                        sender_id=message.sender_id,
+                        sender_name=message.sender_name,
+                        step_index=(step_index * 100 + call_index),
+                    )
+                    tool_results.append(result)
+                    pending_tool_results.append(result)
+                    self.trace_recorder.record(actual_trace_id, "tool_called", {"call": call.to_dict()})
+                    self.trace_recorder.record(actual_trace_id, "tool_result", result.to_dict())
+                    for transition in result.state_transitions:
+                        self.trace_recorder.record(actual_trace_id, "state_transition", transition.to_dict())
+                self.store.append_tool_turn(
+                    message.conversation_id,
+                    json.dumps([result.to_dict() for result in pending_tool_results], ensure_ascii=False),
+                    actual_trace_id,
+                )
+                continue
+
+            final_reply = decision.reply_to_user.strip()
+            if decision.needs_human and not final_reply:
+                final_reply = "这个我先转人工确认一下。"
+            if not final_reply:
+                final_reply = "我先确认一下。"
+            self.store.append_assistant_turn(message.conversation_id, final_reply, actual_trace_id)
+            self.trace_recorder.record(actual_trace_id, "final_output", {"reply": final_reply})
+            break
+        else:
+            final_reply = "我先确认一下，稍后回复你。"
+            self.store.append_assistant_turn(message.conversation_id, final_reply, actual_trace_id)
+            self.trace_recorder.record(actual_trace_id, "final_output", {"reply": final_reply, "reason": "max_steps_exceeded"})
+
+        transitions = [transition for result in tool_results for transition in result.state_transitions]
+        return AgentRuntimeResultV2(
+            trace_id=actual_trace_id,
+            final_reply=final_reply,
+            decisions=decisions,
+            tool_results=tool_results,
+            state_transitions=transitions,
+        )
+
+    def _parse_decision(self, raw_response: str) -> AgentDecisionV2:
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            payload = {
+                "goal": "parse_failed",
+                "reasoning_summary": "模型没有返回合法 JSON",
+                "reply_to_user": "这个我先转人工确认一下。",
+                "tool_calls": [],
+                "needs_human": True,
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "goal": "parse_failed",
+                "reasoning_summary": "模型返回不是 JSON object",
+                "reply_to_user": "这个我先转人工确认一下。",
+                "tool_calls": [],
+                "needs_human": True,
+            }
+        return AgentDecisionV2.from_payload(payload)
+
+    def _tool_call_from_dict(self, raw: dict[str, Any]):
+        from .models import ToolCallV2
+
+        return ToolCallV2(
+            name=str(raw.get("name") or ""),
+            arguments=dict(raw.get("arguments") or {}),
+            idempotency_key=str(raw.get("idempotency_key")) if raw.get("idempotency_key") else None,
+            reason=str(raw.get("reason") or ""),
+        )
+
+
+def estimate_tokens(value: Any) -> int:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True) if not isinstance(value, str) else value
+    return max(1, len(text) // 4)
