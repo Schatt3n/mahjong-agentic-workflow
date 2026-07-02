@@ -128,12 +128,12 @@ def test_agent_v2_manual_badcase_is_recorded_through_tool_gateway_trace() -> Non
     assert validate_agent_runtime_trace_completeness(trace.get_trace("manual_badcase_trace")).complete is True
 
 
-def test_agent_v2_app_defaults_to_main_trial_port(monkeypatch) -> None:
+def test_agent_v2_app_defaults_to_legacy_trial_port(monkeypatch) -> None:
     monkeypatch.delenv("MAHJONG_AGENT_V2_PORT", raising=False)
 
     module = load_app_module_without_runtime()
 
-    assert module.PORT == 8790
+    assert module.PORT == 8792
 
 
 def test_agent_v2_budget_is_configured_from_environment(monkeypatch) -> None:

@@ -49,6 +49,28 @@ flowchart TD
 - V3 本地服务默认使用 SQLite：`data/agent_runtime_v3.sqlite3`。
 - SQLite 持久化客户、局、邀约草稿、对话 turn、工具幂等结果、消息幂等结果、badcase、状态变化。
 - Trace 使用 JSONL：`logs/agent_runtime_v3_trace.log`，可按 `traceId` 结构化回放模型输入、模型输出、工具调用、工具结果和状态变化。
+- 本地页面保留短路径：`/api/logs` 查看 V3 日志尾部，`/api/state` 查看 V3 状态，`/api/message` 发送测试消息。
+
+## 本地启动
+
+```bash
+set -a
+source .env
+set +a
+/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v3_app.py
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:8790/
+```
+
+## Badcase 入口
+
+- 模型可以在 action 中调用 `record_badcase` 工具主动归档坏例子。
+- 人工测试时可以调用 `POST /api/v3/badcases`，或在本地 V3 页面点击“标记 badcase”。
+- 人工 badcase 不直接写库，会先构造 `record_badcase` 工具调用，再经过 `ToolGatewayV3` 的 schema、权限、幂等和 trace。
 
 ## 当前限制
 

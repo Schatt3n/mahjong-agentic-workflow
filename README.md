@@ -10,11 +10,11 @@
 
 代码里的 `mahjong_agent` 包名和 `AgentRuntime` 等类名暂时保留为历史实现名，后续可以做无破坏兼容迁移；对外产品名和仓库名建议使用 `mahjong-ops-workflow`。
 
-## Agent Runtime V2
+## 当前主入口：Agent Runtime V3
 
-项目已经新增一条独立 V2 主链路，用来重做“模型自主决策工具”的 Agent 版本。V2 不复用旧 parser、旧 workflow、旧 guard 作为主执行链路；旧系统只作为业务参考。
+项目当前默认试用入口已经切到一条独立 V3 主链路，用来验证“模型自主决策工具”的 Agent 版本。V3 不复用旧 parser、旧 workflow、旧 guard 作为主执行链路；旧系统只作为业务参考。
 
-V2 原则：
+V3 原则：
 
 - LLM 负责理解用户、判断目标、决定调用哪些工具。
 - 后端负责工具 schema 校验、权限、幂等、状态机、并发、预算、日志审计。
@@ -22,14 +22,14 @@ V2 原则：
 - 每一次模型输入、模型输出、工具调用、工具结果、状态变化都可追溯。
 - 回复不对进入 eval/badcase，不直接硬编码修一句话。
 - 同一会话串行处理，同一 `message_id` 重复进入时走消息结果账本，不重复调用模型或执行工具。
-- 工具 contract 提供结构化组局条件和客户可见文案校验；参数错误会作为 tool result 回到模型，由模型修正，而不是后端补业务语义 if-else。
-- `StatePolicyV2` 负责局和邀约草稿的状态合法性，模型不能绕过状态机直接落库。
-- `ContextPackingPolicyV2` 负责上下文预算和裁剪审计，避免多轮对话无限塞进模型窗口。
+- 工具参数错误会作为 tool result 回到模型，由模型修正，而不是后端补业务语义 if-else。
+- 状态机负责局和邀约草稿的状态合法性，模型不能绕过状态机直接落库。
+- `ContextPackingPolicyV3` 负责上下文预算和裁剪审计，避免多轮对话无限塞进模型窗口。
 - LLM 调用失败会记录 `llm_error` 并中断本轮工具执行，返回人工兜底回复。
 
-V2 文档见 [docs/agent_runtime_v2.md](docs/agent_runtime_v2.md)。
+V3 文档见 [docs/agent_runtime_v3.md](docs/agent_runtime_v3.md)。
 
-V2 状态默认写入 `data/agent_runtime_v2.sqlite3`，trace 默认写入 `logs/agent_runtime_v2_trace.jsonl`，badcase 默认写入 `eval/badcases/agent_runtime_v2_badcases.jsonl`。
+V3 状态默认写入 `data/agent_runtime_v3.sqlite3`，trace 默认写入 `logs/agent_runtime_v3_trace.log`。
 
 本地启动：
 
@@ -37,7 +37,7 @@ V2 状态默认写入 `data/agent_runtime_v2.sqlite3`，trace 默认写入 `logs
 set -a
 source .env
 set +a
-/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v2_app.py
+/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v3_app.py
 ```
 
 默认地址：
@@ -45,6 +45,8 @@ set +a
 ```text
 http://127.0.0.1:8790/
 ```
+
+历史 V2 试用台保留在 `scripts/run_agent_v2_app.py`，默认端口 `8792`，只用于对照和回归，不作为当前测试入口。
 
 ## 解决的问题
 

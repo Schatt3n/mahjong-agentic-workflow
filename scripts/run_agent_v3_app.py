@@ -35,13 +35,14 @@ from mahjong_agent_v3 import (  # noqa: E402
     OpenAICompatibleAgentClientV3,
     SQLiteAgentStoreV3,
     TokenBudgetV3,
+    ToolCallV3,
     ToolGatewayV3,
     UserMessageV3,
 )
 from mahjong_agent_v3.tracing import validate_trace_v3  # noqa: E402
 
 
-PORT = int(os.getenv("MAHJONG_AGENT_V3_PORT", "8791"))
+PORT = int(os.getenv("MAHJONG_AGENT_V3_PORT", "8790"))
 TRACE_PATH = ROOT / "logs" / "agent_runtime_v3_trace.log"
 DB_PATH = Path(os.getenv("MAHJONG_AGENT_V3_DB_PATH") or ROOT / "data" / "agent_runtime_v3.sqlite3")
 
@@ -77,6 +78,108 @@ def get_runtime() -> AgentRuntimeV3:
     if RUNTIME is None:
         RUNTIME = build_runtime()
     return RUNTIME
+
+
+def trace_payload(runtime: AgentRuntimeV3, trace_id: str) -> dict:
+    events = runtime.trace_recorder.get_trace(trace_id)
+    return {
+        "trace_id": trace_id,
+        "trace_log_path": str(TRACE_PATH),
+        "events": [item.to_dict() for item in events],
+        "completeness": validate_trace_v3(events),
+    }
+
+
+def tail_trace_log(limit: int = 200) -> list[str]:
+    if not TRACE_PATH.exists():
+        return []
+    lines = TRACE_PATH.read_text(encoding="utf-8").splitlines()
+    return lines[-max(1, int(limit)) :]
+
+
+def conversation_id_from_trace(runtime: AgentRuntimeV3, trace_id: str) -> str:
+    if not trace_id:
+        return ""
+    for event in runtime.trace_recorder.get_trace(trace_id):
+        if event.step == "user_input":
+            message = event.content.get("message")
+            if isinstance(message, dict) and message.get("conversation_id"):
+                return str(message["conversation_id"])
+    return ""
+
+
+def trace_facts(runtime: AgentRuntimeV3, trace_id: str) -> dict:
+    facts: dict[str, dict] = {"input": {}, "actual": {}}
+    if not trace_id:
+        return facts
+    for event in runtime.trace_recorder.get_trace(trace_id):
+        if event.step == "user_input":
+            message = event.content.get("message")
+            if isinstance(message, dict):
+                facts["input"] = {"message": message}
+        if event.step == "final_output":
+            facts["actual"] = {"reply": event.content.get("reply", ""), "final_output": dict(event.content)}
+    return facts
+
+
+def build_manual_badcase_payload(runtime: AgentRuntimeV3, payload: dict, *, source_trace_id: str) -> dict:
+    facts = trace_facts(runtime, source_trace_id)
+    expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else {"note": str(payload.get("expected") or "")}
+    return {
+        "reason": str(payload.get("reason") or "人工标记回复不符合预期"),
+        "input": payload.get("input") if isinstance(payload.get("input"), dict) else facts.get("input", {}),
+        "actual": payload.get("actual") if isinstance(payload.get("actual"), dict) else facts.get("actual", {}),
+        "expected": expected,
+        "tags": list(dict.fromkeys([*(str(item) for item in payload.get("tags") or []), "agent_runtime_v3", "manual_review"])),
+        "source": "manual_operator",
+        "metadata": {
+            "source_trace_id": source_trace_id,
+            "operator_note": str(payload.get("note") or ""),
+            "source_trace_completeness": trace_payload(runtime, source_trace_id)["completeness"] if source_trace_id else {},
+        },
+    }
+
+
+def record_manual_badcase(runtime: AgentRuntimeV3, payload: dict) -> dict:
+    source_trace_id = str(payload.get("trace_id") or payload.get("source_trace_id") or "").strip()
+    audit_trace_id = str(payload.get("audit_trace_id") or f"trace_v3_manual_badcase_{os.urandom(6).hex()}")
+    conversation_id = str(payload.get("conversation_id") or conversation_id_from_trace(runtime, source_trace_id) or "manual_review_v3")
+    badcase_payload = build_manual_badcase_payload(runtime, payload, source_trace_id=source_trace_id)
+    call = ToolCallV3(name="record_badcase", arguments=badcase_payload, reason="manual operator reported badcase")
+    runtime.trace_recorder.record(
+        audit_trace_id,
+        "manual_badcase_input",
+        {
+            "source_trace_id": source_trace_id,
+            "conversation_id": conversation_id,
+            "payload": badcase_payload,
+        },
+    )
+    runtime.trace_recorder.record(audit_trace_id, "tool_called", {"call": call.to_dict(), "step_index": 1})
+    result = runtime.tool_gateway.execute(
+        call,
+        trace_id=audit_trace_id,
+        conversation_id=conversation_id,
+        sender_id=str(payload.get("operator_id") or "operator"),
+        sender_name=str(payload.get("operator_name") or "老板/测试者"),
+        step_index=1,
+    )
+    runtime.trace_recorder.record(audit_trace_id, "tool_result", result.to_dict())
+    runtime.trace_recorder.record(
+        audit_trace_id,
+        "manual_badcase_recorded",
+        {
+            "source_trace_id": source_trace_id,
+            "tool_result": result.to_dict(),
+        },
+        level="WARN" if result.error else "INFO",
+    )
+    return {
+        "audit_trace_id": audit_trace_id,
+        "source_trace_id": source_trace_id,
+        "tool_result": result.to_dict(),
+        "trace": trace_payload(runtime, audit_trace_id),
+    }
 
 
 def seed_customers(store: SQLiteAgentStoreV3) -> None:
@@ -122,7 +225,7 @@ class AgentV3Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._html(index_html())
             return
-        if parsed.path == "/api/v3/state":
+        if parsed.path in {"/api/v3/state", "/api/state"}:
             runtime = get_runtime()
             self._json(
                 {
@@ -133,13 +236,16 @@ class AgentV3Handler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if parsed.path == "/api/v3/traces":
+        if parsed.path in {"/api/v3/traces", "/api/traces"}:
             runtime = get_runtime()
             trace_id = (parse_qs(parsed.query).get("trace_id") or [""])[0]
-            events = runtime.trace_recorder.get_trace(trace_id)
-            self._json({"trace_id": trace_id, "trace_log_path": str(TRACE_PATH), "events": [item.to_dict() for item in events], "completeness": validate_trace_v3(events)})
+            self._json(trace_payload(runtime, trace_id))
             return
-        if parsed.path == "/api/v3/badcases":
+        if parsed.path in {"/api/v3/logs", "/api/logs"}:
+            limit = int((parse_qs(parsed.query).get("limit") or ["200"])[0] or "200")
+            self._json({"runtime": "mahjong_agent_v3", "trace_log_path": str(TRACE_PATH), "tail": tail_trace_log(limit)})
+            return
+        if parsed.path in {"/api/v3/badcases", "/api/badcases"}:
             runtime = get_runtime()
             self._json({"records": list(runtime.store.badcases)})
             return
@@ -147,7 +253,7 @@ class AgentV3Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/v3/message":
+        if parsed.path in {"/api/v3/message", "/api/message"}:
             runtime = get_runtime()
             payload = self._read_json()
             message = UserMessageV3(
@@ -166,6 +272,11 @@ class AgentV3Handler(BaseHTTPRequestHandler):
                 )
             result = runtime.handle_user_message(message, trace_id=payload.get("trace_id"))
             self._json(result.to_dict())
+            return
+        if parsed.path in {"/api/v3/badcases", "/api/badcases"}:
+            runtime = get_runtime()
+            payload = self._read_json()
+            self._json(record_manual_badcase(runtime, payload))
             return
         self.send_error(404)
 
@@ -239,8 +350,13 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
   <p><textarea id="text">通宵1块有人吗？没有就帮我组一个</textarea></p>
   <button onclick="sendMessage()">发送到 V3</button>
   <button onclick="loadState()">刷新状态</button>
+  <button onclick="recordBadcase()">标记 badcase</button>
   <h2>结果</h2>
   <pre id="output"></pre>
+  <h2>人工 badcase</h2>
+  <p><input id="badcaseReason" value="回复不符合预期" placeholder="badcase 原因"></p>
+  <p><textarea id="badcaseExpected" placeholder="期望行为或回复"></textarea></p>
+  <pre id="badcaseOutput"></pre>
   <h2>状态</h2>
   <pre id="state"></pre>
 </main>
@@ -253,7 +369,19 @@ async function sendMessage(){
     text: text.value
   };
   const res = await fetch('/api/v3/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  output.textContent = JSON.stringify(await res.json(), null, 2);
+  const body = await res.json();
+  window.lastTraceId = body.trace_id;
+  output.textContent = JSON.stringify(body, null, 2);
+  await loadState();
+}
+async function recordBadcase(){
+  const payload = {
+    source_trace_id: window.lastTraceId || '',
+    reason: badcaseReason.value,
+    expected: { note: badcaseExpected.value }
+  };
+  const res = await fetch('/api/v3/badcases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  badcaseOutput.textContent = JSON.stringify(await res.json(), null, 2);
   await loadState();
 }
 async function loadState(){

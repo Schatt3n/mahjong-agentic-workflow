@@ -31,6 +31,7 @@ def main() -> int:
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime_v2_eval.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime_v3.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime_v3_eval.py"])
+    run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_v3_app.py"])
     return 0
 
 

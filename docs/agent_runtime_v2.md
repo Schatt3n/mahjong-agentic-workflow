@@ -179,7 +179,7 @@ SQLite 中持久化：
 本地查看当前 V2 状态：
 
 ```bash
-curl -s http://127.0.0.1:8790/api/v2/state
+curl -s http://127.0.0.1:8792/api/v2/state
 ```
 
 ## Concurrency / Idempotency
@@ -218,7 +218,7 @@ eval/badcases/agent_runtime_v2_badcases.jsonl
 本地查看：
 
 ```bash
-curl -s http://127.0.0.1:8790/api/v2/badcases
+curl -s http://127.0.0.1:8792/api/v2/badcases
 ```
 
 ## 本地启动
@@ -233,23 +233,22 @@ set +a
 默认地址：
 
 ```text
-http://127.0.0.1:8790/
+http://127.0.0.1:8792/
 ```
 
 接口：
 
 ```bash
-curl -s http://127.0.0.1:8790/api/v2/message \
+curl -s http://127.0.0.1:8792/api/v2/message \
   -H 'Content-Type: application/json' \
   -d '{"conversation_id":"v2_test","sender_id":"zhang","sender_name":"张哥","text":"通宵有人吗"}'
 ```
 
 ## 当前边界
 
-这是新系统的最小闭环版本，还没有替换旧老板试用台。
+V2 当前作为历史对照和回归链路保留，不再作为默认老板试用入口。
 
 下一步应该做：
 
-- 把 V2 页面扩展为完整测试控制台。
-- 给 V2 增加端到端回归集。
-- 默认试用入口已经切到 `scripts/run_agent_v2_app.py`；旧 `scripts/run_boss_trial_app.py` 仅保留在 `8792` 做历史对照。
+- 默认主入口已经切到 `scripts/run_agent_v3_app.py`。
+- V2 如需对照测试，使用 `8792`。
