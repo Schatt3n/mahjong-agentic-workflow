@@ -14,6 +14,7 @@ from mahjong_agent_v3 import (
     JsonlTraceRecorderV3,
     SQLiteAgentStoreV3,
     StaticAgentClientV3,
+    ToolGatewayV3,
     UserMessageV3,
 )
 from mahjong_agent_v3.tracing import trace_steps, validate_trace_v3
@@ -298,6 +299,72 @@ def test_v3_illegal_game_status_transition_is_rejected_by_state_machine() -> Non
     second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
     assert "illegal game status transition" in second_prompt["previous_tool_results"][0]["error"]
     assert result.final_reply == "这个我先确认一下。"
+
+
+def test_v3_tool_permission_denial_is_fed_back_to_model_without_side_effect() -> None:
+    store = seeded_store()
+    game, _ = store.create_game(
+        conversation_id="v3_permission",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="setup_permission",
+    )
+    trace = InMemoryTraceRecorderV3()
+    gateway = ToolGatewayV3(
+        store=store,
+        trace_recorder=trace,
+        allowed_execution_modes={"read_only", "state_write", "audit_write"},
+    )
+    client = StaticAgentClientV3(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="模型请求创建邀约草稿，但当前权限禁止 draft_write。",
+                tool_calls=[
+                    {
+                        "name": "create_invite_drafts",
+                        "arguments": {
+                            "game_id": game.game_id,
+                            "invitations": [{"customer_id": "ran", "display_name": "冉姐", "message_text": "冉姐，1块，打吗？"}],
+                        },
+                        "reason": "验证权限拦截。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="needs_human",
+                reasoning_summary="工具权限拒绝创建草稿，交给人工或等待配置恢复。",
+                reply_to_user="我先确认一下能不能发邀约。",
+                needs_human=True,
+            ),
+        ]
+    )
+    runtime = AgentRuntimeV3(llm_client=client, store=store, tool_gateway=gateway, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_permission",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="帮我问冉姐",
+            message_id="msg_v3_permission",
+        ),
+        trace_id="trace_v3_permission",
+    )
+
+    assert result.tool_results[0].called is False
+    assert result.tool_results[0].allowed is False
+    assert result.tool_results[0].error == "tool execution_mode not allowed: draft_write"
+    assert store.invite_drafts == {}
+    second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
+    assert second_prompt["previous_tool_results"][0]["error"] == "tool execution_mode not allowed: draft_write"
+    permission_events = [event for event in trace.get_trace("trace_v3_permission") if event.step == "tool_permission_checked"]
+    assert permission_events[0].level == "WARN"
+    assert permission_events[0].content["allowed"] is False
+    assert validate_trace_v3(trace.get_trace("trace_v3_permission"))["complete"] is True
+    assert result.final_reply == "我先确认一下能不能发邀约。"
 
 
 def test_v3_jsonl_trace_is_structured_and_replayable(tmp_path) -> None:
