@@ -265,6 +265,49 @@ def test_v2_trace_completeness_reports_bad_event_order() -> None:
     assert "context_built must occur before llm_prompt" in report.ordering_errors
 
 
+def test_v2_trace_completeness_requires_reply_review_model_events() -> None:
+    events = [
+        TraceEventV2("trace_v2_review_incomplete", "user_input", {}),
+        TraceEventV2("trace_v2_review_incomplete", "context_packed", {}),
+        TraceEventV2("trace_v2_review_incomplete", "context_built", {}),
+        TraceEventV2("trace_v2_review_incomplete", "llm_prompt", {}),
+        TraceEventV2("trace_v2_review_incomplete", "budget_checked", {}),
+        TraceEventV2("trace_v2_review_incomplete", "llm_response", {}),
+        TraceEventV2("trace_v2_review_incomplete", "action_proposed", {}),
+        TraceEventV2("trace_v2_review_incomplete", "reply_review_prompt", {}),
+        TraceEventV2("trace_v2_review_incomplete", "reply_review_budget_checked", {}),
+        TraceEventV2("trace_v2_review_incomplete", "final_output", {}),
+    ]
+
+    report = validate_agent_runtime_trace_completeness(events)
+
+    assert report.complete is False
+    assert "reply_review_response" in report.missing_steps
+    assert "reply_review_proposed" in report.missing_steps
+
+
+def test_v2_trace_completeness_reports_bad_reply_review_order() -> None:
+    events = [
+        TraceEventV2("trace_v2_review_order", "user_input", {}),
+        TraceEventV2("trace_v2_review_order", "context_packed", {}),
+        TraceEventV2("trace_v2_review_order", "context_built", {}),
+        TraceEventV2("trace_v2_review_order", "llm_prompt", {}),
+        TraceEventV2("trace_v2_review_order", "budget_checked", {}),
+        TraceEventV2("trace_v2_review_order", "llm_response", {}),
+        TraceEventV2("trace_v2_review_order", "action_proposed", {}),
+        TraceEventV2("trace_v2_review_order", "reply_review_prompt", {}),
+        TraceEventV2("trace_v2_review_order", "reply_review_response", {}),
+        TraceEventV2("trace_v2_review_order", "reply_review_budget_checked", {}),
+        TraceEventV2("trace_v2_review_order", "reply_review_proposed", {}),
+        TraceEventV2("trace_v2_review_order", "final_output", {}),
+    ]
+
+    report = validate_agent_runtime_trace_completeness(events)
+
+    assert report.complete is False
+    assert "reply_review_budget_checked must occur before reply_review_response" in report.ordering_errors
+
+
 class FailingAgentClientV2:
     def __init__(self, exc: Exception) -> None:
         self.exc = exc
@@ -430,6 +473,58 @@ def test_v2_gateway_rejects_invalid_tool_arguments_and_runtime_returns_result_to
     assert "requirement is required" in second_prompt
 
 
+def test_v2_current_game_search_uses_requirement_contract_aliases() -> None:
+    store = seeded_store()
+    store.create_game(
+        conversation_id="boss_v2",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "start_time_kind": "asap_when_full",
+            "smoke_preference": "non_smoking",
+            "duration_text": "通宵",
+            "user_visible_summary": "杭麻 0.5档 人齐开 无烟 通宵 缺3",
+        },
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_v2_alias_search",
+    )
+
+    matches = store.search_current_games(
+        {
+            "game_type": "hangzhou_mahjong",
+            "stake_options": ["0.5", "1"],
+            "start_time_kind": "人齐开",
+            "smoke_preference": "无烟",
+            "duration_text": "通宵",
+        }
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["game"]["requirement"]["stake"] == "0.5"
+    assert "smoke_preference_matched" in matches[0]["reasons"]
+    assert "start_time_kind_matched" in matches[0]["reasons"]
+    assert "duration_matched" in matches[0]["reasons"]
+
+
+def test_v2_customer_search_uses_smoke_preference_contract_alias() -> None:
+    store = seeded_store()
+
+    candidates = store.search_customers(
+        {
+            "game_type": "hangzhou_mahjong",
+            "stake": "1",
+            "smoke_preference": "烟都可",
+        },
+        exclude_customer_ids=["zhang"],
+    )
+
+    assert candidates
+    assert candidates[0]["customer"]["customer_id"] == "ran"
+    assert "smoke_compatible" in candidates[0]["reasons"]
+
+
 def test_v2_gateway_rejects_internal_codes_in_customer_visible_invites_and_model_retries() -> None:
     store = seeded_store()
     game, _ = store.create_game(
@@ -578,6 +673,8 @@ def test_v2_reply_review_revises_final_reply_and_records_badcase() -> None:
     assert "reply_review_proposed" in steps
     assert "reply_revised" in steps
     assert steps[-1] == "final_output"
+    report = validate_agent_runtime_trace_completeness(trace.get_trace("trace_v2_reply_review"))
+    assert report.complete is True
 
 
 def test_v2_gateway_enforces_tool_execution_mode_permissions() -> None:
@@ -1106,6 +1203,9 @@ def test_v2_system_prompt_separates_customer_reply_from_operator_notes() -> None
     assert "不要暴露候选人姓名、候选人数、建局、创建记录、草稿、审批、后台看板" in prompt
     assert "不要说“已建局/局已建好/已创建/已组好”" in prompt
     assert "不要要求用户去审批" in prompt
+    assert "只要当前目标是“帮用户找人/组局”" in prompt
+    assert "用户回复“可以/组/帮我组/好”" in prompt
+    assert "“人齐开/找到人再商量/尽快开”是有效的 start_time_kind=asap_when_full" in prompt
     assert "最终回复审查模型" in review_prompt
     assert "approved" in review_prompt
     assert "badcase" in review_prompt

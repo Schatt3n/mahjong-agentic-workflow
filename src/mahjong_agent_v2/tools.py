@@ -339,28 +339,52 @@ def requirement_schema_v2() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "game_type": {"type": "string"},
-            "game_type_label": {"type": "string"},
-            "stake": {"type": "string"},
+            "game_type": {
+                "type": "string",
+                "description": "内部结构化玩法编码，例如 hangzhou_mahjong；只能用于工具参数，不能写进客户可见文案。",
+            },
+            "game_type_label": {
+                "type": "string",
+                "description": "客户可见玩法中文名，例如杭麻、川麻、红中。",
+            },
+            "stake": {"type": "string", "description": "结构化档位，例如 0.5、1、2-16。"},
             "stake_options": {"type": "array", "items": {"type": "string"}},
-            "start_time": {"type": "string"},
-            "start_time_text": {"type": "string"},
+            "start_time": {"type": "string", "description": "明确时间，如 14:00；不确定时留空。"},
+            "start_time_text": {
+                "type": "string",
+                "description": "客户可见时间表达，如人齐开、通宵、今晚、下午4点。",
+                "x-public-text": True,
+            },
             "start_time_kind": {
                 "type": "string",
                 "enum": ["exact", "asap_when_full", "overnight", "flexible", "unknown"],
+                "description": "内部结构化时间类型。写给客户/候选人时必须转成自然中文：asap_when_full=人齐开，overnight=通宵，flexible=时间可商量。",
             },
             "duration_hours": {"type": "number"},
-            "duration_text": {"type": "string"},
+            "duration_text": {
+                "type": "string",
+                "description": "客户可见时长表达，如约4小时、通宵、时间可商量。",
+                "x-public-text": True,
+            },
             "smoke_preference": {
                 "type": "string",
                 "enum": ["any", "non_smoking", "smoke_ok", "unknown"],
+                "description": "内部结构化烟况。写给客户/候选人时必须转成自然中文：any=烟都可，non_smoking=无烟，smoke_ok=有烟。",
             },
-            "smoke_label": {"type": "string"},
+            "smoke_label": {
+                "type": "string",
+                "description": "客户可见烟况中文，如无烟、有烟、烟都可。",
+                "x-public-text": True,
+            },
             "current_players": {"type": "integer", "minimum": 0, "maximum": 4},
             "missing_players": {"type": "integer", "minimum": 0, "maximum": 4},
             "seats_total": {"type": "integer", "minimum": 2, "maximum": 8},
             "candidate_preferences": {"type": "object"},
-            "user_visible_summary": {"type": "string", "x-public-text": True},
+            "user_visible_summary": {
+                "type": "string",
+                "description": "给模型写客户/候选人文案时参考的自然中文摘要，不允许包含内部枚举、snake_case 或 JSON。",
+                "x-public-text": True,
+            },
         },
     }
 

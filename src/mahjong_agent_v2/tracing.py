@@ -131,6 +131,7 @@ def validate_agent_runtime_trace_completeness(
             required.extend(["llm_response", "action_proposed"])
         elif "llm_error" in present:
             required.append("llm_error")
+        required.extend(_reply_review_required_steps(present))
     missing = [step for step in required if step not in present]
     ordering_errors = _trace_ordering_errors(present)
     pairing_errors = _tool_pairing_errors(present)
@@ -144,6 +145,31 @@ def validate_agent_runtime_trace_completeness(
         ordering_errors=ordering_errors,
         pairing_errors=pairing_errors,
     )
+
+
+def _reply_review_required_steps(present: list[str]) -> list[str]:
+    review_steps = {
+        step
+        for step in present
+        if step.startswith("reply_review_") or step == "reply_revised"
+    }
+    if not review_steps:
+        return []
+    required = ["reply_review_prompt", "reply_review_budget_checked"]
+    if "reply_review_skipped" in review_steps:
+        required.append("reply_review_skipped")
+        return required
+    if "reply_review_error" in review_steps:
+        required.append("reply_review_error")
+        return required
+    required.append("reply_review_response")
+    if "reply_review_contract_error" in review_steps:
+        required.append("reply_review_contract_error")
+        return required
+    required.append("reply_review_proposed")
+    if "reply_revised" in review_steps:
+        required.append("reply_revised")
+    return required
 
 
 def _trace_ordering_errors(steps: list[str]) -> list[str]:
@@ -170,6 +196,22 @@ def _trace_ordering_errors(steps: list[str]) -> list[str]:
         errors.append("action_proposed must occur before tool_called")
     if "state_transition" in steps and "tool_result" in steps and steps.index("tool_result") > steps.index("state_transition"):
         errors.append("tool_result must occur before state_transition")
+    for before, after in [
+        ("reply_review_prompt", "reply_review_budget_checked"),
+        ("reply_review_budget_checked", "reply_review_response"),
+        ("reply_review_budget_checked", "reply_review_skipped"),
+        ("reply_review_budget_checked", "reply_review_error"),
+        ("reply_review_response", "reply_review_contract_error"),
+        ("reply_review_response", "reply_review_proposed"),
+        ("reply_review_proposed", "reply_revised"),
+        ("reply_review_skipped", "final_output"),
+        ("reply_review_error", "final_output"),
+        ("reply_review_contract_error", "final_output"),
+        ("reply_review_proposed", "final_output"),
+        ("reply_revised", "final_output"),
+    ]:
+        if before in steps and after in steps and steps.index(before) > steps.index(after):
+            errors.append(f"{before} must occur before {after}")
     if steps[-1] != "final_output":
         errors.append("trace must end with final_output")
     return errors

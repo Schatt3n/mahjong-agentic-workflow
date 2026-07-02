@@ -371,25 +371,38 @@ class InMemoryAgentStoreV2:
         return transition
 
 
+_REQUIREMENT_FIELD_ALIASES: tuple[tuple[str, tuple[str, ...], int], ...] = (
+    ("game_type", ("game_type", "ruleset"), 30),
+    ("stake", ("stake", "stake_options", "level"), 25),
+    ("smoke_preference", ("smoke_preference", "smoke"), 15),
+    ("start_time_kind", ("start_time_kind", "start_time_mode"), 10),
+    ("duration", ("duration_kind", "duration_mode", "duration_text"), 10),
+)
+
+_CANONICAL_REQUIREMENT_VALUES: dict[str, str] = {
+    "烟都可": "any",
+    "都可": "any",
+    "无烟": "non_smoking",
+    "有烟": "smoke_ok",
+    "人齐开": "asap_when_full",
+    "尽快": "asap_when_full",
+    "通宵": "overnight",
+}
+
+
 def _score_requirement(query: dict[str, Any], candidate: dict[str, Any]) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
-    for field_name, weight in (
-        ("game_type", 30),
-        ("stake", 25),
-        ("smoke", 15),
-        ("start_time_mode", 10),
-        ("duration_mode", 10),
-    ):
-        expected = query.get(field_name)
-        actual = candidate.get(field_name)
+    for logical_name, aliases, weight in _REQUIREMENT_FIELD_ALIASES:
+        expected = _requirement_value(query, aliases)
+        actual = _requirement_value(candidate, aliases)
         if expected in (None, "", [], {}):
             continue
         if actual in (None, "", [], {}):
             continue
         if _compatible(expected, actual):
             score += weight
-            reasons.append(f"{field_name}_matched")
+            reasons.append(f"{logical_name}_matched")
         else:
             return 0, []
     return score, reasons
@@ -398,9 +411,9 @@ def _score_requirement(query: dict[str, Any], candidate: dict[str, Any]) -> tupl
 def _score_customer(requirement: dict[str, Any], customer: CustomerProfileV2) -> tuple[float, list[str]]:
     score = 30.0 * max(0.0, min(1.0, customer.response_score)) - 20.0 * max(0.0, customer.fatigue_score)
     reasons: list[str] = []
-    game_type = str(requirement.get("game_type") or "")
-    stake = str(requirement.get("stake") or "")
-    smoke = str(requirement.get("smoke") or "")
+    game_type = str(_requirement_value(requirement, ("game_type", "ruleset")) or "")
+    stake = str(_requirement_value(requirement, ("stake", "level")) or "")
+    smoke = str(_requirement_value(requirement, ("smoke_preference", "smoke")) or "")
     if game_type and game_type in customer.preferred_games:
         score += 30
         reasons.append("game_preference_matched")
@@ -417,6 +430,23 @@ def _score_customer(requirement: dict[str, Any], customer: CustomerProfileV2) ->
         score += 5
         reasons.append("has_stake_profile")
     return score, reasons
+
+
+def _requirement_value(payload: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    for alias in aliases:
+        value = payload.get(alias)
+        if value not in (None, "", [], {}):
+            return _canonical_requirement_value(value)
+    return None
+
+
+def _canonical_requirement_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_canonical_requirement_value(item) for item in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        return _CANONICAL_REQUIREMENT_VALUES.get(stripped, stripped)
+    return value
 
 
 def _compatible(expected: Any, actual: Any) -> bool:
