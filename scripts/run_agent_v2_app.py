@@ -24,6 +24,7 @@ from mahjong_agent_v2 import (  # noqa: E402
     UserMessageV2,
 )
 from mahjong_agent_v2.runtime import TokenBudgetV2  # noqa: E402
+from mahjong_agent_v2.tracing import validate_agent_runtime_trace_completeness  # noqa: E402
 
 
 PORT = int(os.getenv("MAHJONG_AGENT_V2_PORT", "8790"))
@@ -125,6 +126,17 @@ def get_runtime() -> AgentRuntimeV2:
     return RUNTIME
 
 
+def trace_payload(runtime: AgentRuntimeV2, trace_id: str) -> dict:
+    events = runtime.trace_recorder.get_trace(trace_id)
+    completeness = validate_agent_runtime_trace_completeness(events)
+    return {
+        "trace_id": trace_id,
+        "trace_log_path": str(TRACE_PATH),
+        "events": [event.to_dict() for event in events],
+        "completeness": completeness.to_dict(),
+    }
+
+
 class AgentV2Handler(BaseHTTPRequestHandler):
     server_version = "MahjongAgentV2/0.1"
 
@@ -148,7 +160,7 @@ class AgentV2Handler(BaseHTTPRequestHandler):
             runtime = get_runtime()
             query = parse_qs(parsed.query)
             trace_id = (query.get("trace_id") or [""])[0]
-            self._json({"trace_id": trace_id, "events": [event.to_dict() for event in runtime.trace_recorder.get_trace(trace_id)]})
+            self._json(trace_payload(runtime, trace_id))
             return
         if parsed.path == "/api/v2/badcases":
             self._json({"path": str(BADCASE_PATH), "records": read_jsonl(BADCASE_PATH)})
@@ -263,7 +275,9 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f4f6f2;padding:12px;b
   <section>
     <h2>状态</h2>
     <div id="state"></div>
-    <h3>Trace</h3>
+    <h3>Trace 完整性</h3>
+    <div id="traceCompleteness" class="card muted">暂无</div>
+    <h3>Trace 事件</h3>
     <div id="trace" class="traceList"></div>
     <h3>Badcase</h3>
     <div id="badcases"></div>
@@ -327,8 +341,24 @@ async function loadState(){
 }
 async function loadTrace(id){
   const traceId=id || document.getElementById('trace_id').value || lastTraceId;
-  if(!traceId){document.getElementById('trace').innerHTML='<div class="muted">暂无</div>';return;}
+  if(!traceId){
+    document.getElementById('traceCompleteness').innerHTML='暂无';
+    document.getElementById('trace').innerHTML='<div class="muted">暂无</div>';
+    return;
+  }
   const data=await (await fetch('/api/v2/traces?trace_id='+encodeURIComponent(traceId))).json();
+  const report=data.completeness || {};
+  const missing=(report.missing_steps||[]).join(', ') || '无';
+  const ordering=(report.ordering_errors||[]).join('\\n') || '无';
+  const pairing=(report.pairing_errors||[]).join('\\n') || '无';
+  document.getElementById('traceCompleteness').innerHTML=`
+    ${pill(report.complete ? '完整' : '不完整')}
+    ${pill('事件 '+((data.events||[]).length))}
+    <div class="muted">${esc(data.trace_log_path||'')}</div>
+    <div>缺失步骤：${esc(missing)}</div>
+    <div>顺序错误：${esc(ordering)}</div>
+    <div>工具配对错误：${esc(pairing)}</div>
+  `;
   document.getElementById('trace').innerHTML=(data.events||[]).map(e=>`
     <div class="traceEvent">
       ${pill(e.step)}${pill(e.level)}

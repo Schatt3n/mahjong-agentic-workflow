@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+
+from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,13 +29,31 @@ def test_agent_v2_console_exposes_observable_panels() -> None:
     assert "模型决策" in html
     assert "工具调用" in html
     assert "状态变化" in html
-    assert "Trace" in html
+    assert "Trace 完整性" in html
+    assert "Trace 事件" in html
     assert "Badcase" in html
     assert "message_id" in html
     assert "/api/v2/message" in html
     assert "/api/v2/state" in html
     assert "/api/v2/traces" in html
     assert "/api/v2/badcases" in html
+    assert "traceCompleteness" in html
+    assert "completeness" in html
+
+
+def test_agent_v2_trace_payload_includes_completeness_report() -> None:
+    module = load_app_module_without_runtime()
+    trace = InMemoryTraceRecorderV2()
+    trace.record("trace_observable", "user_input", {"text": "通宵有人吗"})
+    runtime = SimpleNamespace(trace_recorder=trace)
+
+    payload = module.trace_payload(runtime, "trace_observable")
+
+    assert payload["trace_id"] == "trace_observable"
+    assert payload["trace_log_path"].endswith("logs/agent_runtime_v2_trace.jsonl")
+    assert len(payload["events"]) == 1
+    assert payload["completeness"]["complete"] is False
+    assert "context_packed" in payload["completeness"]["missing_steps"]
 
 
 def test_agent_v2_app_defaults_to_main_trial_port(monkeypatch) -> None:
