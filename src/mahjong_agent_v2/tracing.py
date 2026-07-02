@@ -9,6 +9,17 @@ from typing import Any
 from .models import DEFAULT_TZ_V2
 
 
+AGENT_RUNTIME_V2_TRACE_SCHEMA_VERSION = "agent_runtime_v2.trace.v1"
+AGENT_RUNTIME_V2_REQUIRED_TRACE_STEPS: tuple[str, ...] = (
+    "user_input",
+    "context_packed",
+    "context_built",
+    "llm_prompt",
+    "budget_checked",
+    "final_output",
+)
+
+
 @dataclass(slots=True)
 class TraceEventV2:
     trace_id: str
@@ -20,7 +31,7 @@ class TraceEventV2:
     def to_dict(self) -> dict[str, Any]:
         occurred_at = self.occurred_at or datetime.now(DEFAULT_TZ_V2)
         return {
-            "schema_version": "agent_runtime_v2.trace.v1",
+            "schema_version": AGENT_RUNTIME_V2_TRACE_SCHEMA_VERSION,
             "trace_id": self.trace_id,
             "time": occurred_at.isoformat(),
             "step": self.step,
@@ -79,6 +90,102 @@ class JsonlTraceRecorderV2:
                 )
             )
         return events
+
+
+@dataclass(slots=True)
+class TraceCompletenessReportV2:
+    trace_id: str
+    schema_version: str
+    complete: bool
+    required_steps: list[str]
+    present_steps: list[str]
+    missing_steps: list[str]
+    ordering_errors: list[str]
+    pairing_errors: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trace_id": self.trace_id,
+            "schema_version": self.schema_version,
+            "complete": self.complete,
+            "required_steps": list(self.required_steps),
+            "present_steps": list(self.present_steps),
+            "missing_steps": list(self.missing_steps),
+            "ordering_errors": list(self.ordering_errors),
+            "pairing_errors": list(self.pairing_errors),
+        }
+
+
+def validate_agent_runtime_trace_completeness(
+    events: list[TraceEventV2],
+    *,
+    required_steps: tuple[str, ...] = AGENT_RUNTIME_V2_REQUIRED_TRACE_STEPS,
+) -> TraceCompletenessReportV2:
+    trace_id = events[0].trace_id if events else ""
+    present = [event.step for event in events]
+    if "message_deduplicated" in present:
+        required = ["message_deduplicated"]
+    else:
+        required = list(required_steps)
+        if "llm_response" in present:
+            required.extend(["llm_response", "action_proposed"])
+        elif "llm_error" in present:
+            required.append("llm_error")
+    missing = [step for step in required if step not in present]
+    ordering_errors = _trace_ordering_errors(present)
+    pairing_errors = _tool_pairing_errors(present)
+    return TraceCompletenessReportV2(
+        trace_id=trace_id,
+        schema_version=AGENT_RUNTIME_V2_TRACE_SCHEMA_VERSION,
+        complete=not missing and not ordering_errors and not pairing_errors,
+        required_steps=required,
+        present_steps=present,
+        missing_steps=missing,
+        ordering_errors=ordering_errors,
+        pairing_errors=pairing_errors,
+    )
+
+
+def _trace_ordering_errors(steps: list[str]) -> list[str]:
+    if not steps:
+        return ["trace has no events"]
+    if "message_deduplicated" in steps:
+        return [] if steps[-1] == "message_deduplicated" else ["message_deduplicated trace must end immediately"]
+    errors: list[str] = []
+    for before, after in [
+        ("user_input", "context_packed"),
+        ("context_packed", "context_built"),
+        ("context_built", "llm_prompt"),
+        ("llm_prompt", "budget_checked"),
+    ]:
+        if before in steps and after in steps and steps.index(before) > steps.index(after):
+            errors.append(f"{before} must occur before {after}")
+    if "llm_response" in steps and "budget_checked" in steps and steps.index("budget_checked") > steps.index("llm_response"):
+        errors.append("budget_checked must occur before llm_response")
+    if "llm_error" in steps and "budget_checked" in steps and steps.index("budget_checked") > steps.index("llm_error"):
+        errors.append("budget_checked must occur before llm_error")
+    if "action_proposed" in steps and "llm_response" in steps and steps.index("llm_response") > steps.index("action_proposed"):
+        errors.append("llm_response must occur before action_proposed")
+    if "tool_called" in steps and "action_proposed" in steps and steps.index("action_proposed") > steps.index("tool_called"):
+        errors.append("action_proposed must occur before tool_called")
+    if "state_transition" in steps and "tool_result" in steps and steps.index("tool_result") > steps.index("state_transition"):
+        errors.append("tool_result must occur before state_transition")
+    if steps[-1] != "final_output":
+        errors.append("trace must end with final_output")
+    return errors
+
+
+def _tool_pairing_errors(steps: list[str]) -> list[str]:
+    errors: list[str] = []
+    called_indexes = [index for index, step in enumerate(steps) if step == "tool_called"]
+    result_indexes = [index for index, step in enumerate(steps) if step == "tool_result"]
+    if len(called_indexes) != len(result_indexes):
+        errors.append(f"tool_called count {len(called_indexes)} != tool_result count {len(result_indexes)}")
+        return errors
+    for pair_index, (called_index, result_index) in enumerate(zip(called_indexes, result_indexes), start=1):
+        if called_index > result_index:
+            errors.append(f"tool pair {pair_index} has tool_result before tool_called")
+    return errors
 
 
 def _jsonable(value: Any) -> Any:

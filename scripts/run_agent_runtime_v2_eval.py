@@ -19,7 +19,7 @@ from mahjong_agent_v2 import (  # noqa: E402
     ToolGatewayV2,
     UserMessageV2,
 )
-from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2  # noqa: E402
+from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2, validate_agent_runtime_trace_completeness  # noqa: E402
 
 
 REGRESSION_PATH = ROOT / "eval" / "regression" / "agent_runtime_v2_regression.jsonl"
@@ -237,6 +237,14 @@ def validate_result(
     for step in expected.get("trace_steps_contains") or []:
         if str(step) not in trace_steps:
             errors.append(f"trace missing step {step!r}")
+    if expected.get("trace_complete") is not None:
+        report = validate_agent_runtime_trace_completeness(trace.get_trace(result.trace_id))
+        if bool(report.complete) != bool(expected["trace_complete"]):
+            errors.append(
+                "trace_complete="
+                f"{report.complete}, missing={report.missing_steps}, "
+                f"ordering={report.ordering_errors}, pairing={report.pairing_errors}"
+            )
     return errors
 
 
@@ -245,6 +253,8 @@ def count_checks_for_expected(expected: dict[str, Any]) -> int:
     for key in ("final_reply_exact", "tool_names", "game_count", "invite_draft_count", "state_transition_count"):
         if key in expected:
             total += 1
+    if "trace_complete" in expected:
+        total += 1
     for key in ("final_reply_contains", "final_reply_forbidden", "tool_errors_contains", "trace_steps_contains"):
         total += len(expected.get(key) or [])
     return total

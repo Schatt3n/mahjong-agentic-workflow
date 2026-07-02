@@ -109,6 +109,13 @@ V2 的状态机边界由 `StatePolicyV2` 负责，不由 LLM 决定。
 - `state_transition`
 - `final_output`
 
+V2 提供 `validate_agent_runtime_trace_completeness()` 做自动审计：
+
+- 校验基础事件是否齐全。
+- 校验 `tool_called` 和 `tool_result` 是否成对。
+- 校验关键事件顺序，例如 `llm_prompt -> budget_checked -> llm_response -> action_proposed`。
+- 校验正常处理链路以 `final_output` 收束。
+
 如果模型调用超时或失败，Runtime 会记录 `llm_error`，停止本轮工具执行，输出人工兜底回复，并将本轮结果写入消息幂等账本，避免重复投递时反复触发失败请求。
 
 本地 V2 服务 trace 默认写入：

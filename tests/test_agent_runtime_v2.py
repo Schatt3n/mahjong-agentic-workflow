@@ -19,7 +19,7 @@ from mahjong_agent_v2 import (
 )
 from mahjong_agent_v2.llm import StaticAgentClientV2
 from mahjong_agent_v2.models import ConversationRoleV2, ConversationTurnV2, ToolResultV2
-from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2
+from mahjong_agent_v2.tracing import TraceEventV2, InMemoryTraceRecorderV2, validate_agent_runtime_trace_completeness
 
 
 def test_v2_runtime_lets_model_choose_tool_order_and_reply_after_results() -> None:
@@ -70,6 +70,8 @@ def test_v2_runtime_lets_model_choose_tool_order_and_reply_after_results() -> No
     assert "tool_called" in steps
     assert "tool_result" in steps
     assert "final_output" in steps
+    report = validate_agent_runtime_trace_completeness(trace.get_trace("trace_v2_search"))
+    assert report.complete is True
 
 
 def test_v2_context_builder_packs_recent_conversation_with_budget_audit() -> None:
@@ -225,6 +227,41 @@ def test_v2_runtime_rejects_invalid_tool_call_shape_before_tool_gateway() -> Non
     steps = [event.step for event in trace.get_trace("trace_v2_bad_tool_call_contract")]
     assert "decision_contract_error" in steps
     assert "tool_called" not in steps
+
+
+def test_v2_trace_completeness_reports_missing_tool_result_pair() -> None:
+    events = [
+        TraceEventV2("trace_v2_incomplete", "user_input", {}),
+        TraceEventV2("trace_v2_incomplete", "context_packed", {}),
+        TraceEventV2("trace_v2_incomplete", "context_built", {}),
+        TraceEventV2("trace_v2_incomplete", "llm_prompt", {}),
+        TraceEventV2("trace_v2_incomplete", "budget_checked", {}),
+        TraceEventV2("trace_v2_incomplete", "llm_response", {}),
+        TraceEventV2("trace_v2_incomplete", "action_proposed", {}),
+        TraceEventV2("trace_v2_incomplete", "tool_called", {}),
+        TraceEventV2("trace_v2_incomplete", "final_output", {}),
+    ]
+
+    report = validate_agent_runtime_trace_completeness(events)
+
+    assert report.complete is False
+    assert "tool_called count 1 != tool_result count 0" in report.pairing_errors
+
+
+def test_v2_trace_completeness_reports_bad_event_order() -> None:
+    events = [
+        TraceEventV2("trace_v2_bad_order", "user_input", {}),
+        TraceEventV2("trace_v2_bad_order", "llm_prompt", {}),
+        TraceEventV2("trace_v2_bad_order", "context_packed", {}),
+        TraceEventV2("trace_v2_bad_order", "context_built", {}),
+        TraceEventV2("trace_v2_bad_order", "budget_checked", {}),
+        TraceEventV2("trace_v2_bad_order", "final_output", {}),
+    ]
+
+    report = validate_agent_runtime_trace_completeness(events)
+
+    assert report.complete is False
+    assert "context_built must occur before llm_prompt" in report.ordering_errors
 
 
 class FailingAgentClientV2:
