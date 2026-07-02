@@ -17,6 +17,7 @@ from mahjong_agent_v2 import (
     ToolGatewayV2,
     UserMessageV2,
 )
+from mahjong_agent_v2.context import DEFAULT_V2_PROMPT_PATH
 from mahjong_agent_v2.llm import StaticAgentClientV2
 from mahjong_agent_v2.models import ConversationRoleV2, ConversationTurnV2, ToolResultV2
 from mahjong_agent_v2.tracing import TraceEventV2, InMemoryTraceRecorderV2, validate_agent_runtime_trace_completeness
@@ -1036,6 +1037,17 @@ def test_v2_runtime_source_does_not_import_legacy_parser_workflow_or_guard() -> 
     assert "semantic_resolver" not in source
     assert "controlled_workflow" not in source
     assert "reply_guard" not in source
+
+
+def test_v2_system_prompt_separates_customer_reply_from_operator_notes() -> None:
+    prompt = DEFAULT_V2_PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "`reply_to_user` 是发给当前消息发送者的客户可见回复" in prompt
+    assert "后台事实、工具执行结果、候选人名单、草稿审批状态只能写在 `reasoning_summary`" in prompt
+    assert "`create_invite_drafts` 只创建待审批草稿，不代表已经发出邀约" in prompt
+    assert "不要暴露候选人姓名、候选人数、建局、创建记录、草稿、审批、后台看板" in prompt
+    assert "不要说“已建局/局已建好/已创建/已组好”" in prompt
+    assert "不要要求用户去审批" in prompt
 
 
 def seeded_store() -> InMemoryAgentStoreV2:
