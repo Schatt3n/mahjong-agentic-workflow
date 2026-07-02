@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,31 @@ class TraceEventV3:
     def to_log_line(self) -> str:
         payload = json.dumps({"step": self.step, **self.content}, ensure_ascii=False, sort_keys=True)
         return f"{self.trace_id}-{self.occurred_at}-{self.level}: {payload}"
+
+    @classmethod
+    def from_log_line(cls, line: str) -> "TraceEventV3 | None":
+        match = re.match(
+            r"^(?P<trace_id>.+)-(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})-(?P<level>[A-Z]+): (?P<payload>\{.*\})$",
+            line,
+        )
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        step = payload.pop("step", None)
+        if not isinstance(step, str) or not step:
+            return None
+        return cls(
+            trace_id=match.group("trace_id"),
+            step=step,
+            content=payload,
+            level=match.group("level"),
+            occurred_at=match.group("time"),
+        )
 
 
 @dataclass(slots=True)
@@ -69,14 +95,9 @@ class JsonlTraceRecorderV3:
             for line in Path(self.path).read_text(encoding="utf-8").splitlines():
                 if not line.startswith(prefix):
                     continue
-                # Log lines remain human-readable; API trace reads only the raw line.
-                events.append(
-                    TraceEventV3(
-                        trace_id=trace_id,
-                        step="raw_log_line",
-                        content={"line": line},
-                    )
-                )
+                event = TraceEventV3.from_log_line(line)
+                if event is not None and event.trace_id == trace_id:
+                    events.append(event)
         return events
 
 

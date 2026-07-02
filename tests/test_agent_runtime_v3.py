@@ -9,6 +9,7 @@ from mahjong_agent_v3 import (
     CustomerProfileV3,
     InMemoryAgentStoreV3,
     InMemoryTraceRecorderV3,
+    JsonlTraceRecorderV3,
     StaticAgentClientV3,
     UserMessageV3,
 )
@@ -145,6 +146,36 @@ def test_v3_tool_schema_error_is_fed_back_to_model_not_repaired_by_backend() -> 
     assert second_prompt["previous_tool_results"][0]["error"] == "missing required argument: game_id"
     assert store.games == {}
     assert result.final_reply == "我先确认一下。"
+
+
+def test_v3_jsonl_trace_is_structured_and_replayable(tmp_path) -> None:
+    store = seeded_store()
+    trace = JsonlTraceRecorderV3(tmp_path / "agent_v3_trace.log")
+    client = PlanningClient(store)
+    runtime = AgentRuntimeV3(llm_client=client, store=store, trace_recorder=trace)
+
+    runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_jsonl_trace",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="通宵1块有人吗？没有就帮我组一个",
+            message_id="msg_v3_jsonl_trace",
+        ),
+        trace_id="trace_v3_jsonl_trace",
+    )
+
+    events = trace.get_trace("trace_v3_jsonl_trace")
+    steps = trace_steps(events)
+    assert validate_trace_v3(events)["complete"] is True
+    assert "raw_log_line" not in steps
+    assert "llm_prompt" in steps
+    assert "llm_response" in steps
+    assert "tool_called" in steps
+    assert "tool_result" in steps
+    assert "state_transition" in steps
+    prompt_payload = json.loads(next(event for event in events if event.step == "llm_prompt").content["messages"][1]["content"])
+    assert prompt_payload["runtime"] == "mahjong_agent_v3"
 
 
 def seeded_store() -> InMemoryAgentStoreV3:
