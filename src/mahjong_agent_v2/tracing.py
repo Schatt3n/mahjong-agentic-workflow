@@ -125,6 +125,16 @@ def validate_agent_runtime_trace_completeness(
     present = [event.step for event in events]
     if "message_deduplicated" in present:
         required = ["message_deduplicated"]
+    elif "manual_badcase_input" in present:
+        required = [
+            "manual_badcase_input",
+            "tool_called",
+            "tool_gateway_received",
+            "tool_idempotency_checked",
+            "tool_gateway_completed",
+            "tool_result",
+            "manual_badcase_recorded",
+        ]
     else:
         required = list(required_steps)
         if "llm_response" in present:
@@ -185,6 +195,13 @@ def _trace_ordering_errors(steps: list[str]) -> list[str]:
     if "message_deduplicated" in steps:
         return [] if steps[-1] == "message_deduplicated" else ["message_deduplicated trace must end immediately"]
     errors: list[str] = []
+    is_manual_badcase_trace = "manual_badcase_input" in steps
+    for before, after in [
+        ("manual_badcase_input", "tool_called"),
+        ("tool_result", "manual_badcase_recorded"),
+    ]:
+        if before in steps and after in steps and steps.index(before) > steps.index(after):
+            errors.append(f"{before} must occur before {after}")
     for before, after in [
         ("user_input", "context_packed"),
         ("context_packed", "context_built"),
@@ -230,7 +247,10 @@ def _trace_ordering_errors(steps: list[str]) -> list[str]:
     ]:
         if before in steps and after in steps and steps.index(before) > steps.index(after):
             errors.append(f"{before} must occur before {after}")
-    if steps[-1] != "final_output":
+    if is_manual_badcase_trace:
+        if steps[-1] != "manual_badcase_recorded":
+            errors.append("manual badcase trace must end with manual_badcase_recorded")
+    elif steps[-1] != "final_output":
         errors.append("trace must end with final_output")
     return errors
 

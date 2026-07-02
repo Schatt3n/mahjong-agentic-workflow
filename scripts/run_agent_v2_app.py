@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,7 @@ from mahjong_agent_v2 import (  # noqa: E402
     ToolGatewayV2,
     UserMessageV2,
 )
+from mahjong_agent_v2.models import ToolCallV2  # noqa: E402
 from mahjong_agent_v2.runtime import TokenBudgetV2  # noqa: E402
 from mahjong_agent_v2.tracing import validate_agent_runtime_trace_completeness  # noqa: E402
 
@@ -137,6 +139,96 @@ def trace_payload(runtime: AgentRuntimeV2, trace_id: str) -> dict:
     }
 
 
+def record_manual_badcase(runtime: AgentRuntimeV2, payload: dict) -> dict:
+    source_trace_id = str(payload.get("trace_id") or payload.get("source_trace_id") or "").strip()
+    audit_trace_id = str(payload.get("audit_trace_id") or f"trace_v2_manual_badcase_{uuid.uuid4().hex[:12]}")
+    conversation_id = str(payload.get("conversation_id") or conversation_id_from_trace(runtime, source_trace_id) or "manual_review")
+    badcase_payload = build_manual_badcase_payload(runtime, payload, source_trace_id=source_trace_id)
+    call = ToolCallV2(
+        name="record_badcase",
+        arguments=badcase_payload,
+        reason="manual operator reported badcase",
+    )
+    if getattr(runtime.tool_gateway, "trace_recorder", None) is None:
+        runtime.tool_gateway.trace_recorder = runtime.trace_recorder
+    runtime.trace_recorder.record(
+        audit_trace_id,
+        "manual_badcase_input",
+        {
+            "source_trace_id": source_trace_id,
+            "conversation_id": conversation_id,
+            "payload": badcase_payload,
+        },
+    )
+    runtime.trace_recorder.record(audit_trace_id, "tool_called", {"call": call.to_dict()})
+    result = runtime.tool_gateway.execute(
+        call,
+        trace_id=audit_trace_id,
+        conversation_id=conversation_id,
+        sender_id=str(payload.get("operator_id") or "operator"),
+        sender_name=str(payload.get("operator_name") or "老板/测试者"),
+        step_index=1,
+    )
+    runtime.trace_recorder.record(audit_trace_id, "tool_result", result.to_dict())
+    runtime.trace_recorder.record(
+        audit_trace_id,
+        "manual_badcase_recorded",
+        {
+            "source_trace_id": source_trace_id,
+            "tool_result": result.to_dict(),
+        },
+        level="WARN" if result.error else "INFO",
+    )
+    return {
+        "audit_trace_id": audit_trace_id,
+        "source_trace_id": source_trace_id,
+        "tool_result": result.to_dict(),
+        "trace": trace_payload(runtime, audit_trace_id),
+    }
+
+
+def build_manual_badcase_payload(runtime: AgentRuntimeV2, payload: dict, *, source_trace_id: str) -> dict:
+    facts = trace_facts(runtime, source_trace_id)
+    return {
+        "reason": str(payload.get("reason") or "人工标记回复不符合预期"),
+        "input": payload.get("input") if isinstance(payload.get("input"), dict) else facts.get("input", {}),
+        "actual": payload.get("actual") if isinstance(payload.get("actual"), dict) else facts.get("actual", {}),
+        "expected": payload.get("expected") if isinstance(payload.get("expected"), dict) else {"note": str(payload.get("expected") or "")},
+        "tags": list(dict.fromkeys([*(str(item) for item in payload.get("tags") or []), "agent_runtime_v2", "manual_review"])),
+        "source": "manual_operator",
+        "metadata": {
+            "source_trace_id": source_trace_id,
+            "operator_note": str(payload.get("note") or ""),
+            "source_trace_completeness": trace_payload(runtime, source_trace_id)["completeness"] if source_trace_id else {},
+        },
+    }
+
+
+def trace_facts(runtime: AgentRuntimeV2, trace_id: str) -> dict:
+    facts: dict[str, dict] = {"input": {}, "actual": {}}
+    if not trace_id:
+        return facts
+    for event in runtime.trace_recorder.get_trace(trace_id):
+        if event.step == "user_input":
+            message = event.content.get("message")
+            if isinstance(message, dict):
+                facts["input"] = {"message": message}
+        if event.step == "final_output":
+            facts["actual"] = {"reply": event.content.get("reply", "")}
+    return facts
+
+
+def conversation_id_from_trace(runtime: AgentRuntimeV2, trace_id: str) -> str:
+    if not trace_id:
+        return ""
+    for event in runtime.trace_recorder.get_trace(trace_id):
+        if event.step == "user_input":
+            message = event.content.get("message")
+            if isinstance(message, dict) and message.get("conversation_id"):
+                return str(message["conversation_id"])
+    return ""
+
+
 class AgentV2Handler(BaseHTTPRequestHandler):
     server_version = "MahjongAgentV2/0.1"
 
@@ -183,6 +275,11 @@ class AgentV2Handler(BaseHTTPRequestHandler):
             message = UserMessageV2(**message_kwargs)
             result = runtime.handle_user_message(message, trace_id=payload.get("trace_id"))
             self._json(result.to_dict())
+            return
+        if parsed.path == "/api/v2/badcases":
+            runtime = get_runtime()
+            payload = self._read_json()
+            self._json(record_manual_badcase(runtime, payload))
             return
         self.send_error(404)
 
@@ -280,6 +377,12 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f4f6f2;padding:12px;b
     <h3>Trace 事件</h3>
     <div id="trace" class="traceList"></div>
     <h3>Badcase</h3>
+    <div class="card">
+      <input id="badcase_reason" placeholder="badcase 原因，例如：回复过度追问 / 没有继续找候选人">
+      <textarea id="badcase_expected" style="height:72px" placeholder="期望表现，例如：应该继续搜索候选人并生成待审批邀约"></textarea>
+      <button class="danger" onclick="recordBadcase()">归档当前回复为 badcase</button>
+      <div id="badcaseRecordResult" class="muted">发现回复不对时，先归档，不在代码里硬修一句话。</div>
+    </div>
     <div id="badcases"></div>
   </section>
 </main>
@@ -372,6 +475,29 @@ async function loadBadcases(){
     <div class="muted">${esc(data.path||'')}</div>
     ${(data.records||[]).slice(-6).reverse().map(b=>`<div class="card">${pill(b.badcase_id)}<div>${esc(b.reason)}</div><pre>${pretty(b)}</pre></div>`).join('') || '<div class="muted">暂无</div>'}
   `;
+}
+async function recordBadcase(){
+  const sourceTraceId=document.getElementById('trace_id').value || lastTraceId;
+  const reason=document.getElementById('badcase_reason').value || '人工标记回复不符合预期';
+  const expectedText=document.getElementById('badcase_expected').value || '';
+  const res=await fetch('/api/v2/badcases',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      trace_id:sourceTraceId,
+      conversation_id:document.getElementById('conversation_id').value,
+      reason,
+      expected:{note:expectedText},
+      note:expectedText
+    })
+  });
+  const data=await res.json();
+  document.getElementById('badcaseRecordResult').innerHTML=`已归档：${esc(data.audit_trace_id||'')}`;
+  if(data.audit_trace_id){
+    document.getElementById('trace_id').value=data.audit_trace_id;
+    await loadTrace(data.audit_trace_id);
+  }
+  await loadBadcases();
 }
 loadState();loadBadcases();
 </script>

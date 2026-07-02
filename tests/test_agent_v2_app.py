@@ -4,7 +4,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
-from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2
+from mahjong_agent_v2 import InMemoryAgentStoreV2, InMemoryEvalRecorderV2, ToolGatewayV2
+from mahjong_agent_v2.tracing import InMemoryTraceRecorderV2, validate_agent_runtime_trace_completeness
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,8 @@ def test_agent_v2_console_exposes_observable_panels() -> None:
     assert "/api/v2/badcases" in html
     assert "traceCompleteness" in html
     assert "completeness" in html
+    assert "归档当前回复为 badcase" in html
+    assert "recordBadcase" in html
 
 
 def test_agent_v2_trace_payload_includes_completeness_report() -> None:
@@ -54,6 +57,62 @@ def test_agent_v2_trace_payload_includes_completeness_report() -> None:
     assert len(payload["events"]) == 1
     assert payload["completeness"]["complete"] is False
     assert "context_packed" in payload["completeness"]["missing_steps"]
+
+
+def test_agent_v2_manual_badcase_is_recorded_through_tool_gateway_trace() -> None:
+    module = load_app_module_without_runtime()
+    store = InMemoryAgentStoreV2()
+    trace = InMemoryTraceRecorderV2()
+    eval_recorder = InMemoryEvalRecorderV2()
+    gateway = ToolGatewayV2(store=store, eval_recorder=eval_recorder, trace_recorder=trace)
+    runtime = SimpleNamespace(trace_recorder=trace, tool_gateway=gateway)
+    trace.record(
+        "source_trace",
+        "user_input",
+        {
+            "message": {
+                "conversation_id": "boss_trial_v2",
+                "sender_id": "zhang",
+                "sender_name": "张哥",
+                "text": "通宵有人吗",
+            }
+        },
+    )
+    trace.record("source_trace", "final_output", {"reply": "通宵有的，你几个人？"})
+
+    result = module.record_manual_badcase(
+        runtime,
+        {
+            "trace_id": "source_trace",
+            "reason": "回复声称有通宵局但当前局池没有证据",
+            "expected": {"reply_style": "应该先查当前局或说明没有现成局"},
+            "audit_trace_id": "manual_badcase_trace",
+        },
+    )
+
+    assert result["audit_trace_id"] == "manual_badcase_trace"
+    assert result["source_trace_id"] == "source_trace"
+    assert result["tool_result"]["name"] == "record_badcase"
+    assert result["tool_result"]["called"] is True
+    assert eval_recorder.records[0]["source"] == "manual_operator"
+    assert eval_recorder.records[0]["trace_id"] == "manual_badcase_trace"
+    assert eval_recorder.records[0]["conversation_id"] == "boss_trial_v2"
+    assert eval_recorder.records[0]["input"]["message"]["text"] == "通宵有人吗"
+    assert eval_recorder.records[0]["actual"]["reply"] == "通宵有的，你几个人？"
+    steps = [event.step for event in trace.get_trace("manual_badcase_trace")]
+    assert steps == [
+        "manual_badcase_input",
+        "tool_called",
+        "tool_gateway_received",
+        "tool_idempotency_checked",
+        "tool_definition_checked",
+        "tool_schema_checked",
+        "tool_permission_checked",
+        "tool_gateway_completed",
+        "tool_result",
+        "manual_badcase_recorded",
+    ]
+    assert validate_agent_runtime_trace_completeness(trace.get_trace("manual_badcase_trace")).complete is True
 
 
 def test_agent_v2_app_defaults_to_main_trial_port(monkeypatch) -> None:
