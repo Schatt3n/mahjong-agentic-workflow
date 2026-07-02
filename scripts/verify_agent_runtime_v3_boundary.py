@@ -28,6 +28,19 @@ FORBIDDEN_MODULE_NAMES = {
     "trial_tool_gateway",
     "workflow",
 }
+FORBIDDEN_SEMANTIC_PATCH_TOKENS = {
+    "_normalize_pool_query_text": "旧试用台归一化函数不能进入 V3 主链路",
+    "_guard_suggested_reply": "旧试用台业务回复 guard 不能进入 V3 主链路",
+    "ReplyGuard": "V3 主链路不允许接入旧回复 guard",
+    "re.sub": "V3 后端不应用正则替换修麻将语义",
+    "re.findall": "V3 后端不应用正则抽取修麻将语义",
+    "0，5": "V3 后端不应硬编码 0.5 口误 badcase",
+    "0。5": "V3 后端不应硬编码 0.5 口误 badcase",
+    "0/5": "V3 后端不应硬编码 0.5 口误 badcase",
+    "人气开": "V3 后端不应硬编码人齐开口误 badcase",
+    "asap_when_full": "V3 客户可见链路不应泄漏旧内部枚举补丁",
+    "先帮你留意下": "V3 不应把过早停止话术硬编码为兜底回复",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +58,8 @@ def target_files() -> list[Path]:
 
 
 def verify_file(path: Path) -> list[BoundaryViolation]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text, filename=str(path))
     violations: list[BoundaryViolation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -55,6 +69,14 @@ def verify_file(path: Path) -> list[BoundaryViolation]:
             module = node.module or ""
             if module:
                 violations.extend(_violations_for_module(path, node.lineno, module))
+    violations.extend(_semantic_patch_violations(path, text))
+    return violations
+
+
+def verify_files(paths: list[Path] | None = None) -> list[BoundaryViolation]:
+    violations: list[BoundaryViolation] = []
+    for path in paths or target_files():
+        violations.extend(verify_file(path))
     return violations
 
 
@@ -84,16 +106,31 @@ def _violations_for_module(path: Path, line: int, module: str) -> list[BoundaryV
     return violations
 
 
-def main() -> int:
+def _semantic_patch_violations(path: Path, text: str) -> list[BoundaryViolation]:
     violations: list[BoundaryViolation] = []
-    for path in target_files():
-        violations.extend(verify_file(path))
+    for token, reason in FORBIDDEN_SEMANTIC_PATCH_TOKENS.items():
+        offset = text.find(token)
+        if offset < 0:
+            continue
+        line = text[:offset].count("\n") + 1
+        violations.append(
+            BoundaryViolation(
+                path=path,
+                line=line,
+                message=f"Agent Runtime V3 semantic boundary violation: {reason} ({token!r})",
+            )
+        )
+    return violations
+
+
+def main() -> int:
+    violations = verify_files()
     if violations:
         print("Agent Runtime V3 boundary check failed:", file=sys.stderr)
         for violation in violations:
             print(f"  {violation.format()}", file=sys.stderr)
         return 1
-    print("PASS Agent Runtime V3 boundary: no legacy parser/workflow/guard imports")
+    print("PASS Agent Runtime V3 boundary: no legacy imports or semantic patch code")
     return 0
 
 

@@ -40,7 +40,7 @@ flowchart TD
 
 ## 已验证
 
-- `scripts/verify_agent_runtime_v3_boundary.py`：验证 V3 不 import V2/旧 parser/workflow/guard。
+- `scripts/verify_agent_runtime_v3_boundary.py`：验证 V3 不 import V2/旧 parser/workflow/guard，也不把正则归一化、业务回复 guard、单句 badcase 补丁塞回主链路。
 - `tests/test_agent_runtime_v3.py`：验证模型驱动工具顺序、工具错误回喂模型、后端不解释短确认语义、JSONL trace 可回放、SQLite 状态可恢复。
 - `scripts/run_evals.py`：已纳入 V3 边界和 V3 runtime 测试。
 

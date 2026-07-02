@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,16 @@ from mahjong_agent_v3.tracing import trace_steps, validate_trace_v3
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BOUNDARY_SCRIPT = ROOT / "scripts" / "verify_agent_runtime_v3_boundary.py"
+
+
+def load_boundary_module():
+    spec = importlib.util.spec_from_file_location("verify_agent_runtime_v3_boundary_for_test", BOUNDARY_SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_v3_main_chain_does_not_import_legacy_parser_workflow_or_guard() -> None:
@@ -35,6 +47,29 @@ def test_v3_main_chain_does_not_import_legacy_parser_workflow_or_guard() -> None
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in text, f"{path} contains forbidden legacy token {token!r}"
+
+
+def test_v3_boundary_script_rejects_semantic_patch_code(tmp_path) -> None:
+    module = load_boundary_module()
+    bad_file = tmp_path / "bad_v3_semantic_patch.py"
+    bad_file.write_text(
+        "def patch(text):\n"
+        "    return re.sub('0，5', '0.5', text)\n",
+        encoding="utf-8",
+    )
+
+    violations = module.verify_files([bad_file])
+
+    messages = "\n".join(violation.message for violation in violations)
+    assert "semantic boundary violation" in messages
+    assert "正则替换修麻将语义" in messages
+    assert "0.5 口误 badcase" in messages
+
+
+def test_v3_boundary_script_passes_current_main_chain() -> None:
+    module = load_boundary_module()
+
+    assert module.verify_files() == []
 
 
 def test_v3_runtime_lets_model_drive_tool_sequence_until_final_reply() -> None:
