@@ -594,6 +594,86 @@ def test_v3_invalid_candidate_status_is_rejected_by_tool_schema() -> None:
     assert result.final_reply == "我确认一下她到底来不来。"
 
 
+def test_v3_candidate_join_is_traced_and_persisted_as_state_transition(tmp_path) -> None:
+    db_path = tmp_path / "agent_v3_candidate_join.sqlite3"
+    store = seeded_store(SQLiteAgentStoreV3(db_path))
+    game, _ = store.create_game(
+        conversation_id="v3_candidate_join",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="setup_candidate_join",
+    )
+    store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[{"customer_id": "ran", "display_name": "冉姐", "message_text": "冉姐，1块，打吗？"}],
+        trace_id="setup_candidate_join",
+    )
+    trace = InMemoryTraceRecorderV3()
+    client = StaticAgentClientV3(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="候选人明确确认，模型记录候选人加入。",
+                tool_calls=[
+                    {
+                        "name": "record_candidate_reply",
+                        "arguments": {
+                            "game_id": game.game_id,
+                            "customer_id": "ran",
+                            "display_name": "冉姐",
+                            "status": "accepted",
+                        },
+                        "reason": "候选人确认参加，记录状态变化。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="候选人已加入局。",
+                reply_to_user="好的，加你进来了。",
+            ),
+        ]
+    )
+    runtime = AgentRuntimeV3(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_candidate_join",
+            sender_id="ran",
+            sender_name="冉姐",
+            text="可以",
+            message_id="msg_v3_candidate_join",
+        ),
+        trace_id="trace_v3_candidate_join",
+    )
+
+    assert any(item.customer_id == "ran" for item in store.games[game.game_id].participants)
+    participant_transition = next(
+        transition
+        for transition in result.state_transitions
+        if transition.entity_type == "game_participant" and transition.entity_id == f"{game.game_id}:ran"
+    )
+    assert participant_transition.from_status is None
+    assert participant_transition.to_status == "confirmed"
+    trace_transition = next(
+        event
+        for event in trace.get_trace("trace_v3_candidate_join")
+        if event.step == "state_transition" and event.content["entity_type"] == "game_participant"
+    )
+    assert trace_transition.content["entity_id"] == f"{game.game_id}:ran"
+    reopened = SQLiteAgentStoreV3(db_path)
+    persisted = [
+        transition
+        for transition in reopened.transitions
+        if transition.entity_type == "game_participant" and transition.entity_id == f"{game.game_id}:ran"
+    ]
+    assert len(persisted) == 1
+    assert persisted[0].to_status == "confirmed"
+    assert result.final_reply == "好的，加你进来了。"
+
+
 def test_v3_illegal_game_status_transition_is_rejected_by_state_machine() -> None:
     store = seeded_store()
     game, _ = store.create_game(

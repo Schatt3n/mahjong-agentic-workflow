@@ -347,6 +347,16 @@ class SQLiteAgentStoreV3:
                         source="candidate_reply",
                     )
                 )
+                transitions.append(
+                    StateTransitionV3(
+                        "game_participant",
+                        f"{game.game_id}:{customer_id}",
+                        None,
+                        "confirmed",
+                        "record_candidate_reply",
+                        trace_id,
+                    )
+                )
             if game.remaining_seats() == 0 and game.status != GameStatusV3.READY:
                 old = game.status.value
                 game.status = GameStatusV3.READY
