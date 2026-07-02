@@ -184,7 +184,7 @@ eval/badcases/agent_runtime_v2_badcases.jsonl
 本地查看：
 
 ```bash
-curl -s http://127.0.0.1:8791/api/v2/badcases
+curl -s http://127.0.0.1:8790/api/v2/badcases
 ```
 
 ## 本地启动

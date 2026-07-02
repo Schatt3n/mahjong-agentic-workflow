@@ -33,3 +33,50 @@ def test_agent_v2_console_exposes_observable_panels() -> None:
     assert "/api/v2/state" in html
     assert "/api/v2/traces" in html
     assert "/api/v2/badcases" in html
+
+
+def test_agent_v2_app_defaults_to_main_trial_port(monkeypatch) -> None:
+    monkeypatch.delenv("MAHJONG_AGENT_V2_PORT", raising=False)
+
+    module = load_app_module_without_runtime()
+
+    assert module.PORT == 8790
+
+
+def test_agent_v2_budget_is_configured_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MAHJONG_AGENT_V2_MAX_TOKENS_PER_CALL", "64000")
+    monkeypatch.setenv("MAHJONG_AGENT_V2_MAX_CALLS_PER_TURN", "9")
+
+    module = load_app_module_without_runtime()
+    budget = module.budget_from_env()
+
+    assert budget.max_tokens_per_call == 64000
+    assert budget.max_calls_per_turn == 9
+
+
+def test_agent_v2_budget_uses_legacy_env_alias_for_transition(monkeypatch) -> None:
+    monkeypatch.delenv("MAHJONG_AGENT_V2_MAX_TOKENS_PER_CALL", raising=False)
+    monkeypatch.setenv("MAHJONG_LLM_MAX_TOKENS_PER_CALL", "48000")
+
+    module = load_app_module_without_runtime()
+
+    assert module.budget_from_env().max_tokens_per_call == 48000
+
+
+def test_agent_v2_entrypoints_do_not_import_legacy_main_chain() -> None:
+    files = [
+        ROOT / "scripts" / "run_agent_v2_app.py",
+        ROOT / "scripts" / "run_agent_runtime_v2_eval.py",
+    ]
+    source = "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+    forbidden = [
+        "from mahjong_agent import",
+        "import mahjong_agent.",
+        "semantic_resolver",
+        "controlled_workflow",
+        "reply_guard",
+        "backend_fallback",
+    ]
+    for item in forbidden:
+        assert item not in source

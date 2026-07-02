@@ -23,6 +23,7 @@ from mahjong_agent_v2 import (  # noqa: E402
     ToolGatewayV2,
     UserMessageV2,
 )
+from mahjong_agent_v2.runtime import TokenBudgetV2  # noqa: E402
 
 
 PORT = int(os.getenv("MAHJONG_AGENT_V2_PORT", "8790"))
@@ -46,7 +47,29 @@ def build_runtime() -> AgentRuntimeV2:
         store=store,
         tool_gateway=tool_gateway,
         trace_recorder=JsonlTraceRecorderV2(TRACE_PATH),
+        token_budget=budget_from_env(),
     )
+
+
+def budget_from_env() -> TokenBudgetV2:
+    return TokenBudgetV2(
+        max_tokens_per_call=env_int(
+            "MAHJONG_AGENT_V2_MAX_TOKENS_PER_CALL",
+            env_int("MAHJONG_LLM_MAX_TOKENS_PER_CALL", 24_000),
+        ),
+        max_calls_per_turn=env_int("MAHJONG_AGENT_V2_MAX_CALLS_PER_TURN", 6),
+    )
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
 
 
 def seed_customers(store) -> None:
