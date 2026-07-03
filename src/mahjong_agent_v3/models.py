@@ -86,6 +86,26 @@ class ConversationTurnV3:
 
 
 @dataclass(slots=True)
+class ConversationCheckpointV3:
+    conversation_id: str
+    summary: str
+    facts: dict[str, Any] = field(default_factory=dict)
+    open_questions: list[str] = field(default_factory=list)
+    source_trace_id: str | None = None
+    updated_at: datetime = field(default_factory=now_v3)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "summary": self.summary,
+            "facts": dict(self.facts),
+            "open_questions": list(self.open_questions),
+            "source_trace_id": self.source_trace_id,
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass(slots=True)
 class CustomerProfileV3:
     customer_id: str
     display_name: str

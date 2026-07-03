@@ -202,6 +202,16 @@ def default_tool_definitions_v3(store: InMemoryAgentStoreV3) -> dict[str, ToolDe
             "metadata": {"type": "object", "additionalProperties": True},
         },
     }
+    checkpoint_schema = {
+        "type": "object",
+        "required": ["summary"],
+        "additionalProperties": False,
+        "properties": {
+            "summary": non_empty_string,
+            "facts": {"type": "object", "additionalProperties": True},
+            "open_questions": {"type": "array", "items": non_empty_string},
+        },
+    }
 
     def search_current_games(call: ToolCallV3, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResultV3:
         matches = store.search_current_games(dict(call.arguments.get("requirement") or {}), limit=int(call.arguments.get("limit") or 8))
@@ -264,6 +274,22 @@ def default_tool_definitions_v3(store: InMemoryAgentStoreV3) -> dict[str, ToolDe
     def record_badcase(call: ToolCallV3, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResultV3:
         record = store.record_badcase(dict(call.arguments), trace_id=trace_id, conversation_id=conversation_id)
         return ToolResultV3(name=call.name, called=True, allowed=True, result={"recorded": True, "badcase": record})
+
+    def update_context_checkpoint(call: ToolCallV3, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResultV3:
+        checkpoint, transition = store.upsert_conversation_checkpoint(
+            conversation_id=conversation_id,
+            summary=str(call.arguments["summary"]),
+            facts=dict(call.arguments.get("facts") or {}),
+            open_questions=[str(item) for item in call.arguments.get("open_questions") or []],
+            trace_id=trace_id,
+        )
+        return ToolResultV3(
+            name=call.name,
+            called=True,
+            allowed=True,
+            result={"checkpoint": checkpoint.to_dict()},
+            state_transitions=[transition],
+        )
 
     return {
         "search_current_games": ToolDefinitionV3(
@@ -373,6 +399,14 @@ def default_tool_definitions_v3(store: InMemoryAgentStoreV3) -> dict[str, ToolDe
             "audit_write",
             {"type": "object", "additionalProperties": True},
             record_badcase,
+        ),
+        "update_context_checkpoint": ToolDefinitionV3(
+            "update_context_checkpoint",
+            "更新当前会话的长期上下文 checkpoint。模型负责总结需要跨窗口保留的事实、待确认问题和当前任务状态；工具只校验并存储。",
+            "medium",
+            "state_write",
+            checkpoint_schema,
+            update_context_checkpoint,
         ),
     }
 

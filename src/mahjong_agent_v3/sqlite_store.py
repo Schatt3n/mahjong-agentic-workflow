@@ -11,6 +11,7 @@ from typing import Any
 from .models import (
     AgentActionV3,
     AgentRuntimeResultV3,
+    ConversationCheckpointV3,
     ConversationRoleV3,
     ConversationTurnV3,
     CustomerProfileV3,
@@ -74,6 +75,15 @@ class SQLiteAgentStoreV3:
         with self._lock:
             rows = self._connection.execute("SELECT payload FROM v3_outbound_message_drafts").fetchall()
             return {item.draft_id: item for item in (_outbound_message_draft_from_payload(_loads(row["payload"])) for row in rows)}
+
+    @property
+    def conversation_checkpoints(self) -> dict[str, ConversationCheckpointV3]:
+        with self._lock:
+            rows = self._connection.execute("SELECT payload FROM v3_conversation_checkpoints").fetchall()
+            return {
+                item.conversation_id: item
+                for item in (_checkpoint_from_payload(_loads(row["payload"])) for row in rows)
+            }
 
     @property
     def transitions(self) -> list[StateTransitionV3]:
@@ -149,6 +159,55 @@ class SQLiteAgentStoreV3:
             ).fetchall()
             turns = [_turn_from_payload(_loads(row["payload"])) for row in rows]
             return list(reversed(turns))
+
+    def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpointV3 | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM v3_conversation_checkpoints WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return _checkpoint_from_payload(_loads(row["payload"]))
+
+    def upsert_conversation_checkpoint(
+        self,
+        *,
+        conversation_id: str,
+        summary: str,
+        facts: dict[str, Any],
+        open_questions: list[str],
+        trace_id: str,
+    ) -> tuple[ConversationCheckpointV3, StateTransitionV3]:
+        with self._lock, self._connection:
+            previous = self.get_conversation_checkpoint(conversation_id)
+            checkpoint = ConversationCheckpointV3(
+                conversation_id=conversation_id,
+                summary=summary,
+                facts=dict(facts),
+                open_questions=list(open_questions),
+                source_trace_id=trace_id,
+            )
+            transition = StateTransitionV3(
+                "conversation_checkpoint",
+                conversation_id,
+                "exists" if previous else None,
+                "updated",
+                "update_context_checkpoint",
+                trace_id,
+            )
+            self._connection.execute(
+                """
+                INSERT INTO v3_conversation_checkpoints(conversation_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    payload=excluded.payload,
+                    updated_at=excluded.updated_at
+                """,
+                (conversation_id, _dumps(checkpoint.to_dict()), checkpoint.updated_at.isoformat()),
+            )
+            self._append_transition(transition)
+            return checkpoint, transition
 
     def active_games(self, conversation_id: str | None = None) -> list[GameV3]:
         games = [
@@ -568,6 +627,11 @@ class SQLiteAgentStoreV3:
                 occurred_at TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS v3_conversation_checkpoints(
+                conversation_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS v3_idempotency_ledger(
                 idempotency_key TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
@@ -592,6 +656,7 @@ class SQLiteAgentStoreV3:
             CREATE INDEX IF NOT EXISTS idx_v3_games_status ON v3_games(status);
             CREATE INDEX IF NOT EXISTS idx_v3_invites_game_id ON v3_invite_drafts(game_id);
             CREATE INDEX IF NOT EXISTS idx_v3_outbound_conversation_id ON v3_outbound_message_drafts(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_v3_checkpoints_updated_at ON v3_conversation_checkpoints(updated_at);
             """
         )
         self._connection.commit()
@@ -622,6 +687,17 @@ def _turn_from_payload(payload: dict[str, Any]) -> ConversationTurnV3:
         sender_name=payload.get("sender_name"),
         metadata=dict(payload.get("metadata") or {}),
         occurred_at=_datetime_from_payload(payload.get("occurred_at")),
+    )
+
+
+def _checkpoint_from_payload(payload: dict[str, Any]) -> ConversationCheckpointV3:
+    return ConversationCheckpointV3(
+        conversation_id=str(payload.get("conversation_id") or ""),
+        summary=str(payload.get("summary") or ""),
+        facts=dict(payload.get("facts") or {}) if isinstance(payload.get("facts"), dict) else {},
+        open_questions=[str(item) for item in payload.get("open_questions") or []],
+        source_trace_id=payload.get("source_trace_id"),
+        updated_at=_datetime_from_payload(payload.get("updated_at")),
     )
 
 

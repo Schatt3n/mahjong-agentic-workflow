@@ -10,7 +10,7 @@
 - `regression/`：从 badcase 修复后沉淀出来的专项回归集。适合放“曾经线上/试用中明确失败过，修复后必须永远防回归”的样本。
 - `regression/controlled_workflow_regression.jsonl`：受控工作流专项回归集，使用固定 semantic/reply contract 验证 `ContextBuilder -> SemanticResolver -> ActionValidator -> ToolOrchestrator -> StateMachine -> ReplyPolicy -> ReplyGuard -> Trace`，并校验 `controlled_trace.v1` 完整性，不依赖真实 LLM 的随机输出。它既覆盖成功链路，也覆盖模型 contract 失败路径，例如语义缺 `proposed_action` 必须转人工且不调用工具、回复草稿缺必填字段必须规则兜底并在 trace 中标记 WARN。
 - `regression/agent_runtime_v2_regression.jsonl`：V2 Agent Runtime 专项回归集，作为 legacy/reference 保留，不代表当前主链路。
-- `regression/agent_runtime_v3_regression.jsonl`：V3 Agent Runtime 专项回归集，验证当前独立主链路中“模型理解目标并决定工具调用，后端只做 schema/权限/状态/幂等/审计”的行为。
+- `regression/agent_runtime_v3_regression.jsonl`：V3 Agent Runtime 专项回归集，验证当前独立主链路中“模型理解目标并决定工具调用，后端只做 schema/权限/状态/幂等/审计”的行为；上下文 checkpoint、工具合同和持久化恢复由 V3 pytest 覆盖。
 - `few_shot_examples.jsonl`：老板认可的话术样例。运行试用台时会被动态读取，作为 LLM 起草回复的 few-shot examples，但它不等同于回归评估集。
 - `../skills/mahjong_operations_skills.jsonl`：可复用的运营 skill。它描述“遇到某类场景应该怎么判断和行动”，会被动态注入语义解析、工具规划、回复起草和邀约草稿阶段。
 

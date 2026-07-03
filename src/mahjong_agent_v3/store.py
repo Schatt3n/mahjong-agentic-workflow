@@ -6,6 +6,7 @@ from typing import Any
 
 from .models import (
     AgentRuntimeResultV3,
+    ConversationCheckpointV3,
     ConversationRoleV3,
     ConversationTurnV3,
     CustomerProfileV3,
@@ -47,6 +48,7 @@ class InMemoryAgentStoreV3:
     outbound_message_drafts: dict[str, OutboundMessageDraftV3] = field(default_factory=dict)
     transitions: list[StateTransitionV3] = field(default_factory=list)
     turns: dict[str, list[ConversationTurnV3]] = field(default_factory=dict)
+    conversation_checkpoints: dict[str, ConversationCheckpointV3] = field(default_factory=dict)
     idempotency_ledger: dict[str, ToolResultV3] = field(default_factory=dict)
     message_results: dict[str, AgentRuntimeResultV3] = field(default_factory=dict)
     badcases: list[dict[str, Any]] = field(default_factory=list)
@@ -82,6 +84,40 @@ class InMemoryAgentStoreV3:
     def recent_turns(self, conversation_id: str, limit: int = 30) -> list[ConversationTurnV3]:
         with self._lock:
             return list(self.turns.get(conversation_id, []))[-int(limit):]
+
+    def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpointV3 | None:
+        with self._lock:
+            return self.conversation_checkpoints.get(conversation_id)
+
+    def upsert_conversation_checkpoint(
+        self,
+        *,
+        conversation_id: str,
+        summary: str,
+        facts: dict[str, Any],
+        open_questions: list[str],
+        trace_id: str,
+    ) -> tuple[ConversationCheckpointV3, StateTransitionV3]:
+        with self._lock:
+            previous = self.conversation_checkpoints.get(conversation_id)
+            checkpoint = ConversationCheckpointV3(
+                conversation_id=conversation_id,
+                summary=summary,
+                facts=dict(facts),
+                open_questions=list(open_questions),
+                source_trace_id=trace_id,
+            )
+            self.conversation_checkpoints[conversation_id] = checkpoint
+            transition = StateTransitionV3(
+                entity_type="conversation_checkpoint",
+                entity_id=conversation_id,
+                from_status="exists" if previous else None,
+                to_status="updated",
+                reason="update_context_checkpoint",
+                trace_id=trace_id,
+            )
+            self.transitions.append(transition)
+            return checkpoint, transition
 
     def active_games(self, conversation_id: str | None = None) -> list[GameV3]:
         with self._lock:

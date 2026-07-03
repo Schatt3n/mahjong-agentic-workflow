@@ -232,6 +232,9 @@ class AgentV3Handler(BaseHTTPRequestHandler):
                     "games": [item.to_dict() for item in runtime.store.games.values()],
                     "invite_drafts": [item.to_dict() for item in runtime.store.invite_drafts.values()],
                     "outbound_message_drafts": [item.to_dict() for item in runtime.store.outbound_message_drafts.values()],
+                    "conversation_checkpoints": [
+                        item.to_dict() for item in runtime.store.conversation_checkpoints.values()
+                    ],
                     "customers": [item.to_dict() for item in runtime.store.customers.values()],
                     "runtime_config": runtime_config(runtime),
                 }

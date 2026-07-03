@@ -40,6 +40,7 @@ flowchart TD
 - `record_candidate_reply`：记录候选人反馈并推进受控状态。
 - `update_game_status`：按状态机更新局状态。
 - `record_badcase`：记录 badcase/eval 候选样本。
+- `update_context_checkpoint`：更新当前会话的长期上下文 checkpoint，由模型决定摘要内容，后端只校验并持久化。
 
 ## 工具合同
 
@@ -54,6 +55,15 @@ flowchart TD
 - 候选人确认加入局时，会记录 `game_participant` 状态变化，并同时写入 trace 和持久化状态变化表。
 - schema 错误、权限拒绝和状态机错误都会作为 `tool_result.error` 放进下一轮上下文，由模型决定修正参数、追问或转人工。
 - 权限策略可以按 `execution_mode` 或 `risk_level` 禁止某类工具；被拒绝的工具不会执行副作用，也不会落库。
+
+## 上下文和记忆
+
+- `ContextBuilderV3` 每轮只负责打包上下文，不解释麻将语义，不决定下一步动作。
+- 每轮上下文包含当前消息、近期对话、客户画像、当前局池、待审批草稿、可用工具、上一轮工具结果、输出合同和 `conversation_checkpoint`。
+- `ContextPackingPolicyV3` 会按 token 预算裁剪近期对话，并把裁剪数量、是否带 checkpoint、checkpoint 来源 trace 写入 `context_packed` trace。
+- `conversation_checkpoint` 是模型通过 `update_context_checkpoint` 工具写入的长期对话摘要，用来保留“用户已经说过的人数、档位、烟况、待确认问题”等跨窗口事实。
+- 后端不会自动总结用户语义，也不会把短句硬编码进 checkpoint；如果模型没有显式调用工具，checkpoint 不会更新。
+- 如果 checkpoint 和当前消息、工具结果或系统状态冲突，提示词要求模型以当前事实为准，并再次调用 `update_context_checkpoint` 修正。
 
 ## 模型输出合同
 
@@ -90,14 +100,14 @@ flowchart TD
 ## 已验证
 
 - `scripts/verify_agent_runtime_v3_boundary.py`：验证 V3 不 import V2/旧 parser/workflow/guard，也不把正则归一化、业务回复 guard、单句 badcase 补丁塞回主链路。
-- `tests/test_agent_runtime_v3.py`：验证模型驱动工具顺序、工具错误回喂模型、后端不解释短确认语义、预算拒绝、消息幂等、并发去重、JSONL trace 可回放、SQLite 状态可恢复。
+- `tests/test_agent_runtime_v3.py`：验证模型驱动工具顺序、工具错误回喂模型、后端不解释短确认语义、上下文 checkpoint、预算拒绝、消息幂等、并发去重、JSONL trace 可回放、SQLite 状态可恢复。
 - `scripts/run_evals.py`：当前主链路默认评测，只运行 V3 边界、V3 runtime eval 和 V3 pytest。
 - `scripts/run_legacy_evals.py`：旧 V2/trial/workflow 参考回归，保留用于对照，不代表当前主链路。
 
 ## 持久化
 
 - V3 本地服务默认使用 SQLite：`data/agent_runtime_v3.sqlite3`。
-- SQLite 持久化客户、局、邀约草稿、通用外发消息草稿、对话 turn、工具幂等结果、消息幂等结果、badcase、状态变化。
+- SQLite 持久化客户、局、邀约草稿、通用外发消息草稿、对话 turn、上下文 checkpoint、工具幂等结果、消息幂等结果、badcase、状态变化。
 - Trace 使用 JSONL：`logs/agent_runtime_v3_trace.log`，可按 `traceId` 结构化回放模型输入、模型输出、工具调用、工具结果和状态变化。
 - 本地页面保留短路径：`/api/logs` 查看 V3 日志尾部，`/api/state` 查看 V3 状态，`/api/message` 发送测试消息。
 

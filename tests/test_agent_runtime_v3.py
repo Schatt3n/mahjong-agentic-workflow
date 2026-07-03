@@ -1317,6 +1317,110 @@ def test_v3_sqlite_store_persists_badcases_from_tool(tmp_path) -> None:
     assert reopened.badcases[0]["reason"] == "测试回复不合适"
 
 
+def test_v3_context_checkpoint_is_tool_driven_and_survives_context_packing() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorderV3()
+    client = StaticAgentClientV3(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="用户补充了长期任务事实，模型显式写入 checkpoint。",
+                tool_calls=[
+                    {
+                        "name": "update_context_checkpoint",
+                        "arguments": {
+                            "summary": "张哥正在让老板帮忙组一桌杭麻，倾向人齐开，烟况都可。",
+                            "facts": {
+                                "organizer_id": "zhang",
+                                "game_type": "hangzhou_mahjong",
+                                "start_time_kind": "asap_when_full",
+                                "smoke_preference": "any",
+                            },
+                            "open_questions": ["还需要确认档位和当前人数"],
+                        },
+                        "reason": "这些事实需要跨多轮保留，避免上下文窗口裁剪后丢失。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="waiting_user",
+                reasoning_summary="checkpoint 已更新，继续追问缺失信息。",
+                reply_to_user="行，那你这边几个人，打多大？",
+            ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="下一轮能看到 checkpoint，模型无需后端补语义。",
+                reply_to_user="收到。",
+            ),
+        ]
+    )
+    runtime = AgentRuntimeV3(llm_client=client, store=store, trace_recorder=trace)
+
+    first = runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_checkpoint",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="人齐开吧，有烟无烟都行",
+            message_id="msg_v3_checkpoint_1",
+        ),
+        trace_id="trace_v3_checkpoint_1",
+    )
+
+    checkpoint = store.get_conversation_checkpoint("v3_checkpoint")
+    assert checkpoint is not None
+    assert checkpoint.summary == "张哥正在让老板帮忙组一桌杭麻，倾向人齐开，烟况都可。"
+    assert checkpoint.facts["start_time_kind"] == "asap_when_full"
+    assert first.tool_results[0].name == "update_context_checkpoint"
+    assert any(
+        event.step == "state_transition" and event.content["entity_type"] == "conversation_checkpoint"
+        for event in trace.get_trace("trace_v3_checkpoint_1")
+    )
+
+    runtime.context_builder.packing_policy.max_recent_conversation_tokens = 1
+    second = runtime.handle_user_message(
+        UserMessageV3(
+            conversation_id="v3_checkpoint",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="一个人，1块的",
+            message_id="msg_v3_checkpoint_2",
+        ),
+        trace_id="trace_v3_checkpoint_2",
+    )
+
+    second_prompt = json.loads(client.calls[2]["messages"][1]["content"])
+    assert second.final_reply == "收到。"
+    assert second_prompt["conversation_checkpoint"]["summary"] == checkpoint.summary
+    assert second_prompt["conversation_checkpoint"]["facts"]["smoke_preference"] == "any"
+    assert second_prompt["context_budget"]["conversation_checkpoint_present"] is True
+    assert second_prompt["context_budget"]["omitted_turn_count"] >= 1
+    assert len(second_prompt["recent_conversation"]) == 1
+
+
+def test_v3_sqlite_store_persists_context_checkpoint(tmp_path) -> None:
+    db_path = tmp_path / "agent_v3_checkpoint.sqlite3"
+    store = SQLiteAgentStoreV3(db_path)
+
+    checkpoint, transition = store.upsert_conversation_checkpoint(
+        conversation_id="v3_checkpoint_sqlite",
+        summary="张哥当前在组 1 块杭麻，人齐开。",
+        facts={"organizer_id": "zhang", "stake": "1", "start_time_kind": "asap_when_full"},
+        open_questions=["烟况是否都可"],
+        trace_id="trace_v3_checkpoint_sqlite",
+    )
+
+    assert checkpoint.source_trace_id == "trace_v3_checkpoint_sqlite"
+    assert transition.entity_type == "conversation_checkpoint"
+    reopened = SQLiteAgentStoreV3(db_path)
+    persisted = reopened.get_conversation_checkpoint("v3_checkpoint_sqlite")
+    assert persisted is not None
+    assert persisted.summary == "张哥当前在组 1 块杭麻，人齐开。"
+    assert persisted.facts["stake"] == "1"
+    assert persisted.open_questions == ["烟况是否都可"]
+    assert any(item.entity_type == "conversation_checkpoint" for item in reopened.transitions)
+
+
 def seeded_store(store=None):
     store = store or InMemoryAgentStoreV3()
     store.upsert_customer(

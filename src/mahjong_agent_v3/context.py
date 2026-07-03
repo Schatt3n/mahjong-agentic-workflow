@@ -70,11 +70,18 @@ class AgentContextBuilderV3:
             self.store.recent_turns(message.conversation_id, self.packing_policy.max_turns_considered)
         )
         profile = self.store.customers.get(message.sender_id)
+        checkpoint = self.store.get_conversation_checkpoint(message.conversation_id)
+        audit = {
+            **audit,
+            "conversation_checkpoint_present": checkpoint is not None,
+            "conversation_checkpoint_source_trace_id": checkpoint.source_trace_id if checkpoint else None,
+        }
         payload = {
             "runtime": "mahjong_agent_v3",
             "trace_id": trace_id,
             "current_message": message.to_dict(),
             "recent_conversation": recent_conversation,
+            "conversation_checkpoint": checkpoint.to_dict() if checkpoint else None,
             "context_budget": audit,
             "sender_profile": profile.to_dict() if profile else None,
             "active_games": [item.to_dict() for item in self.store.active_games(message.conversation_id)],

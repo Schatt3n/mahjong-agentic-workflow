@@ -3,6 +3,7 @@ from .llm import OpenAICompatibleAgentClientV3, StaticAgentClientV3
 from .models import (
     AgentActionV3,
     AgentRuntimeResultV3,
+    ConversationCheckpointV3,
     CustomerProfileV3,
     GameV3,
     InviteDraftV3,
@@ -22,6 +23,7 @@ __all__ = [
     "AgentContextBuilderV3",
     "AgentRuntimeResultV3",
     "AgentRuntimeV3",
+    "ConversationCheckpointV3",
     "CustomerProfileV3",
     "GameV3",
     "InMemoryAgentStoreV3",
