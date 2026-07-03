@@ -232,6 +232,28 @@ class SQLiteAgentStoreV3:
                 return None
             return _tool_result_from_payload(_loads(row["payload"]))
 
+    def claim_idempotent_result(self, key: str | None, claimed_result: ToolResultV3) -> tuple[bool, ToolResultV3 | None]:
+        if not key:
+            return True, None
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO v3_idempotency_ledger(idempotency_key, payload, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (key, _dumps(claimed_result.to_dict()), _now_iso()),
+            )
+            if cursor.rowcount == 1:
+                return True, None
+            row = self._connection.execute(
+                "SELECT payload FROM v3_idempotency_ledger WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return False, None
+            return False, _tool_result_from_payload(_loads(row["payload"]))
+
     def remember_result(self, key: str | None, result: ToolResultV3) -> None:
         if not key:
             return
@@ -240,7 +262,8 @@ class SQLiteAgentStoreV3:
                 """
                 INSERT INTO v3_idempotency_ledger(idempotency_key, payload, created_at)
                 VALUES (?, ?, ?)
-                ON CONFLICT(idempotency_key) DO NOTHING
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    payload=excluded.payload
                 """,
                 (key, _dumps(result.to_dict()), _now_iso()),
             )

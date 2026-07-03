@@ -109,6 +109,47 @@ class ToolGatewayV3:
                 self._record(trace_id, "tool_permission_checked", {"tool_name": call.name, "allowed": False, "error": permission_error}, level="WARN")
                 return self._complete(trace_id, step_index, result, outcome="blocked", remember_key=idempotency_key)
             self._record(trace_id, "tool_permission_checked", {"tool_name": call.name, "allowed": True})
+            claimed_result = ToolResultV3(
+                name=call.name,
+                called=False,
+                allowed=True,
+                result={"idempotency_status": "claimed", "claimed_by_trace_id": trace_id},
+                error="tool execution is already in progress for this idempotency key",
+                idempotency_key=idempotency_key,
+            )
+            claimed, claimed_existing = self.store.claim_idempotent_result(idempotency_key, claimed_result)
+            self._record(
+                trace_id,
+                "tool_idempotency_claimed",
+                {
+                    "tool_name": call.name,
+                    "step_index": step_index,
+                    "idempotency_key": idempotency_key,
+                    "claimed": claimed,
+                    "existing": claimed_existing.to_dict() if claimed_existing else None,
+                },
+                level="WARN" if not claimed else "INFO",
+            )
+            if not claimed:
+                if claimed_existing is None:
+                    claimed_existing = ToolResultV3(
+                        name=call.name,
+                        called=False,
+                        allowed=False,
+                        error="idempotency key already claimed but result is unavailable",
+                        idempotency_key=idempotency_key,
+                    )
+                result = ToolResultV3(
+                    name=claimed_existing.name,
+                    called=claimed_existing.called,
+                    allowed=claimed_existing.allowed,
+                    result=dict(claimed_existing.result),
+                    error=claimed_existing.error,
+                    idempotency_key=idempotency_key,
+                    deduplicated=True,
+                    state_transitions=list(claimed_existing.state_transitions),
+                )
+                return self._complete(trace_id, step_index, result, outcome="deduplicated")
             try:
                 if definition.handler is None:
                     raise RuntimeError(f"tool has no handler: {call.name}")

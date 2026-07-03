@@ -99,6 +99,7 @@ def test_v3_manual_badcase_is_recorded_through_tool_gateway(tmp_path) -> None:
         "tool_definition_checked",
         "tool_schema_checked",
         "tool_permission_checked",
+        "tool_idempotency_claimed",
         "tool_gateway_completed",
         "tool_result",
         "manual_badcase_recorded",

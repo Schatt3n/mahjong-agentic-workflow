@@ -135,11 +135,21 @@ class InMemoryAgentStoreV3:
         with self._lock:
             return self.idempotency_ledger.get(key or "")
 
+    def claim_idempotent_result(self, key: str | None, claimed_result: ToolResultV3) -> tuple[bool, ToolResultV3 | None]:
+        if not key:
+            return True, None
+        with self._lock:
+            existing = self.idempotency_ledger.get(key)
+            if existing is not None:
+                return False, existing
+            self.idempotency_ledger[key] = claimed_result
+            return True, None
+
     def remember_result(self, key: str | None, result: ToolResultV3) -> None:
         if not key:
             return
         with self._lock:
-            self.idempotency_ledger.setdefault(key, result)
+            self.idempotency_ledger[key] = result
 
     def idempotent_message_result(self, message_id: str | None) -> AgentRuntimeResultV3 | None:
         with self._lock:

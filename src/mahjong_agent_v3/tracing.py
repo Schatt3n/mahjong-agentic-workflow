@@ -132,6 +132,10 @@ def validate_trace_v3(events: list[TraceEventV3]) -> dict[str, Any]:
             event.step == "tool_definition_checked" and event.content.get("allowed") is False
             for event in events
         )
+        permission_blocked = any(
+            event.step == "tool_permission_checked" and event.content.get("allowed") is False
+            for event in events
+        )
         if (
             not schema_blocked
             and not definition_blocked
@@ -139,4 +143,12 @@ def validate_trace_v3(events: list[TraceEventV3]) -> dict[str, Any]:
             and "tool_permission_checked" not in missing
         ):
             missing.append("tool_permission_checked")
+        if (
+            not schema_blocked
+            and not definition_blocked
+            and not permission_blocked
+            and "tool_idempotency_claimed" not in steps
+            and "tool_idempotency_claimed" not in missing
+        ):
+            missing.append("tool_idempotency_claimed")
     return {"complete": not missing, "missing": missing, "steps": steps}

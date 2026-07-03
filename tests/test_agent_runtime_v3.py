@@ -18,6 +18,7 @@ from mahjong_agent_v3 import (
     StaticAgentClientV3,
     ToolCallV3,
     ToolGatewayV3,
+    ToolResultV3,
     TokenBudgetV3,
     UserMessageV3,
 )
@@ -1215,6 +1216,99 @@ def test_v3_tool_gateway_serializes_concurrent_same_backend_idempotency_key() ->
         events = trace.get_trace(trace_id)
         hit_values.extend(event.content["hit"] for event in events if event.step == "tool_idempotency_checked")
     assert sorted(hit_values) == [False, True]
+
+
+def test_v3_tool_gateway_claims_idempotency_before_executing_side_effect(tmp_path) -> None:
+    store = seeded_store(SQLiteAgentStoreV3(tmp_path / "agent_v3_tool_claim.sqlite3"))
+    trace = InMemoryTraceRecorderV3()
+    gateway = ToolGatewayV3(store=store, trace_recorder=trace)
+    call = ToolCallV3(
+        name="create_game",
+        arguments={
+            "requirement": {"game_type": "hangzhou_mahjong", "stake": "1"},
+            "organizer_id": "zhang",
+            "organizer_name": "张哥",
+            "known_players": [{"customer_id": "zhang", "display_name": "张哥"}],
+        },
+        idempotency_key="model-key-ignored-by-backend-when-message-id-exists",
+    )
+
+    result = gateway.execute(
+        call,
+        trace_id="trace_v3_tool_claim",
+        conversation_id="v3_tool_claim",
+        sender_id="zhang",
+        sender_name="张哥",
+        step_index=101,
+        source_message_id="msg_v3_tool_claim",
+    )
+
+    assert result.called is True
+    assert result.allowed is True
+    assert len(store.games) == 1
+    assert result.idempotency_key
+    persisted = store.idempotent_result(result.idempotency_key)
+    assert persisted is not None
+    assert persisted.called is True
+    assert persisted.result["game"]["organizer_id"] == "zhang"
+    claim_event = next(event for event in trace.get_trace("trace_v3_tool_claim") if event.step == "tool_idempotency_claimed")
+    assert claim_event.content["claimed"] is True
+    assert claim_event.content["idempotency_key"] == result.idempotency_key
+    steps = trace_steps(trace.get_trace("trace_v3_tool_claim"))
+    assert steps == [
+        "tool_gateway_received",
+        "tool_idempotency_checked",
+        "tool_definition_checked",
+        "tool_schema_checked",
+        "tool_permission_checked",
+        "tool_idempotency_claimed",
+        "tool_gateway_completed",
+    ]
+
+
+def test_v3_sqlite_idempotency_claim_is_atomic_across_store_instances(tmp_path) -> None:
+    db_path = tmp_path / "agent_v3_claim_atomic.sqlite3"
+    first_store = SQLiteAgentStoreV3(db_path)
+    second_store = SQLiteAgentStoreV3(db_path)
+    key = "message:shared:tool:create_game:args:same"
+    first_claim = ToolResultV3(
+        name="create_game",
+        called=False,
+        allowed=True,
+        result={"idempotency_status": "claimed", "claimed_by_trace_id": "trace_first"},
+        error="tool execution is already in progress for this idempotency key",
+        idempotency_key=key,
+    )
+    second_claim = ToolResultV3(
+        name="create_game",
+        called=False,
+        allowed=True,
+        result={"idempotency_status": "claimed", "claimed_by_trace_id": "trace_second"},
+        error="tool execution is already in progress for this idempotency key",
+        idempotency_key=key,
+    )
+
+    acquired, existing = first_store.claim_idempotent_result(key, first_claim)
+    duplicate_acquired, duplicate_existing = second_store.claim_idempotent_result(key, second_claim)
+
+    assert acquired is True
+    assert existing is None
+    assert duplicate_acquired is False
+    assert duplicate_existing is not None
+    assert duplicate_existing.result["claimed_by_trace_id"] == "trace_first"
+
+    final = ToolResultV3(
+        name="create_game",
+        called=True,
+        allowed=True,
+        result={"game": {"game_id": "game_claimed"}},
+        idempotency_key=key,
+    )
+    first_store.remember_result(key, final)
+    persisted = second_store.idempotent_result(key)
+    assert persisted is not None
+    assert persisted.called is True
+    assert persisted.result["game"]["game_id"] == "game_claimed"
 
 
 def test_v3_jsonl_trace_is_structured_and_replayable(tmp_path) -> None:

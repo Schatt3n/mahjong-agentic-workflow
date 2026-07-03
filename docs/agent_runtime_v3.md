@@ -90,12 +90,14 @@ flowchart TD
 - 预算拒绝会写入 `budget_checked` 和 `final_output`，trace 完整性校验不会要求不存在的 `llm_response`。
 - 同一 `message_id` 重复进入时直接返回消息结果账本，不再调用 LLM，也不重复执行建局、邀约草稿等副作用工具。
 - 工具幂等键由后端根据 `source_message_id + tool name + canonical arguments` 生成，模型无法通过篡改 traceId 绕过工具幂等。
+- ToolGateway 在执行通过 schema/权限校验的工具前，会先向 store claim 幂等键；SQLite 使用唯一键原子 claim，claim 失败时返回已有结果或进行中结果，不再执行副作用工具。
+- `tool_idempotency_claimed` 会写入 trace，证明某次工具执行是否真正拿到了执行权。
 
 ## 并发边界
 
 - Runtime 对同一 `conversation_id` 使用会话锁串行处理，避免同一对话的多轮上下文和状态写入乱序。
 - 同一 `message_id` 并发进入时，第一条请求完成后写入消息结果账本，后续请求只返回缓存结果并记录 `message_deduplicated`。
-- ToolGateway 对同一后端幂等键使用进程内锁，保证并发请求下同一个副作用工具只执行一次，后续请求返回 deduplicated 结果。
+- ToolGateway 对同一后端幂等键使用进程内锁，SQLite store 再用持久化 claim 做第二层保护；单机多线程下同一个副作用工具只执行一次，未来多进程部署也不会在 claim 前重复执行同一工具。
 
 ## 已验证
 
@@ -107,7 +109,7 @@ flowchart TD
 ## 持久化
 
 - V3 本地服务默认使用 SQLite：`data/agent_runtime_v3.sqlite3`。
-- SQLite 持久化客户、局、邀约草稿、通用外发消息草稿、对话 turn、上下文 checkpoint、工具幂等结果、消息幂等结果、badcase、状态变化。
+- SQLite 持久化客户、局、邀约草稿、通用外发消息草稿、对话 turn、上下文 checkpoint、工具幂等 claim/result、消息幂等结果、badcase、状态变化。
 - Trace 使用 JSONL：`logs/agent_runtime_v3_trace.log`，可按 `traceId` 结构化回放模型输入、模型输出、工具调用、工具结果和状态变化。
 - 本地页面保留短路径：`/api/logs` 查看 V3 日志尾部，`/api/state` 查看 V3 状态，`/api/message` 发送测试消息。
 - `/api/runtime` 和 `/api/health` 返回当前 V3 runtime manifest，包括主链路名、工具清单、端点清单和 legacy 入口状态，用于确认当前服务没有跑回旧系统。
