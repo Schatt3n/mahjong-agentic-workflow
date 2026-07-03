@@ -6,15 +6,15 @@
 
 这个项目沉淀了一套可以接入真实微信、企业微信、小程序、客服系统和 CRM 的“麻将馆运营自动化中台”。它负责理解用户组局意图、维护客户画像、管理待组局队列、推荐合适客户、生成邀约草稿，并在高并发和分布式场景下保证消息不串、不乱序、可观测、可回溯。
 
-更准确地说，当前项目是一个 **agentic workflow**：LLM 负责结合上下文做语义理解、动作提案和回复草稿；流程、状态推进、幂等、客户锁、outbox、风险拦截和审计由确定性后端控制。它不是一个可以绕过后端边界、自己随意改数据库和发送消息的完全自治 Agent。
+当前主系统是一个有生产边界的 **Agent Runtime**：LLM 负责理解用户、判断目标、决定调用哪些工具和调用顺序；后端只负责工具 schema、权限、幂等、状态机、并发、预算、日志和审计。模型不能绕过工具网关直接改数据库，也不能直接发送高风险消息。
 
 代码里的 `mahjong_agent` 包名和 `AgentRuntime` 等类名暂时保留为历史实现名，后续可以做无破坏兼容迁移；对外产品名和仓库名建议使用 `mahjong-ops-workflow`。
 
-## 当前主入口：Agent Runtime V3
+## 当前主入口：Agent Runtime
 
-项目当前默认试用入口已经切到一条独立 V3 主链路，用来验证“模型自主决策工具”的 Agent 版本。V3 不复用旧 parser、旧 workflow、旧 guard 作为主执行链路；旧系统只作为业务参考。
+项目当前默认试用入口是一条独立主链路。实现包历史上仍叫 `mahjong_agent_v3`，但对外运行时名称已经收敛为 `mahjong_agent_runtime`。这条主链路不复用旧 parser、旧 workflow、旧 guard；旧系统只作为业务参考和回归对照。
 
-V3 原则：
+主链路原则：
 
 - LLM 负责理解用户、判断目标、决定调用哪些工具。
 - 后端负责工具 schema 校验、权限、幂等、状态机、并发、预算、日志审计。
@@ -24,20 +24,20 @@ V3 原则：
 - 同一会话串行处理，同一 `message_id` 重复进入时走消息结果账本，不重复调用模型或执行工具。
 - 工具参数错误会作为 tool result 回到模型，由模型修正，而不是后端补业务语义 if-else。
 - 状态机负责局和邀约草稿的状态合法性，模型不能绕过状态机直接落库。
-- `ContextPackingPolicyV3` 负责上下文预算和裁剪审计；跨窗口事实由模型通过 `update_context_checkpoint` 工具写入长期 checkpoint，后端只校验、持久化和回放。
+- `ContextPackingPolicyV3` 负责上下文预算和裁剪审计；跨窗口事实由模型通过 `update_context_checkpoint` 工具写入长期 checkpoint，后端只校验、持久化和回放。这里的 `V3` 是内部实现名，不是对外产品版本。
 - LLM 调用失败会记录 `llm_error` 并中断本轮工具执行，返回人工兜底回复。
 
-V3 文档见 [docs/agent_runtime_v3.md](docs/agent_runtime_v3.md)。
+主链路文档见 [docs/agent_runtime_v3.md](docs/agent_runtime_v3.md)。
 
-V3 状态默认写入 `data/agent_runtime_v3.sqlite3`，trace 默认写入 `logs/agent_runtime_v3_trace.log`。
+主链路状态默认写入 `data/agent_runtime_v3.sqlite3`，trace 默认写入 `logs/agent_runtime_v3_trace.log`。
 
-确认当前服务是否为 V3：
+确认当前服务是否为主 Agent Runtime：
 
 ```bash
 curl http://127.0.0.1:8790/api/runtime
 ```
 
-返回里的 `runtime` 应为 `mahjong_agent_v3`，`main_chain` 应为 `agent_runtime_v3`，`legacy_analyze_endpoint` 应为 `not_exposed_in_v3`。
+返回里的 `runtime` 应为 `mahjong_agent_runtime`，`main_chain` 应为 `agent_runtime`，`legacy_analyze_endpoint` 应为 `not_exposed_in_v3`。
 
 本地启动：
 
@@ -45,7 +45,7 @@ curl http://127.0.0.1:8790/api/runtime
 set -a
 source .env
 set +a
-/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v3_app.py
+/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_app.py
 ```
 
 默认地址：
@@ -54,9 +54,9 @@ set +a
 http://127.0.0.1:8790/
 ```
 
-历史 V2 试用台保留在 `scripts/run_agent_v2_app.py`，默认端口 `8792`，只用于对照和回归，不作为当前测试入口。
+历史 V2 试用台保留在 `scripts/run_agent_v2_app.py`，默认端口 `8792`，只用于对照和回归，不作为当前测试入口。`scripts/run_agent_v3_app.py` 也只作为兼容入口保留，日常启动请使用 `scripts/run_agent_app.py`。
 
-下方“核心能力”“生产架构”“老板试用 Web 台”等章节包含历史 workflow 实现和产品背景说明。当前代码测试、调试和继续开发请优先以 V3 章节、[docs/agent_runtime_v3.md](docs/agent_runtime_v3.md)、`scripts/run_agent_v3_app.py` 和 `scripts/run_evals.py` 为准。
+下方“核心能力”“生产架构”“老板试用 Web 台”等章节包含历史 workflow 实现和产品背景说明。当前代码测试、调试和继续开发请优先以当前主链路章节、[docs/agent_runtime_v3.md](docs/agent_runtime_v3.md)、`scripts/run_agent_app.py` 和 `scripts/run_evals.py` 为准。
 
 ## 解决的问题
 

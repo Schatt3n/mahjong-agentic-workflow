@@ -42,9 +42,9 @@ from mahjong_agent_v3 import (  # noqa: E402
 from mahjong_agent_v3.tracing import validate_trace_v3  # noqa: E402
 
 
-PORT = int(os.getenv("MAHJONG_AGENT_V3_PORT", "8790"))
-TRACE_PATH = ROOT / "logs" / "agent_runtime_v3_trace.log"
-DB_PATH = Path(os.getenv("MAHJONG_AGENT_V3_DB_PATH") or ROOT / "data" / "agent_runtime_v3.sqlite3")
+PORT = int(os.getenv("MAHJONG_AGENT_PORT") or os.getenv("MAHJONG_AGENT_V3_PORT", "8790"))
+TRACE_PATH = Path(os.getenv("MAHJONG_AGENT_TRACE_PATH") or ROOT / "logs" / "agent_runtime_v3_trace.log")
+DB_PATH = Path(os.getenv("MAHJONG_AGENT_DB_PATH") or os.getenv("MAHJONG_AGENT_V3_DB_PATH") or ROOT / "data" / "agent_runtime_v3.sqlite3")
 
 
 RUNTIME: AgentRuntimeV3 | None = None
@@ -92,8 +92,9 @@ def trace_payload(runtime: AgentRuntimeV3, trace_id: str) -> dict:
 
 def runtime_manifest(runtime: AgentRuntimeV3) -> dict:
     return {
-        "runtime": "mahjong_agent_v3",
-        "main_chain": "agent_runtime_v3",
+        "runtime": "mahjong_agent_runtime",
+        "main_chain": "agent_runtime",
+        "implementation_package": "mahjong_agent_v3",
         "status": "ok",
         "legacy_reference_only": True,
         "legacy_entrypoints": {
@@ -102,13 +103,13 @@ def runtime_manifest(runtime: AgentRuntimeV3) -> dict:
             "run_boss_trial_app.py": "reference_only",
         },
         "endpoints": {
-            "message": ["/api/v3/message", "/api/message"],
-            "state": ["/api/v3/state", "/api/state"],
-            "traces": ["/api/v3/traces", "/api/traces"],
-            "logs": ["/api/v3/logs", "/api/logs"],
-            "badcases": ["/api/v3/badcases", "/api/badcases"],
-            "runtime": ["/api/v3/runtime", "/api/runtime"],
-            "health": ["/api/v3/health", "/api/health"],
+            "message": ["/api/message", "/api/v3/message"],
+            "state": ["/api/state", "/api/v3/state"],
+            "traces": ["/api/traces", "/api/v3/traces"],
+            "logs": ["/api/logs", "/api/v3/logs"],
+            "badcases": ["/api/badcases", "/api/v3/badcases"],
+            "runtime": ["/api/runtime", "/api/v3/runtime"],
+            "health": ["/api/health", "/api/v3/health"],
         },
         "available_tools": [item["name"] for item in runtime.tool_gateway.tool_specs_for_prompt()],
         "runtime_config": runtime_config(runtime),
@@ -243,7 +244,7 @@ def seed_customers(store: SQLiteAgentStoreV3) -> None:
 
 
 class AgentV3Handler(BaseHTTPRequestHandler):
-    server_version = "MahjongAgentV3/0.1"
+    server_version = "MahjongAgentRuntime/0.1"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -276,7 +277,7 @@ class AgentV3Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/api/v3/logs", "/api/logs"}:
             limit = int((parse_qs(parsed.query).get("limit") or ["200"])[0] or "200")
-            self._json({"runtime": "mahjong_agent_v3", "trace_log_path": str(TRACE_PATH), "tail": tail_trace_log(limit)})
+            self._json({"runtime": "mahjong_agent_runtime", "trace_log_path": str(TRACE_PATH), "tail": tail_trace_log(limit)})
             return
         if parsed.path in {"/api/v3/badcases", "/api/badcases"}:
             runtime = get_runtime()
@@ -290,7 +291,7 @@ class AgentV3Handler(BaseHTTPRequestHandler):
             runtime = get_runtime()
             payload = self._read_json()
             message = UserMessageV3(
-                conversation_id=str(payload.get("conversation_id") or "boss_v3"),
+                conversation_id=str(payload.get("conversation_id") or "boss_trial"),
                 sender_id=str(payload.get("sender_id") or "zhang"),
                 sender_name=str(payload.get("sender_name") or "张哥"),
                 text=str(payload.get("text") or ""),
@@ -342,7 +343,8 @@ class AgentV3Handler(BaseHTTPRequestHandler):
 def runtime_config(runtime: AgentRuntimeV3) -> dict:
     llm_config = getattr(getattr(runtime, "llm_client", None), "config", None)
     return {
-        "runtime": "mahjong_agent_v3",
+        "runtime": "mahjong_agent_runtime",
+        "implementation_package": "mahjong_agent_v3",
         "llm": {
             "provider": getattr(llm_config, "provider", ""),
             "model": getattr(llm_config, "model", ""),
@@ -361,7 +363,7 @@ def index_html() -> str:
     return """
 <!doctype html>
 <meta charset="utf-8">
-<title>Mahjong Agent V3</title>
+<title>Mahjong Agent Runtime</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;background:#f8faf8;color:#1f2a24}
 main{max-width:980px;margin:auto}
@@ -373,15 +375,15 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 </style>
 <main>
-  <h1>Mahjong Agent V3</h1>
-  <p>独立 V3 主链路：模型决定工具，后端只做合同、权限、幂等、状态和审计。</p>
+  <h1>Mahjong Agent Runtime</h1>
+  <p>当前主链路：模型决定工具，后端只做合同、权限、幂等、状态和审计。</p>
   <div class="grid">
-    <input id="conversationId" value="boss_v3" placeholder="conversationId">
+    <input id="conversationId" value="boss_trial" placeholder="conversationId">
     <input id="senderId" value="zhang" placeholder="senderId">
   </div>
   <p><input id="senderName" value="张哥" placeholder="senderName"></p>
   <p><textarea id="text">通宵1块有人吗？没有就帮我组一个</textarea></p>
-  <button onclick="sendMessage()">发送到 V3</button>
+  <button onclick="sendMessage()">发送</button>
   <button onclick="loadState()">刷新状态</button>
   <button onclick="recordBadcase()">标记 badcase</button>
   <h2>结果</h2>
@@ -401,7 +403,7 @@ async function sendMessage(){
     sender_name: senderName.value,
     text: text.value
   };
-  const res = await fetch('/api/v3/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const res = await fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const body = await res.json();
   window.lastTraceId = body.trace_id;
   output.textContent = JSON.stringify(body, null, 2);
@@ -413,12 +415,12 @@ async function recordBadcase(){
     reason: badcaseReason.value,
     expected: { note: badcaseExpected.value }
   };
-  const res = await fetch('/api/v3/badcases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const res = await fetch('/api/badcases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   badcaseOutput.textContent = JSON.stringify(await res.json(), null, 2);
   await loadState();
 }
 async function loadState(){
-  const res = await fetch('/api/v3/state');
+  const res = await fetch('/api/state');
   state.textContent = JSON.stringify(await res.json(), null, 2);
 }
 loadState();
@@ -439,7 +441,7 @@ def env_int(name: str, default: int) -> int:
 
 def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", PORT), AgentV3Handler)
-    print(f"Mahjong Agent V3 listening on http://127.0.0.1:{PORT}")
+    print(f"Mahjong Agent Runtime listening on http://127.0.0.1:{PORT}")
     print(f"Trace log: {TRACE_PATH}")
     try:
         server.serve_forever()
@@ -447,7 +449,7 @@ def main() -> None:
         pass
     finally:
         server.server_close()
-        print("Mahjong Agent V3 stopped.")
+        print("Mahjong Agent Runtime stopped.")
 
 
 if __name__ == "__main__":

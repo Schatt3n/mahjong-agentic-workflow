@@ -1,15 +1,15 @@
-# Mahjong Agent Runtime V3
+# Mahjong Agent Runtime
 
-V3 是一条独立主链路，不在 V2 或旧 trial/workflow 代码上继续缝补。
+这是当前默认的独立主链路，不在 V2 或旧 trial/workflow 代码上继续缝补。
 
-V2 和旧 trial/workflow 代码仅作为 legacy/reference 保留，不接入当前 V3 服务、上下文构建、工具网关或默认评测入口。
+V2 和旧 trial/workflow 代码仅作为 legacy/reference 保留，不接入当前主服务、上下文构建、工具网关或默认评测入口。当前实现包历史上仍叫 `mahjong_agent_v3`，文档里的 V3 类名是内部实现名，不代表对外还要维护多个主版本。
 
 ## 设计边界
 
 - LLM 负责理解用户、判断目标、决定调用哪些工具和调用顺序。
 - 后端负责工具 schema 校验、权限、幂等、状态机、并发、预算、日志和审计。
 - 后端不解析麻将自然语言，不用 if-else 修具体 badcase。
-- 旧 parser、旧 workflow、旧 guard 不参与 V3 主链路。
+- 旧 parser、旧 workflow、旧 guard 不参与当前主链路。
 - 工具调用、模型输入、模型输出、状态变化都写入 trace。
 - 回复不对时进入 `record_badcase` 或 eval，不把坏例子硬编码进主流程。
 
@@ -101,18 +101,18 @@ flowchart TD
 
 ## 已验证
 
-- `scripts/verify_agent_runtime_v3_boundary.py`：验证 V3 不 import V2/旧 parser/workflow/guard，也不把正则归一化、业务回复 guard、单句 badcase 补丁塞回主链路。
+- `scripts/verify_agent_runtime_v3_boundary.py`：验证当前主链路不 import V2/旧 parser/workflow/guard，也不把正则归一化、业务回复 guard、单句 badcase 补丁塞回主链路。
 - `tests/test_agent_runtime_v3.py`：验证模型驱动工具顺序、工具错误回喂模型、后端不解释短确认语义、上下文 checkpoint、预算拒绝、消息幂等、并发去重、JSONL trace 可回放、SQLite 状态可恢复。
 - `scripts/run_evals.py`：当前主链路默认评测，只运行 V3 边界、V3 runtime eval 和 V3 pytest。
 - `scripts/run_legacy_evals.py`：旧 V2/trial/workflow 参考回归，保留用于对照，不代表当前主链路。
 
 ## 持久化
 
-- V3 本地服务默认使用 SQLite：`data/agent_runtime_v3.sqlite3`。
+- 本地主服务默认使用 SQLite：`data/agent_runtime_v3.sqlite3`。
 - SQLite 持久化客户、局、邀约草稿、通用外发消息草稿、对话 turn、上下文 checkpoint、工具幂等 claim/result、消息幂等结果、badcase、状态变化。
 - Trace 使用 JSONL：`logs/agent_runtime_v3_trace.log`，可按 `traceId` 结构化回放模型输入、模型输出、工具调用、工具结果和状态变化。
-- 本地页面保留短路径：`/api/logs` 查看 V3 日志尾部，`/api/state` 查看 V3 状态，`/api/message` 发送测试消息。
-- `/api/runtime` 和 `/api/health` 返回当前 V3 runtime manifest，包括主链路名、工具清单、端点清单和 legacy 入口状态，用于确认当前服务没有跑回旧系统。
+- 本地页面保留短路径：`/api/logs` 查看日志尾部，`/api/state` 查看状态，`/api/message` 发送测试消息。
+- `/api/runtime` 和 `/api/health` 返回当前 runtime manifest，包括主链路名、工具清单、端点清单和 legacy 入口状态，用于确认当前服务没有跑回旧系统。
 
 ## 本地启动
 
@@ -120,7 +120,7 @@ flowchart TD
 set -a
 source .env
 set +a
-/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_v3_app.py
+/Users/wangjie/Documents/Codex/tools/miniforge3/bin/python scripts/run_agent_app.py
 ```
 
 默认地址：
@@ -133,11 +133,11 @@ http://127.0.0.1:8790/
 
 - 模型可以在 action 中调用 `record_badcase` 工具主动归档坏例子。
 - 顶层 `badcase` 字段不是写入通道；非 null 时会触发合同错误，后端不会替模型转换成工具调用。
-- 人工测试时可以调用 `POST /api/v3/badcases`，或在本地 V3 页面点击“标记 badcase”。
+- 人工测试时可以调用 `POST /api/badcases`，或在本地页面点击“标记 badcase”。
 - 人工 badcase 不直接写库，会先构造 `record_badcase` 工具调用，再经过 `ToolGatewayV3` 的 schema、权限、幂等和 trace。
 
 ## 当前限制
 
-- V3 还没有真实微信/小红书/抖音通道，只保留通道无关的输入输出模型。
-- V3 还没有独立 golden dataset；当前先用单元测试证明主链路边界。
-- V3 还没有多进程 SQLite 工具执行租约；当前进程内有幂等锁，单机单进程可用。
+- 当前主链路还没有真实微信/小红书/抖音通道，只保留通道无关的输入输出模型。
+- 当前主链路还没有独立 golden dataset；当前先用单元测试证明主链路边界。
+- 当前主链路还没有多进程 SQLite 工具执行租约；当前进程内有幂等锁，单机单进程可用。

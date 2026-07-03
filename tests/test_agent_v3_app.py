@@ -16,6 +16,7 @@ from mahjong_agent_v3 import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "run_agent_v3_app.py"
+MAIN_SCRIPT = ROOT / "scripts" / "run_agent_app.py"
 
 
 def load_app_module():
@@ -107,11 +108,19 @@ def test_v3_manual_badcase_is_recorded_through_tool_gateway(tmp_path) -> None:
 
 
 def test_v3_app_defaults_to_main_trial_port(monkeypatch) -> None:
+    monkeypatch.delenv("MAHJONG_AGENT_PORT", raising=False)
     monkeypatch.delenv("MAHJONG_AGENT_V3_PORT", raising=False)
 
     app = load_app_module()
 
     assert app.PORT == 8790
+
+
+def test_main_agent_app_entrypoint_exists_without_versioned_operator_name() -> None:
+    text = MAIN_SCRIPT.read_text(encoding="utf-8")
+
+    assert "from run_agent_v3_app import main" in text
+    assert "MAHJONG_AGENT_PORT" in text
 
 
 def test_v3_runtime_manifest_identifies_current_main_chain(tmp_path) -> None:
@@ -127,10 +136,12 @@ def test_v3_runtime_manifest_identifies_current_main_chain(tmp_path) -> None:
 
     manifest = app.runtime_manifest(runtime)
 
-    assert manifest["runtime"] == "mahjong_agent_v3"
-    assert manifest["main_chain"] == "agent_runtime_v3"
+    assert manifest["runtime"] == "mahjong_agent_runtime"
+    assert manifest["main_chain"] == "agent_runtime"
+    assert manifest["implementation_package"] == "mahjong_agent_v3"
     assert manifest["legacy_reference_only"] is True
     assert manifest["legacy_entrypoints"]["legacy_analyze_endpoint"] == "not_exposed_in_v3"
+    assert "/api/message" in manifest["endpoints"]["message"]
     assert "/api/v3/message" in manifest["endpoints"]["message"]
     assert "search_current_games" in manifest["available_tools"]
     assert "update_context_checkpoint" in manifest["available_tools"]

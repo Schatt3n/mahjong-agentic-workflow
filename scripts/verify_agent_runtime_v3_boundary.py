@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 V3_SOURCE_ROOT = ROOT / "src" / "mahjong_agent_v3"
-V3_ENTRYPOINTS = (ROOT / "scripts" / "run_agent_v3_app.py",)
+V3_ENTRYPOINTS = (ROOT / "scripts" / "run_agent_app.py", ROOT / "scripts" / "run_agent_v3_app.py")
 FORBIDDEN_PACKAGES = {"mahjong_agent", "mahjong_agent_v2"}
 FORBIDDEN_MODULE_NAMES = {
     "action_validator",
