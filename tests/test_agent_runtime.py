@@ -1473,7 +1473,9 @@ def test_runtime_tool_gateway_serializes_concurrent_same_backend_idempotency_key
     assert sorted(result.deduplicated for result in results) == [False, True]
     assert len({result.idempotency_key for result in results}) == 1
     assert all(
-        result.idempotency_key.startswith("message:msg_runtime_concurrent_tool:tool:create_game:args:")
+        result.idempotency_key.startswith(
+            "conversation:runtime_concurrent_tool:sender:zhang:message:msg_runtime_concurrent_tool:tool:create_game:args:"
+        )
         for result in results
     )
     hit_values = []
@@ -1481,6 +1483,61 @@ def test_runtime_tool_gateway_serializes_concurrent_same_backend_idempotency_key
         events = trace.get_trace(trace_id)
         hit_values.extend(event.content["hit"] for event in events if event.step == "tool_idempotency_checked")
     assert sorted(hit_values) == [False, True]
+
+
+def test_runtime_tool_idempotency_is_scoped_by_conversation_and_sender() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    gateway = ToolGateway(store=store, trace_recorder=trace)
+    call = ToolCall(
+        name="create_game",
+        arguments={
+            "requirement": {"game_type": "hangzhou_mahjong", "stake": "1"},
+            "organizer_id": "zhang",
+            "organizer_name": "张哥",
+            "known_players": [{"customer_id": "zhang", "display_name": "张哥"}],
+        },
+        idempotency_key="model-key-cannot-collapse-conversations",
+    )
+    first = gateway.execute(
+        call,
+        trace_id="trace_tool_scope_a",
+        conversation_id="runtime_tool_scope_a",
+        sender_id="zhang",
+        sender_name="张哥",
+        step_index=101,
+        source_message_id="same_upstream_tool_message",
+    )
+    second = gateway.execute(
+        call,
+        trace_id="trace_tool_scope_b",
+        conversation_id="runtime_tool_scope_b",
+        sender_id="zhang",
+        sender_name="张哥",
+        step_index=101,
+        source_message_id="same_upstream_tool_message",
+    )
+    third = gateway.execute(
+        call,
+        trace_id="trace_tool_scope_sender",
+        conversation_id="runtime_tool_scope_a",
+        sender_id="ran",
+        sender_name="冉姐",
+        step_index=101,
+        source_message_id="same_upstream_tool_message",
+    )
+
+    assert first.called is True
+    assert second.called is True
+    assert third.called is True
+    assert first.deduplicated is False
+    assert second.deduplicated is False
+    assert third.deduplicated is False
+    assert len(store.games) == 3
+    assert len({first.idempotency_key, second.idempotency_key, third.idempotency_key}) == 3
+    assert "conversation:runtime_tool_scope_a:sender:zhang:" in (first.idempotency_key or "")
+    assert "conversation:runtime_tool_scope_b:sender:zhang:" in (second.idempotency_key or "")
+    assert "conversation:runtime_tool_scope_a:sender:ran:" in (third.idempotency_key or "")
 
 
 def test_runtime_tool_gateway_claims_idempotency_before_executing_side_effect(tmp_path) -> None:

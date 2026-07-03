@@ -90,7 +90,7 @@ flowchart TD
 - 每轮 LLM 调用前都会执行 `TokenBudget.reserve`，预算拒绝时不会调用模型，也不会执行工具。
 - 预算拒绝会写入 `budget_checked` 和 `final_output`，trace 完整性校验不会要求不存在的 `llm_response`。
 - 同一 `message_id` 重复进入时直接返回消息结果账本，不再调用 LLM，也不重复执行建局、邀约草稿等副作用工具。
-- 工具幂等键由后端根据 `source_message_id + tool name + canonical arguments` 生成，模型无法通过篡改 traceId 绕过工具幂等。
+- 工具幂等键由后端根据 `conversation_id + sender_id + source_message_id + tool name + canonical arguments` 生成，模型无法通过篡改 traceId 或复用上游消息 ID 绕过工具幂等。
 - ToolGateway 在执行通过 schema/权限校验的工具前，会先向 store claim 幂等键；SQLite 使用唯一键原子 claim，claim 失败时返回已有结果或进行中结果，不再执行副作用工具。
 - `tool_idempotency_claimed` 会写入 trace，证明某次工具执行是否真正拿到了执行权。
 

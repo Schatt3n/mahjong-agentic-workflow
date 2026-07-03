@@ -64,7 +64,12 @@ class ToolGateway:
     ) -> ToolResult:
         definition = self.tools.get(call.name)
         idempotency_key = (
-            backend_tool_idempotency_key(call, source_message_id=source_message_id)
+            backend_tool_idempotency_key(
+                call,
+                conversation_id=conversation_id,
+                sender_id=sender_id,
+                source_message_id=source_message_id,
+            )
             or call.idempotency_key
             or f"{trace_id}:tool:{step_index}:{call.name}"
         )
@@ -540,12 +545,21 @@ def validate_value(key: str, value: Any, schema: dict[str, Any]) -> str | None:
     return None
 
 
-def backend_tool_idempotency_key(call: ToolCall, *, source_message_id: str | None) -> str | None:
+def backend_tool_idempotency_key(
+    call: ToolCall,
+    *,
+    conversation_id: str,
+    sender_id: str,
+    source_message_id: str | None,
+) -> str | None:
     if not source_message_id:
         return None
     canonical_args = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical_args.encode("utf-8")).hexdigest()[:24]
-    return f"message:{source_message_id}:tool:{call.name}:args:{digest}"
+    return (
+        f"conversation:{conversation_id}:sender:{sender_id}:"
+        f"message:{source_message_id}:tool:{call.name}:args:{digest}"
+    )
 
 
 def idempotency_lock_for_key(key: str) -> threading.RLock:
