@@ -240,6 +240,35 @@ def test_real_owner_live_eval_seed_games_keep_expected_seat_counts(tmp_path: Pat
     assert later_game.requirement["user_visible_summary"] == "两个人，18.30 星月的局，371 她"
 
 
+def test_real_owner_live_eval_casual_chat_scenario_preserves_active_game(tmp_path: Path) -> None:
+    script_path = ROOT / "scripts" / "run_real_owner_chat_live_eval.py"
+    spec = importlib.util.spec_from_file_location("run_real_owner_chat_live_eval_for_casual_test", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    scenario_ids = {scenario.scenario_id for scenario in module.live_eval_scenarios()}
+    assert "casual_chat_should_not_pollute_business_state" in scenario_ids
+
+    casual_scenario = next(
+        scenario
+        for scenario in module.live_eval_scenarios()
+        if scenario.scenario_id == "casual_chat_should_not_pollute_business_state"
+    )
+    assert "search_current_games" in casual_scenario.forbidden_tool_names
+    assert casual_scenario.expected_active_game_requirement["user_visible_summary"] == "七点三缺一"
+
+    store = module.SQLiteAgentStore(tmp_path / "casual.sqlite3")
+    module.setup_casual_chat_should_not_pollute_business_state(store)
+    casual_game = store.active_games("owner_real_customer_chat")[0]
+    assert casual_game.requirement["stake"] == "0.5"
+    assert casual_game.requirement["smoke_preference"] == "no_smoke"
+    assert casual_game.requirement["start_time"] == "19:00"
+    assert casual_game.requirement["user_visible_summary"] == "七点三缺一"
+
+
 def action_json(
     *,
     objective_status: str,

@@ -41,6 +41,8 @@ class LiveEvalScenario:
     required_reply_contains: list[str] = field(default_factory=list)
     forbidden_reply_contains: list[str] = field(default_factory=list)
     forbidden_trace_steps: list[str] = field(default_factory=lambda: ["action_contract_error", "llm_error"])
+    expected_active_game_count: int | None = None
+    expected_active_game_requirement: dict[str, Any] = field(default_factory=dict)
 
 
 def build_empty_store(db_path: pathlib.Path) -> SQLiteAgentStore:
@@ -170,6 +172,42 @@ def setup_duration_rejection(store: SQLiteAgentStore) -> None:
             {"customer_id": "kexing", "display_name": "可星", "status": "confirmed"},
         ],
         trace_id="trace_owner_real_duration_setup",
+    )
+
+
+def setup_casual_chat_should_not_pollute_business_state(store: SQLiteAgentStore) -> None:
+    seed_default_profiles(store)
+    store.append_user_turn(
+        UserMessage(
+            conversation_id="owner_real_customer_chat",
+            sender_id="owner_real_customer",
+            sender_name="常客",
+            text="帮我约个6.30无烟的",
+            message_id="msg_owner_real_casual_initial_request",
+        ),
+        "trace_owner_real_casual_initial_request",
+    )
+    store.append_assistant_turn("owner_real_customer_chat", "七点三缺一，可以不", "trace_owner_real_casual_initial_offer")
+    store.create_game(
+        conversation_id="owner_real_customer_chat",
+        organizer_id="owner_real_customer",
+        organizer_name="常客",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "no_smoke",
+            "start_time_kind": "scheduled",
+            "start_time": "19:00",
+            "duration_hours": 4,
+            "needed_seats": 1,
+            "user_visible_summary": "七点三缺一",
+        },
+        known_players=[
+            {"customer_id": "summer", "display_name": "夏日", "status": "confirmed"},
+            {"customer_id": "smile", "display_name": "笑脸", "status": "confirmed"},
+            {"customer_id": "kexing", "display_name": "可星", "status": "confirmed"},
+        ],
+        trace_id="trace_owner_real_casual_game_setup",
     )
 
 
@@ -413,6 +451,43 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
             ],
         ),
         LiveEvalScenario(
+            scenario_id="casual_chat_should_not_pollute_business_state",
+            name="AI/运营闲聊可回复，但不能污染当前组局状态",
+            setup=setup_casual_chat_should_not_pollute_business_state,
+            message=UserMessage(
+                conversation_id="owner_real_customer_chat",
+                sender_id="owner_real_customer",
+                sender_name="常客",
+                text="好奇问一下，你们是不是每天都要人工找人组局啊，如果给你一个AI帮你组局你会用吗",
+                message_id="msg_owner_real_live_eval_casual_chat",
+            ),
+            forbidden_tool_names=[
+                "search_current_games",
+                "search_customers",
+                "create_game",
+                "create_invite_drafts",
+                "record_candidate_reply",
+                "update_game_status",
+            ],
+            forbidden_reply_contains=[
+                "要组一个吗",
+                "打多大",
+                "几个人",
+                "什么玩法",
+                "我是AI",
+                *common_forbidden,
+            ],
+            expected_active_game_count=1,
+            expected_active_game_requirement={
+                "stake": "0.5",
+                "smoke_preference": "no_smoke",
+                "start_time_kind": "scheduled",
+                "start_time": "19:00",
+                "needed_seats": 1,
+                "user_visible_summary": "七点三缺一",
+            },
+        ),
+        LiveEvalScenario(
             scenario_id="resume_status_after_casual_chat",
             name="长闲聊后用户问局况，应接回当前组局状态",
             setup=setup_resume_status_after_casual_chat,
@@ -491,7 +566,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
     ]
 
 
-def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[str]) -> dict[str, Any]:
+def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[str], store: SQLiteAgentStore) -> dict[str, Any]:
     final_reply = str(result.final_reply or "")
     tool_names = [item.name for item in result.tool_results if item.name not in {"customer_visible_text_generation", "customer_visible_content_review"}]
     checks: list[dict[str, Any]] = []
@@ -557,6 +632,28 @@ def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[s
                 "actual": trace_steps,
             }
         )
+    if scenario.expected_active_game_count is not None:
+        active_games = store.active_games(scenario.message.conversation_id)
+        checks.append(
+            {
+                "name": "active_game_count_should_match",
+                "passed": len(active_games) == scenario.expected_active_game_count,
+                "expected": scenario.expected_active_game_count,
+                "actual": len(active_games),
+            }
+        )
+    if scenario.expected_active_game_requirement:
+        active_games = store.active_games(scenario.message.conversation_id)
+        active_requirement = active_games[0].requirement if active_games else {}
+        for key, expected in scenario.expected_active_game_requirement.items():
+            checks.append(
+                {
+                    "name": f"active_game_requirement_should_keep_{key}",
+                    "passed": active_requirement.get(key) == expected,
+                    "expected": expected,
+                    "actual": active_requirement.get(key),
+                }
+            )
     return {
         "passed": all(item["passed"] for item in checks),
         "checks": checks,
@@ -578,7 +675,7 @@ def run_scenario(client: OpenAICompatibleAgentClient, args: argparse.Namespace, 
     trace_id = f"trace_owner_real_live_eval_{scenario.scenario_id}"
     result = runtime.handle_user_message(scenario.message, trace_id=trace_id)
     trace_steps = [item.step for item in trace.get_trace(trace_id)]
-    validation = validate_result(result, scenario, trace_steps)
+    validation = validate_result(result, scenario, trace_steps, store)
     return {
         "status": "passed" if validation["passed"] else "failed",
         "trace_id": result.trace_id,
