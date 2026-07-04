@@ -1183,6 +1183,8 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
   <p><textarea id="wechatText" placeholder="默认会填入上一轮 Agent final_reply"></textarea></p>
   <button onclick="sendWechatText()">手动发给微信联系人</button>
   <button class="secondary" onclick="loadWechatBridgeStatus()">Wechaty bridge 状态</button>
+  <button class="danger" onclick="setWechatSendChannel(false)">暂停微信发送总闸</button>
+  <button class="secondary" onclick="setWechatSendChannel(true)">开启微信发送总闸</button>
   <button class="danger" onclick="setWechatAutoSend(false)">暂停自动外发</button>
   <button class="secondary" onclick="setWechatAutoSend(true)">开启自动外发</button>
   <pre id="wechatSendOutput"></pre>
@@ -1279,6 +1281,20 @@ async function setWechatAutoSend(enabled){
   if(!ok) return;
   try{
     const res = await fetch(`${WECHATY_OUTBOUND_BASE}/auto-send`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled})
+    });
+    wechatSendOutput.textContent = JSON.stringify(await res.json(), null, 2);
+  }catch(err){
+    wechatSendOutput.textContent = '切换失败：' + err;
+  }
+}
+async function setWechatSendChannel(enabled){
+  const ok = confirm(enabled ? '确认开启微信发送总闸？开启后手动发送可用，自动外发仍受自动外发开关控制。' : '确认暂停微信发送总闸？暂停后手动发送和自动外发都会被挡住。');
+  if(!ok) return;
+  try{
+    const res = await fetch(`${WECHATY_OUTBOUND_BASE}/send-channel`,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({enabled})

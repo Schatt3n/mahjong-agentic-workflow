@@ -10,6 +10,10 @@ const outboundEnabled = process.env.MAHJONG_WECHATY_OUTBOUND_ENABLED
   ? truthy(process.env.MAHJONG_WECHATY_OUTBOUND_ENABLED)
   : true
 const outboundPort = Number(process.env.MAHJONG_WECHATY_OUTBOUND_PORT || '8791')
+let sendChannelEnabled = process.env.MAHJONG_WECHATY_SEND_ENABLED
+  ? truthy(process.env.MAHJONG_WECHATY_SEND_ENABLED)
+  : false
+let sendChannelUpdatedAt = nowText()
 let autoSendReplyEnabled = truthy(process.env.MAHJONG_WECHATY_AUTO_SEND_REPLY)
 let autoSendReplyUpdatedAt = nowText()
 const contactAliases = parseContactAliases(process.env.MAHJONG_WECHATY_CONTACT_ALIASES || '')
@@ -353,6 +357,9 @@ async function resolveContact(target) {
 }
 
 async function sendContactText(target, text) {
+  if (!sendChannelEnabled) {
+    throw new Error('wechat send channel is paused')
+  }
   const finalText = cleanText(text)
   if (!finalText) {
     throw new Error('missing text')
@@ -403,10 +410,36 @@ function startOutboundServer() {
           ok: true,
           bot_name: botName,
           outbound_enabled: outboundEnabled,
+          send_channel_enabled: sendChannelEnabled,
+          send_channel_updated_at: sendChannelUpdatedAt,
           auto_send_reply: autoSendReplyEnabled,
           auto_send_reply_updated_at: autoSendReplyUpdatedAt,
           known_contact_count: publicKnownContacts().length,
           contact_alias_count: contactAliases.size,
+        })
+        return
+      }
+      if (request.method === 'GET' && request.url === '/send-channel') {
+        sendJson(response, 200, {
+          ok: true,
+          send_channel_enabled: sendChannelEnabled,
+          updated_at: sendChannelUpdatedAt,
+        })
+        return
+      }
+      if (request.method === 'POST' && request.url === '/send-channel') {
+        const payload = await readJsonRequest(request)
+        if (typeof payload.enabled !== 'boolean') {
+          sendJson(response, 400, { ok: false, error: 'enabled must be boolean' })
+          return
+        }
+        sendChannelEnabled = payload.enabled
+        sendChannelUpdatedAt = nowText()
+        console.log(`[${nowText()}] send_channel_enabled=${sendChannelEnabled}`)
+        sendJson(response, 200, {
+          ok: true,
+          send_channel_enabled: sendChannelEnabled,
+          updated_at: sendChannelUpdatedAt,
         })
         return
       }
@@ -496,10 +529,12 @@ bot.on('message', async (message) => {
         `conversation_id=${payload.conversation_id} trace_id=${result.trace_id || '-'}`
     )
     const finalReply = result?.route_result?.agent_result?.final_reply
-    if (autoSendReplyEnabled && finalReply) {
+    if (sendChannelEnabled && autoSendReplyEnabled && finalReply) {
       await message.say(finalReply)
       markOutboundSignature(payload.conversation_id, finalReply)
       console.log(`[${nowText()}] auto-sent reply trace_id=${result.trace_id || '-'} text=${finalReply}`)
+    } else if (!sendChannelEnabled && autoSendReplyEnabled && finalReply) {
+      console.log(`[${nowText()}] skipped auto-send because send channel is paused trace_id=${result.trace_id || '-'}`)
     }
   } catch (error) {
     console.error(`[${nowText()}] forward failed: ${error?.message || String(error)}`)
@@ -515,6 +550,7 @@ process.once('SIGINT', async () => {
 console.log(`[${nowText()}] starting ${botName}`)
 console.log(`[${nowText()}] endpoint=${endpoint}`)
 console.log(`[${nowText()}] WECHATY_PUPPET=${process.env.WECHATY_PUPPET || '(default)'}`)
+console.log(`[${nowText()}] send_channel_enabled=${sendChannelEnabled}`)
 console.log(`[${nowText()}] auto_send_reply=${autoSendReplyEnabled}`)
 console.log(`[${nowText()}] contact_alias_count=${contactAliases.size}`)
 
