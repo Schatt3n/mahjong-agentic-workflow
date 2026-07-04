@@ -1384,6 +1384,37 @@ def test_runtime_game_participants_can_represent_multiple_seats() -> None:
     }
 
 
+def test_runtime_search_current_games_projects_remaining_seats_after_sender_join() -> None:
+    store = seeded_store()
+
+    game, _ = store.create_game(
+        conversation_id="runtime_join_projection",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "no_smoke"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="setup_join_projection",
+    )
+    store.record_candidate_reply(
+        game_id=game.game_id,
+        customer_id="lin01",
+        display_name="林01",
+        status="accepted",
+        trace_id="trace_join_projection_lin",
+    )
+
+    matches = store.search_current_games(
+        {"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "no_smoke"},
+        sender_id="k01",
+        limit=5,
+    )
+
+    assert matches[0]["game"]["remaining_seats"] == 2
+    assert matches[0]["join_projection"]["remaining_seats_before_join"] == 2
+    assert matches[0]["join_projection"]["remaining_seats_after_join"] == 1
+    assert matches[0]["join_projection"]["would_fill_game"] is False
+
+
 def test_runtime_sqlite_preserves_party_size_across_reload(tmp_path) -> None:
     db_path = tmp_path / "runtime_party_size.sqlite3"
     store = seeded_store(SQLiteAgentStore(db_path))
