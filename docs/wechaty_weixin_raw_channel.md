@@ -112,6 +112,21 @@ pnpm start
 
 这类方案更接近“监听当前桌面微信”，但维护成本和风控风险最高。Mac 方向需要单独验证对应 Puppet 是否仍可用、是否维护、是否支持当前微信版本。
 
+已验证 `wechaty-puppet-macpro@0.6.0`：
+
+- 启动时要求 `WECHATY_PUPPET_MACPRO_TOKEN`，没有 token 会直接失败。
+- 依赖较老，在 Node 22/24 下会因为 `grpc@1.24.11` 编译失败。
+- 若必须验证，建议给 bridge 单独使用 Node 16 环境，不要把它作为默认依赖提交到项目里。
+
+示例：
+
+```bash
+export WECHATY_PUPPET=wechaty-puppet-macpro
+export WECHATY_PUPPET_MACPRO_TOKEN='your-token'
+pnpm add wechaty-puppet-macpro@0.6.0
+pnpm start
+```
+
 ## 当前 payload 字段
 
 bridge 会尽量保留原始信息：
