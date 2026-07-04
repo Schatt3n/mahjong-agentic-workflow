@@ -42,11 +42,17 @@ CANDIDATE_REPLY_NEXT_STEP_POLICIES: dict[str, dict[str, Any]] = {
     },
     "accepted": {
         "terminal_for_current_offer": True,
-        "instruction": "This tool has recorded acceptance of the current offer. Reply briefly with the updated public status.",
+        "instruction": (
+            "This tool has recorded acceptance of the current offer. Reply with a minimal acknowledgement like ok/好/okk. "
+            "Do not restate time, stake, smoke, ready/full status, or arrival instructions unless the user explicitly asked for status."
+        ),
     },
     "confirmed": {
         "terminal_for_current_offer": True,
-        "instruction": "This tool has recorded confirmation of the current offer. Reply briefly with the updated public status.",
+        "instruction": (
+            "This tool has recorded confirmation of the current offer. Reply with a minimal acknowledgement like ok/好/okk. "
+            "Do not restate time, stake, smoke, ready/full status, or arrival instructions unless the user explicitly asked for status."
+        ),
     },
     "arrived": {
         "terminal_for_current_offer": True,
