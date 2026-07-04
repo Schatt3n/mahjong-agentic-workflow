@@ -224,6 +224,63 @@ def test_runtime_tool_schema_error_is_fed_back_to_model_not_repaired_by_backend(
     assert result.final_reply == "我先确认一下。"
 
 
+def test_runtime_action_contract_error_is_fed_back_to_model_for_repair() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    client = StaticAgentClient(
+        [
+            json.dumps(
+                {
+                    "goal": "查询当前局池，确认是否有适合张哥的局",
+                    "objective_status": "needs_tool",
+                    "reasoning_summary": "局池为空，需要询问用户偏好，但错误地声明 needs_tool。",
+                    "reply_to_user": "",
+                    "tool_calls": [],
+                    "needs_human": False,
+                    "stop_reason": {
+                        "can_stop": True,
+                        "why": "当前局池为空，需要用户补充偏好信息。",
+                        "pending_work": [],
+                        "depends_on_tool_results": True,
+                    },
+                    "badcase": None,
+                },
+                ensure_ascii=False,
+            ),
+            action_json(
+                objective_status="waiting_user",
+                reasoning_summary="上一轮 AgentAction 合同错误，修正为等待用户补充。",
+                reply_to_user="现在没有现成的局，要不要帮你组一个？",
+            ),
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_contract_repair",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="有局吗",
+            message_id="msg_runtime_contract_repair",
+        ),
+        trace_id="trace_contract_repair",
+    )
+
+    assert result.final_reply == "现在没有现成的局，要不要帮你组一个？"
+    assert result.tool_results == []
+    assert store.games == {}
+    assert len(client.calls) == 2
+    second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
+    feedback = second_prompt["previous_tool_results"][0]
+    assert feedback["name"] == "agent_action_contract"
+    assert "needs_tool requires at least one tool_call" in feedback["error"]
+    steps = trace_steps(trace.get_trace("trace_contract_repair"))
+    assert "action_contract_error" in steps
+    assert "contract_error_feedback" in steps
+    assert steps[-1] == "final_output"
+
+
 def test_runtime_schema_rejects_empty_invite_draft_list_without_state_change() -> None:
     store = seeded_store()
     game, _ = store.create_game(

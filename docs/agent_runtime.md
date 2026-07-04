@@ -82,6 +82,7 @@ flowchart TD
 - `objective_status=needs_human` 时 `needs_human` 必须为 true，否则视为合同错误。
 - `needs_human=true` 时 `objective_status` 也必须是 `needs_human`，避免模型状态和人工介入标志不一致。
 - 合同错误会写入 `action_contract_error` trace，后端不会执行任何工具，也不会创建局、创建邀约或写业务状态。
+- 合同错误会作为 `contract_error_feedback` 回填到下一轮上下文，由模型修正 JSON 合同或改为等待用户；只有模型持续失败、预算耗尽、超时或达到最大步数时才转人工。
 - 记录 badcase/eval 样本必须显式调用 `record_badcase` 工具，不能通过 action 顶层 `badcase` 字段让 runtime 自动落库。
 - 这些校验只约束模型输出结构和执行边界，不用来解释麻将业务语义；“通宵、人齐开、0。5”等理解仍由模型结合上下文和画像完成。
 

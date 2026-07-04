@@ -130,11 +130,22 @@ class AgentRuntime:
             action, errors = parse_action(raw_response)
             actions.append(action)
             if errors:
-                final_reply = "这个我先转人工确认一下。"
                 self.trace_recorder.record(trace_id, "action_contract_error", {"errors": errors, "step_index": step_index}, level="WARN")
-                self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "reason": "contract_error"}, level="WARN")
-                self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
-                break
+                feedback = ToolResult(
+                    name="agent_action_contract",
+                    called=False,
+                    allowed=False,
+                    result={
+                        "errors": list(errors),
+                        "raw_response": raw_response,
+                        "instruction": "Fix the AgentAction JSON contract. If waiting for user, use objective_status=waiting_user with non-empty reply_to_user. If tools are needed, use objective_status=needs_tool with at least one tool_call.",
+                    },
+                    error="AgentAction contract invalid: " + "; ".join(errors),
+                )
+                pending_tool_results = [feedback]
+                self.trace_recorder.record(trace_id, "contract_error_feedback", feedback.to_dict(), level="WARN")
+                self.store.append_tool_turn(message.conversation_id, json.dumps([feedback.to_dict()], ensure_ascii=False), trace_id)
+                continue
             self.trace_recorder.record(trace_id, "action_proposed", action.to_dict())
 
             if action.tool_calls:

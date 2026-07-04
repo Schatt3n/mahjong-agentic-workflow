@@ -101,6 +101,7 @@ flowchart TD
 - 消息结果幂等键按 `conversation_id + sender_id + message_id` 派生。
 - 工具幂等键按 `conversation_id + sender_id + source_message_id + tool name + canonical arguments` 派生。
 - LLM 超时、预算拒绝、合同错误都会 fail closed，不执行工具副作用。
+- 模型输出合同错误会先回喂模型修正；持续失败、超时、预算耗尽或达到最大步数才转人工。
 - Trace 格式为 `traceId-time(yyyy-mm-dd hh:mm:ss)-loglevel: content`。
 
 ## 上下文和记忆
