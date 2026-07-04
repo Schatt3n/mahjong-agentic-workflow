@@ -153,6 +153,8 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "公开可见的微信昵称或对方本来能看到的群昵称" in prompt
     assert "不能给老板自己的私有微信备注" in prompt
     assert "如果用户只是问人名，不要顺带推进“打吗/来吗/可以不”" in prompt
+    assert "问人名时也不要说“还差一个/还缺一个/还差几人”" in prompt
+    assert "回答人名的最终 `reply_to_user` 应该是陈述句或名单" in prompt
     assert "夏日、笑脸，还有一个可能可星" in prompt
     assert "5小时不行/我不打了/退群了" in prompt
     assert "第一步必须输出 `objective_status=needs_tool`" in prompt
@@ -167,6 +169,12 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "客户问“所以现在有人了吗/现在几个人了/还差几个/这个局什么情况”" in prompt
     assert "`active_game_visible_summaries` 和 `active_games` 是当前业务状态的权威来源" in prompt
     assert "优先读取当前局的 `active_game_visible_summaries[].seat_summary`" in prompt
+    assert "active_game_visible_summaries[].status_query_reply_contract" in prompt
+    assert "`preferred_reply_text` 已经是后端整理给老板看的摘要" in prompt
+    assert "回复重点是当前进度，不是重新邀约他本人" in prompt
+    assert "不要在这种进度查询里顺带问“打吗/来吗/可以不”" in prompt
+    assert "另一个可选局、别人发起的局或带公开局名/公开昵称的现成局" in prompt
+    assert "必须保留 `user_visible_summary` 里的时间和公开昵称/局名" in prompt
     assert "result.customer_reply_contract" in prompt
     assert "matched_result_summaries" in prompt
     assert "previous_tool_results[].result.next_step_policy" in prompt
@@ -338,6 +346,9 @@ def test_runtime_context_includes_active_game_visible_summaries() -> None:
     summaries = built.payload["active_game_visible_summaries"]
     assert built.payload["context_budget"]["active_game_visible_summary_count"] == 1
     assert summaries[0]["user_visible_summary"] == "两个人，18.30 星月的局，371 她"
+    assert summaries[0]["status_query_reply_contract"]["preferred_reply_source"] == "user_visible_summary"
+    assert summaries[0]["status_query_reply_contract"]["preferred_reply_text"] == "两个人，18.30 星月的局，371 她"
+    assert "不要只根据 seat_summary 重新概括" in summaries[0]["status_query_reply_contract"]["rule"]
     assert summaries[0]["seat_summary"]["claimed_seats"] == 2
     assert summaries[0]["seat_summary"]["remaining_seats"] == 2
     assert summaries[0]["public_requirement"]["start_time"] == "18:30"

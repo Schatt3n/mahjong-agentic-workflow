@@ -263,6 +263,12 @@ def active_game_visible_summary(game: Any) -> dict[str, Any]:
         "game_id": game.game_id,
         "status": game.status.value,
         "user_visible_summary": str(requirement.get("user_visible_summary") or ""),
+        "status_query_reply_contract": {
+            "when_to_use": "用户问当前局况、现在几个人、还差几人、有没有进展时使用。",
+            "preferred_reply_source": "user_visible_summary",
+            "preferred_reply_text": str(requirement.get("user_visible_summary") or ""),
+            "rule": "如果 user_visible_summary 非空，优先原样使用或轻微口语化；不要只根据 seat_summary 重新概括而丢掉时间、公开昵称、局名或缺口短码。",
+        },
         "seat_summary": game.seat_summary(),
         "public_requirement": {
             key: requirement.get(key)

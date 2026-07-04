@@ -182,6 +182,19 @@ def test_run_wechaty_input_gate_uses_recent_context_for_short_answer(monkeypatch
     assert decision["category"] == "followup_answer"
 
 
+def test_wechaty_casual_chat_prompt_forbids_repeating_system_identity_terms() -> None:
+    prompt = (ROOT / "src" / "mahjong_agent_runtime" / "prompts" / "wechaty_casual_chat_reply.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "即使用户原文里出现 AI" in prompt
+    assert "输出前逐字检查 `reply_to_user`" in prompt
+    assert "如果包含，必须重写" in prompt
+    assert "不要回：“要是真有AI能帮我组局就好了”" in prompt
+    assert "闲聊回复不能顺手提当前局、可选局或任何组局进展" in prompt
+    assert "不要回：“打牌直接说就行。七点三缺一，打吗？”" in prompt
+
+
 def test_handle_wechaty_casual_chat_reviews_reply_before_return(monkeypatch) -> None:
     monkeypatch.setenv("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", "true")
     client = StaticAgentClient(

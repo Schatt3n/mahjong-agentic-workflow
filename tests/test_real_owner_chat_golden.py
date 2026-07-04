@@ -59,6 +59,7 @@ def test_real_owner_chat_golden_covers_context_resume_cases() -> None:
     assert resume_case["expected"]["must_use_existing_context"] is True
     assert resume_case["expected"]["should_not_treat_as_new_game"] is True
     assert "我是AI" in resume_case["expected"]["forbidden_reply_contains"]
+    assert "打吗" in resume_case["expected"]["forbidden_reply_contains"]
 
 
 def test_real_owner_chat_supplement_captures_profile_defaults_and_privacy_boundary() -> None:
