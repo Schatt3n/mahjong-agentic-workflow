@@ -6,6 +6,10 @@ const DEFAULT_ENDPOINT = 'http://127.0.0.1:8790/api/channels/wechaty/raw'
 
 const endpoint = process.env.MAHJONG_WECHATY_RAW_ENDPOINT || DEFAULT_ENDPOINT
 const botName = process.env.MAHJONG_WECHATY_BOT_NAME || 'mahjong-wechaty-bridge'
+const defaultContactAliases = new Map([
+  ['刘臻', '@5657a9459a503bf10c1360f24e491963'],
+  ['噜噜小王！', '@5657a9459a503bf10c1360f24e491963'],
+])
 const outboundEnabled = process.env.MAHJONG_WECHATY_OUTBOUND_ENABLED
   ? truthy(process.env.MAHJONG_WECHATY_OUTBOUND_ENABLED)
   : true
@@ -105,7 +109,7 @@ function customerVisibleTextViolations(text) {
 }
 
 function parseContactAliases(raw) {
-  const aliases = new Map()
+  const aliases = new Map(defaultContactAliases)
   for (const part of String(raw || '').split(/[,\n]/)) {
     const item = part.trim()
     if (!item || !item.includes('=')) {

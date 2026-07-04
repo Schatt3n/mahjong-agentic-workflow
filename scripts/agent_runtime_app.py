@@ -64,6 +64,19 @@ WECHATY_RAW_LOG_PATH = Path(
 WECHATY_INPUT_GATE_PROMPT_PATH = (
     SRC / "mahjong_agent_runtime" / "prompts" / "wechaty_input_gate.md"
 )
+DEFAULT_WECHATY_AGENT_WHITELIST = {
+    "@a848814d1f5ac34c2926032824f9c369b9596f7d4f8295a6936310a2630bd477",
+    "@844362549504da622551a39c8569ab565dd821d90291f1ead5befff9c1856aa4",
+    "@bcf90150509c71de7409b5204b82d919c423c5a9d9958f1ac8563a8f6ff0a097",
+    "@ae3faab1468870edf94552f9802092efbdd3910943edcc0cbfe2c3afd65134b5",
+    "@5657a9459a503bf10c1360f24e491963",
+    "xml31323",
+    "刘峻甫-21M-高分子-宜宾",
+    "陈子贤",
+    "Ech0",
+    "刘臻",
+    "噜噜小王！",
+}
 
 
 RUNTIME: AgentRuntime | None = None
@@ -358,7 +371,8 @@ def wechaty_identity_values(payload: dict) -> list[str]:
 
 
 def wechaty_agent_whitelist_hits(payload: dict) -> list[str]:
-    allowed = {item.lower() for item in split_env_list(os.getenv("MAHJONG_WECHATY_AGENT_WHITELIST", ""))}
+    allowed = {item.lower() for item in DEFAULT_WECHATY_AGENT_WHITELIST}
+    allowed.update(item.lower() for item in split_env_list(os.getenv("MAHJONG_WECHATY_AGENT_WHITELIST", "")))
     if not allowed:
         return []
     return [item for item in wechaty_identity_values(payload) if item.lower() in allowed]
@@ -866,6 +880,17 @@ def seed_customers(store: SQLiteAgentStore) -> None:
             response_score=0.8,
             notes="用户确认：姐姐，白名单测试联系人。偏好待补充。",
         ),
+        CustomerProfile(
+            customer_id="@5657a9459a503bf10c1360f24e491963",
+            display_name="刘臻",
+            gender="男",
+            preferred_games=[],
+            preferred_stakes=[],
+            preferred_time_tags=[],
+            smoke_preference=None,
+            response_score=0.8,
+            notes="用户确认：好哥们儿，白名单测试联系人。Wechaty alias/name 日志已确认。",
+        ),
     ]
     for profile in profiles:
         store.upsert_customer(profile)
@@ -1097,7 +1122,9 @@ def runtime_config(runtime: AgentRuntime) -> dict:
         if runtime.context_summary_manager is not None
         else None,
         "wechaty_route_scope": os.getenv("MAHJONG_WECHATY_ROUTE_SCOPE", "self_only"),
-        "wechaty_agent_whitelist": split_env_list(os.getenv("MAHJONG_WECHATY_AGENT_WHITELIST", "")),
+        "wechaty_agent_whitelist": sorted(
+            {*DEFAULT_WECHATY_AGENT_WHITELIST, *split_env_list(os.getenv("MAHJONG_WECHATY_AGENT_WHITELIST", ""))}
+        ),
         "wechaty_input_gate_enabled": env_bool("MAHJONG_WECHATY_INPUT_GATE_ENABLED", True),
         "wechaty_input_gate_model": os.getenv("MAHJONG_WECHATY_INPUT_GATE_LLM_MODEL")
         or getattr(getattr(runtime.llm_client, "config", None), "model", None),

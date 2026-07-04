@@ -100,8 +100,10 @@ export MAHJONG_WECHATY_CONTACT_ALIASES='xml31323=@wechaty-contact-id'
 多个映射用英文逗号分隔，例如：
 
 ```bash
-export MAHJONG_WECHATY_CONTACT_ALIASES='xml31323=@id1,radon_1=@id2'
+export MAHJONG_WECHATY_CONTACT_ALIASES='xml31323=@id1,radon_1=@id2,刘臻=@5657a9459a503bf10c1360f24e491963'
 ```
+
+当前本地 bridge 已内置测试映射：`刘臻` / `噜噜小王！` -> `@5657a9459a503bf10c1360f24e491963`。
 
 ## 测试期路由范围
 
@@ -120,10 +122,12 @@ export MAHJONG_WECHATY_ROUTE_SCOPE=self_only
 如果只想让少数测试好友进入主流程，可以保持 `self_only`，再配置白名单：
 
 ```bash
-export MAHJONG_WECHATY_AGENT_WHITELIST='@contact_id_1,@contact_id_2,Ech0'
+export MAHJONG_WECHATY_AGENT_WHITELIST='@contact_id_1,@contact_id_2,Ech0,刘臻'
 ```
 
 白名单匹配 Wechaty `sender_id`、昵称、备注名或微信号。命中白名单的非 self 消息会进入 Agent；未命中的消息仍只写原始日志。
+
+当前本地 runtime 已内置这些测试白名单：`xml31323`、`刘峻甫-21M-高分子-宜宾`、`陈子贤`、`Ech0`、`刘臻` 及其已知 Wechaty contact id。
 
 白名单只代表“允许进入系统”，不代表每条消息都会进入麻将运营主流程。为了避免朋友闲聊被当成组局消息，runtime 在 Wechaty 入口增加了 LLM 入口分流：
 
@@ -220,7 +224,7 @@ bridge 会尽量保留原始信息：
 4. 用另一个微信给该账号发私聊消息。
 5. 在麻将 runtime 页面点击 `Wechaty 原始消息`。
 6. `8790` 页面默认会实时刷新最近 runtime 日志、Wechaty 原始消息和当前状态。
-7. 如果要测试外发，在页面的“微信测试外发”里填 `xml31323` 或 Wechaty contact id，确认后手动发送。
+7. 如果要测试发送，在页面的“微信手动发送”里填 `xml31323`、`刘臻` 或 Wechaty contact id，确认后手动发送。
 8. 再测试群聊消息，看是否能拿到 `is_room=true`、`room.id` 和 `room.topic`。
 
 ## 是否满足麻将馆目标
