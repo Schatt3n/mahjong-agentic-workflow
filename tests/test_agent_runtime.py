@@ -364,6 +364,63 @@ def test_sqlite_store_persists_message_references(tmp_path: Path) -> None:
     assert reference.recipient_id == "wang"
 
 
+def test_runtime_resolves_platform_message_reference_linked_to_invite_draft(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime_platform_reference.sqlite3"
+    store = SQLiteAgentStore(db_path)
+    game, _ = store.create_game(
+        conversation_id="owner_conversation",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "0.5", "needed_seats": 3},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_platform_reference_seed",
+    )
+    drafts, _ = store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[
+            {
+                "customer_id": "ran",
+                "display_name": "冉姐",
+                "message_text": "14:00，0.5无烟，打吗？",
+                "metadata": {"channel": "wechaty"},
+            }
+        ],
+        trace_id="trace_platform_reference_seed",
+    )
+
+    linked = store.link_message_reference(
+        conversation_id="wechaty:contact:ran",
+        message_id="wechat_msg_001",
+        source_message_id=drafts[0].draft_id,
+        channel="wechaty",
+        text=drafts[0].message_text,
+        metadata={"source": "wechaty_outbound_echo"},
+    )
+
+    assert linked.business_ref_type == "invite_draft"
+    assert linked.business_ref_id == drafts[0].draft_id
+    assert linked.metadata["linked_from_message_id"] == drafts[0].draft_id
+
+    reopened = SQLiteAgentStore(db_path)
+    builder = AgentContextBuilder(store=reopened, tool_gateway=ToolGateway(reopened))
+    built = builder.build(
+        UserMessage(
+            conversation_id="wechaty:contact:ran",
+            sender_id="ran",
+            sender_name="冉姐",
+            text="可以",
+            message_id="wechat_msg_002",
+            quoted_message=QuotedMessageRef(message_id="wechat_msg_001"),
+        ),
+        trace_id="trace_platform_reference_quote",
+    )
+
+    assert built.payload["quoted_message_context"]["business_ref_type"] == "invite_draft"
+    assert built.payload["quoted_message_context"]["business_ref_id"] == drafts[0].draft_id
+    assert built.payload["current_message"]["quoted_message"]["text"] == "14:00，0.5无烟，打吗？"
+    assert built.payload["context_budget"]["quoted_message_reference_resolved"] is True
+
+
 def test_runtime_review_prompt_rejects_internal_enum_and_backend_workflow_leakage() -> None:
     prompt = (ROOT / "src" / "mahjong_agent_runtime" / "prompts" / "agent_runtime_reply_self_review.md").read_text(
         encoding="utf-8"

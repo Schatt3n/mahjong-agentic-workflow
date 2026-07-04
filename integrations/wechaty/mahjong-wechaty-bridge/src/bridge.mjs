@@ -3,8 +3,10 @@ import qrcodeTerminal from 'qrcode-terminal'
 import http from 'node:http'
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8790/api/channels/wechaty/raw'
+const DEFAULT_REFERENCE_ENDPOINT = 'http://127.0.0.1:8790/api/message-references/link'
 
 const endpoint = process.env.MAHJONG_WECHATY_RAW_ENDPOINT || DEFAULT_ENDPOINT
+const referenceEndpoint = process.env.MAHJONG_WECHATY_REFERENCE_ENDPOINT || DEFAULT_REFERENCE_ENDPOINT
 const botName = process.env.MAHJONG_WECHATY_BOT_NAME || 'mahjong-wechaty-bridge'
 const defaultContactAliases = new Map([
   ['刘臻', '@5657a9459a503bf10c1360f24e491963'],
@@ -167,28 +169,36 @@ function outboundSignature(conversationId, text) {
 
 function pruneOutboundSignatures() {
   const now = Date.now()
-  for (const [key, expiresAt] of recentOutboundSignatures.entries()) {
+  for (const [key, record] of recentOutboundSignatures.entries()) {
+    const expiresAt = typeof record === 'number' ? record : record?.expiresAt
     if (expiresAt <= now) {
       recentOutboundSignatures.delete(key)
     }
   }
 }
 
-function markOutboundSignature(conversationId, text) {
+function markOutboundSignature(conversationId, text, reference = {}) {
   const clean = cleanText(text)
   if (!clean) {
     return
   }
   pruneOutboundSignatures()
-  recentOutboundSignatures.set(outboundSignature(conversationId, clean), Date.now() + 60_000)
+  recentOutboundSignatures.set(outboundSignature(conversationId, clean), {
+    expiresAt: Date.now() + 60_000,
+    reference: jsonable(reference || {}),
+  })
+}
+
+function recentOutboundEchoRecord(payload) {
+  if (!payload?.self_message) {
+    return null
+  }
+  pruneOutboundSignatures()
+  return recentOutboundSignatures.get(outboundSignature(payload.conversation_id, payload.text || payload.raw_text || '')) || null
 }
 
 function isRecentOutboundEcho(payload) {
-  if (!payload?.self_message) {
-    return false
-  }
-  pruneOutboundSignatures()
-  return recentOutboundSignatures.has(outboundSignature(payload.conversation_id, payload.text || payload.raw_text || ''))
+  return Boolean(recentOutboundEchoRecord(payload))
 }
 
 function jsonable(value, depth = 0) {
@@ -337,6 +347,42 @@ async function postJson(url, payload) {
   return parsed
 }
 
+function hasReferenceAnchor(reference) {
+  return Boolean(
+    cleanText(reference?.source_message_id || reference?.sourceMessageId || reference?.draft_id || reference?.draftId || '') ||
+      (cleanText(reference?.business_ref_type || reference?.businessRefType || '') &&
+        cleanText(reference?.business_ref_id || reference?.businessRefId || ''))
+  )
+}
+
+async function postDeliveredMessageReference(payload, reference) {
+  if (!payload?.message_id || !hasReferenceAnchor(reference)) {
+    return { ok: false, skipped: 'missing_reference_anchor' }
+  }
+  const body = {
+    conversation_id: payload.conversation_id,
+    platform_message_id: payload.message_id,
+    source_message_id:
+      reference.source_message_id || reference.sourceMessageId || reference.draft_id || reference.draftId || '',
+    business_ref_type: reference.business_ref_type || reference.businessRefType || '',
+    business_ref_id: reference.business_ref_id || reference.businessRefId || '',
+    channel: 'wechaty',
+    text: payload.text || payload.raw_text || '',
+    metadata: {
+      source: 'wechaty_outbound_echo',
+      outbound_source: reference.source || reference.outbound_source || '',
+      recipient_id: reference.recipient_id || reference.recipientId || '',
+      recipient_name: reference.recipient_name || reference.recipientName || '',
+    },
+  }
+  try {
+    return await postJson(referenceEndpoint, body)
+  } catch (error) {
+    console.error(`[${nowText()}] message reference link failed: ${error?.message || String(error)}`)
+    return { ok: false, error: error?.message || String(error) }
+  }
+}
+
 const bot = WechatyBuilder.build({ name: botName })
 
 async function resolveContact(target) {
@@ -404,7 +450,7 @@ async function resolveContact(target) {
   throw new Error(`contact not found: ${requested}`)
 }
 
-async function sendContactText(target, text) {
+async function sendContactText(target, text, options = {}) {
   if (!sendChannelEnabled) {
     throw new Error('wechat send channel is paused')
   }
@@ -419,12 +465,21 @@ async function sendContactText(target, text) {
   const contact = await resolveContact(target)
   await contact.say(finalText)
   const contactId = primitive(contact.id)
-  markOutboundSignature(`wechaty:contact:${contactId}`, finalText)
+  markOutboundSignature(`wechaty:contact:${contactId}`, finalText, {
+    source: 'wechaty_send',
+    source_message_id:
+      options.source_message_id || options.sourceMessageId || options.draft_id || options.draftId || '',
+    business_ref_type: options.business_ref_type || options.businessRefType || '',
+    business_ref_id: options.business_ref_id || options.businessRefId || '',
+    recipient_id: contactId,
+    recipient_name: target,
+  })
   return {
     ok: true,
     to: target,
     contact_id: contactId,
     text: finalText,
+    reference_pending: hasReferenceAnchor(options),
   }
 }
 
@@ -525,7 +580,7 @@ function startOutboundServer() {
       }
       if (request.method === 'POST' && request.url === '/send') {
         const payload = await readJsonRequest(request)
-        const result = await sendContactText(payload.to || payload.contact_id || payload.weixin, payload.text)
+        const result = await sendContactText(payload.to || payload.contact_id || payload.weixin, payload.text, payload)
         sendJson(response, 200, result)
         return
       }
@@ -567,10 +622,12 @@ bot.on('message', async (message) => {
     return
   }
   const payload = await buildPayload(message)
-  if (isRecentOutboundEcho(payload)) {
+  const outboundEcho = recentOutboundEchoRecord(payload)
+  if (outboundEcho) {
+    const linkResult = await postDeliveredMessageReference(payload, outboundEcho.reference || {})
     console.log(
       `[${nowText()}] skipped outbound echo message_id=${payload.message_id || '-'} ` +
-        `conversation_id=${payload.conversation_id}`
+        `conversation_id=${payload.conversation_id} reference_linked=${linkResult?.ok ? 'yes' : 'no'}`
     )
     return
   }
@@ -587,7 +644,10 @@ bot.on('message', async (message) => {
         return
       }
       await message.say(finalReply)
-      markOutboundSignature(payload.conversation_id, finalReply)
+      markOutboundSignature(payload.conversation_id, finalReply, {
+        source: 'wechaty_auto_reply',
+        source_trace_id: result.trace_id || '',
+      })
       console.log(`[${nowText()}] auto-sent reply trace_id=${result.trace_id || '-'} text=${finalReply}`)
     } else if (!sendChannelEnabled && autoSendReplyEnabled && finalReply) {
       console.log(`[${nowText()}] skipped auto-send because send channel is paused trace_id=${result.trace_id || '-'}`)

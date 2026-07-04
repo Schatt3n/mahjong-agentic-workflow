@@ -4,7 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-from mahjong_agent_runtime import AgentRuntime, StaticAgentClient, UserMessage
+from mahjong_agent_runtime import AgentRuntime, InMemoryAgentStore, StaticAgentClient, UserMessage
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +102,45 @@ def test_build_wechaty_user_message_preserves_quoted_message(monkeypatch) -> Non
     assert message.quoted_message.business_ref_type == "outbound_message_draft"
     assert message.quoted_message.business_ref_id == "draft_001"
     assert audit["quoted_message"]["message_id"] == "msg_invite"
+
+
+def test_link_delivered_message_reference_maps_platform_message_to_business_anchor() -> None:
+    store = InMemoryAgentStore()
+    drafts, _ = store.create_outbound_message_drafts(
+        conversation_id="owner_conversation",
+        trace_id="trace_link_delivered_seed",
+        drafts=[
+            {
+                "recipient_id": "wang",
+                "recipient_name": "王哥",
+                "channel": "wechaty",
+                "message_text": "七点三缺一，打吗？",
+                "purpose": "offer_existing_game",
+            }
+        ],
+    )
+    runtime = AgentRuntime(llm_client=StaticAgentClient(outputs=[]), store=store)
+
+    result = app.link_delivered_message_reference(
+        runtime,
+        {
+            "conversation_id": "wechaty:contact:wang",
+            "platform_message_id": "wechat_platform_msg_001",
+            "source_message_id": drafts[0].draft_id,
+            "channel": "wechaty",
+            "text": "七点三缺一，打吗？",
+        },
+    )
+
+    assert result["ok"] is True
+    reference = store.resolve_message_reference(
+        conversation_id="wechaty:contact:wang",
+        message_id="wechat_platform_msg_001",
+    )
+    assert reference is not None
+    assert reference.business_ref_type == "outbound_message_draft"
+    assert reference.business_ref_id == drafts[0].draft_id
+    assert reference.metadata["platform_message_id"] == "wechat_platform_msg_001"
 
 
 def test_run_wechaty_input_gate_uses_recent_context_for_short_answer(monkeypatch) -> None:

@@ -379,6 +379,76 @@ def parse_quoted_message_ref(payload: dict) -> QuotedMessageRef | None:
     )
 
 
+def link_delivered_message_reference(runtime: AgentRuntime, payload: dict) -> dict:
+    conversation_id = str(payload.get("conversation_id") or payload.get("conversationId") or "").strip()
+    message_id = str(
+        payload.get("platform_message_id")
+        or payload.get("platformMessageId")
+        or payload.get("delivered_message_id")
+        or payload.get("deliveredMessageId")
+        or payload.get("message_id")
+        or payload.get("messageId")
+        or ""
+    ).strip()
+    source_message_id = str(
+        payload.get("source_message_id")
+        or payload.get("sourceMessageId")
+        or payload.get("source_reference_message_id")
+        or payload.get("sourceReferenceMessageId")
+        or payload.get("draft_id")
+        or payload.get("draftId")
+        or ""
+    ).strip()
+    business_ref_type = str(payload.get("business_ref_type") or payload.get("businessRefType") or "").strip()
+    business_ref_id = str(payload.get("business_ref_id") or payload.get("businessRefId") or "").strip()
+    trace_seed = json.dumps(
+        {
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "source_message_id": source_message_id,
+            "business_ref_type": business_ref_type,
+            "business_ref_id": business_ref_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    trace_id = str(payload.get("trace_id") or payload.get("traceId") or "").strip()
+    if not trace_id:
+        trace_id = f"trace_message_ref_{hashlib.sha256(trace_seed.encode('utf-8')).hexdigest()[:12]}"
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    try:
+        reference = runtime.store.link_message_reference(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            source_message_id=source_message_id or None,
+            business_ref_type=business_ref_type or None,
+            business_ref_id=business_ref_id or None,
+            channel=str(payload.get("channel") or payload.get("platform_name") or payload.get("platformName") or "").strip() or None,
+            text=str(payload.get("text") or payload.get("message_text") or payload.get("messageText") or "").strip() or None,
+            metadata={
+                **metadata,
+                "source": metadata.get("source") or "delivered_message_reference",
+                "platform_message_id": message_id,
+            },
+        )
+    except ValueError as error:
+        result = {
+            "ok": False,
+            "trace_id": trace_id,
+            "error": str(error),
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "source_message_id": source_message_id,
+            "business_ref_type": business_ref_type,
+            "business_ref_id": business_ref_id,
+        }
+        runtime.trace_recorder.record(trace_id, "message_reference_link_failed", result, level="WARN")
+        return result
+    result = {"ok": True, "trace_id": trace_id, "reference": reference.to_dict()}
+    runtime.trace_recorder.record(trace_id, "message_reference_linked", result)
+    return result
+
+
 def split_env_list(raw: str) -> list[str]:
     normalized = str(raw or "").replace("\n", ",").replace(";", ",")
     return [item.strip() for item in normalized.split(",") if item.strip()]
@@ -1378,6 +1448,11 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                 )
             result = runtime.handle_user_message(message, trace_id=payload.get("trace_id"))
             self._json(result.to_dict())
+            return
+        if parsed.path == "/api/message-references/link":
+            runtime = get_runtime()
+            payload = self._read_json()
+            self._json(link_delivered_message_reference(runtime, payload))
             return
         if parsed.path == "/api/channels/hermes/raw":
             payload = self._read_json()
