@@ -359,7 +359,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
             required_reply_any=[
                 ["七点", "7点", "19:00"],
                 ["三缺一", "371", "缺一"],
-                ["可以不", "可以吗", "打吗", "来吗"],
+                ["可以不", "行不", "可以吗", "打吗", "来吗"],
             ],
             forbidden_reply_contains=["打多大", "几个人", "0.5", "无烟", *common_forbidden],
         ),
@@ -476,7 +476,8 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 message_id="msg_owner_real_live_eval_reject_smoking",
             ),
             required_tool_name_any=["record_candidate_reply", "update_context_checkpoint"],
-            required_reply_any=[["okk", "ok", "好", "好的", "行"]],
+            forbidden_tool_names=["search_current_games", "search_customers", "create_game", "create_invite_drafts"],
+            required_reply_any=[["okk", "ok", "好", "好的", "行", "先不排", "不排你"]],
             forbidden_reply_contains=[
                 "有烟也可以",
                 "再考虑",

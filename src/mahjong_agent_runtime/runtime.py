@@ -1025,6 +1025,7 @@ def build_reply_self_review_payload(
         "sender_profile": context_payload.get("sender_profile"),
         "sender_relationships": context_payload.get("sender_relationships") or [],
         "active_games": context_payload.get("active_games") or [],
+        "active_game_visible_summaries": context_payload.get("active_game_visible_summaries") or [],
         "previous_tool_results": context_payload.get("previous_tool_results") or [],
         "recent_conversation_tail": list(context_payload.get("recent_conversation") or [])[-8:],
         "proposed_action": action.to_dict(),

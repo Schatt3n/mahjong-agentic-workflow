@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from mahjong_agent_runtime import (
+    AgentAction,
     AgentRuntime,
     AgentContextBuilder,
     CustomerProfile,
@@ -25,7 +26,7 @@ from mahjong_agent_runtime import (
     TokenBudget,
     UserMessage,
 )
-from mahjong_agent_runtime.runtime import message_idempotency_key
+from mahjong_agent_runtime.runtime import build_reply_self_review_payload, message_idempotency_key
 from mahjong_agent_runtime.store import normalize_requirement
 from mahjong_agent_runtime.tracing import trace_steps, validate_trace
 
@@ -159,6 +160,10 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "客户问“所以现在有人了吗/现在几个人了/还差几个/这个局什么情况”" in prompt
     assert "`active_game_visible_summaries` 和 `active_games` 是当前业务状态的权威来源" in prompt
     assert "优先读取当前局的 `active_game_visible_summaries[].seat_summary`" in prompt
+    assert "result.customer_reply_contract" in prompt
+    assert "matched_result_summaries" in prompt
+    assert "previous_tool_results[].result.next_step_policy" in prompt
+    assert "requires_explicit_user_request_to_search_alternatives=true" in prompt
     assert "`requirement.user_visible_summary`" in prompt
     assert "不要重新把历史消息里的 `371/272/173`" in prompt
     assert "如果包含时间、局名/公开昵称、缺口短码或下一步确认问题" in prompt
@@ -373,10 +378,53 @@ def test_runtime_review_prompt_rejects_internal_enum_and_backend_workflow_leakag
     assert "还缺几人" in prompt
     assert "微信昵称或群昵称" in prompt
     assert "老板私有微信备注" in prompt
+    assert "`active_game_visible_summaries`" in prompt
+    assert "`user_visible_summary` 是主流程已经整理好的客户可见局摘要" in prompt
+    assert "18.30 星月的局，371 她" in prompt
     assert "用户问“某某是谁”不等于授权暴露这个人在当前局里的角色" in prompt
     assert "某某算不算人/他不打吗" in prompt
     assert "算的，加上你两个，还差两个" in prompt
     assert "leaks_participant_role" in prompt
+
+
+def test_runtime_reply_self_review_payload_includes_visible_game_summaries() -> None:
+    payload = build_reply_self_review_payload(
+        message=UserMessage(
+            conversation_id="runtime_review_visible_summary",
+            sender_id="owner_real_customer",
+            sender_name="常客",
+            text="现在几个人了啊",
+            message_id="msg_runtime_review_visible_summary",
+        ),
+        action=AgentAction(
+            goal="回答当前局况",
+            objective_status="completed",
+            reasoning_summary="从可见局摘要回复。",
+            reply_to_user="两个人，18.30 星月的局，371 她",
+        ),
+        review_items=[
+            {
+                "item_id": "reply_to_user",
+                "source": "reply_to_user",
+                "recipient_id": "owner_real_customer",
+                "recipient_name": "常客",
+                "text": "两个人，18.30 星月的局，371 她",
+            }
+        ],
+        context_payload={
+            "active_game_visible_summaries": [
+                {
+                    "game_id": "game_visible_summary",
+                    "user_visible_summary": "两个人，18.30 星月的局，371 她",
+                    "seat_summary": {"claimed_seats": 2, "remaining_seats": 2},
+                }
+            ]
+        },
+        review_scope="reply_to_user",
+    )
+
+    assert payload["active_game_visible_summaries"][0]["user_visible_summary"] == "两个人，18.30 星月的局，371 她"
+    assert payload["review_items"][0]["text"] == "两个人，18.30 星月的局，371 她"
 
 
 def test_runtime_customer_visible_text_generation_prompt_defines_boss_tone_and_visibility_layers() -> None:
@@ -2852,6 +2900,150 @@ def test_runtime_candidate_decline_releases_existing_seat_and_reopens_game(tmp_p
     assert persisted.remaining_seats() == 1
     assert persisted.status.value == "forming"
     assert result.final_reply == "好的，那这桌先不算你。"
+
+
+def test_runtime_candidate_decline_tool_result_tells_model_not_to_start_new_search(tmp_path) -> None:
+    db_path = tmp_path / "agent_runtime_candidate_decline_policy.sqlite3"
+    store = seeded_store(SQLiteAgentStore(db_path))
+    game, _ = store.create_game(
+        conversation_id="runtime_candidate_decline_policy",
+        organizer_id="xingyue",
+        organizer_name="星月",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "smoking",
+            "start_time": "18:30",
+            "needed_seats": 2,
+            "user_visible_summary": "两个人，18.30 星月的局，371 她",
+        },
+        known_players=[
+            {"customer_id": "xingyue", "display_name": "星月", "status": "confirmed"},
+            {"customer_id": "friend_of_xingyue", "display_name": "她", "status": "confirmed"},
+        ],
+        trace_id="setup_candidate_decline_policy",
+    )
+    client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="用户拒绝当前有烟局，并补充无烟偏好，先记录当前局拒绝。",
+                tool_calls=[
+                    {
+                        "name": "record_candidate_reply",
+                        "arguments": {
+                            "game_id": game.game_id,
+                            "customer_id": "owner_real_customer",
+                            "display_name": "常客",
+                            "status": "declined",
+                        },
+                        "reason": "用户拒绝当前局。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="工具结果要求拒绝当前局后不要自动切到新搜索。",
+                reply_to_user="okk",
+            ),
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=InMemoryTraceRecorder())
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_candidate_decline_policy",
+            sender_id="owner_real_customer",
+            sender_name="常客",
+            text="不打哈，我女朋友让我打无烟的",
+            message_id="msg_runtime_candidate_decline_policy",
+        ),
+        trace_id="trace_candidate_decline_policy",
+    )
+
+    decline_result = result.tool_results[0]
+    policy = decline_result.result["next_step_policy"]
+    assert policy["requires_explicit_user_request_to_search_alternatives"] is True
+    assert "Do not call search_current_games" in policy["instruction"]
+    second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
+    previous_result = second_prompt["previous_tool_results"][0]["result"]
+    assert previous_result["recorded_status"] == "declined"
+    assert previous_result["next_step_policy"]["terminal_for_current_offer"] is True
+    assert result.final_reply == "okk"
+
+
+def test_runtime_search_current_games_tool_result_carries_customer_reply_contract(tmp_path) -> None:
+    db_path = tmp_path / "agent_runtime_search_reply_contract.sqlite3"
+    store = seeded_store(SQLiteAgentStore(db_path))
+    store.create_game(
+        conversation_id="owner_real_customer_chat",
+        organizer_id="xiaori",
+        organizer_name="夏日",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "no_smoke",
+            "start_time": "19:00",
+            "needed_seats": 1,
+            "user_visible_summary": "七点三缺一",
+        },
+        known_players=[
+            {"customer_id": "xiaori", "display_name": "夏日", "status": "confirmed"},
+            {"customer_id": "xiaolian", "display_name": "笑脸", "status": "confirmed"},
+        ],
+        trace_id="setup_search_reply_contract",
+    )
+    client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="按画像默认0.5和1人查现有局。",
+                tool_calls=[
+                    {
+                        "name": "search_current_games",
+                        "arguments": {
+                            "requirement": {
+                                "game_type": "hangzhou_mahjong",
+                                "stake": "0.5",
+                                "smoke_preference": "no_smoke",
+                                "start_time": "19:00",
+                                "known_player_count": 1,
+                            },
+                            "limit": 5,
+                        },
+                        "reason": "先查当前局池。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="工具结果要求用 matched_result_summaries，不复述匹配条件。",
+                reply_to_user="七点三缺一，可以不",
+            ),
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=InMemoryTraceRecorder())
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="owner_real_customer_chat",
+            sender_id="owner_real_customer",
+            sender_name="常客",
+            text="帮我约个6.30无烟的",
+            message_id="msg_search_reply_contract",
+        ),
+        trace_id="trace_search_reply_contract",
+    )
+
+    search_result = result.tool_results[0].result
+    contract = search_result["customer_reply_contract"]
+    assert contract["matched_result_summaries"] == ["七点三缺一"]
+    assert "Do not expand matched query" in contract["customer_visible_rule"]
+    assert "七点三缺一，可以不" in contract["good_reply_examples"]
+    second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
+    previous_contract = second_prompt["previous_tool_results"][0]["result"]["customer_reply_contract"]
+    assert previous_contract["matched_result_summaries"] == ["七点三缺一"]
+    assert result.final_reply == "七点三缺一，可以不"
 
 
 def test_runtime_outbound_message_draft_is_tool_driven_and_persisted(tmp_path) -> None:

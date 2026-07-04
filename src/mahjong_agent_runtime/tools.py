@@ -16,6 +16,67 @@ _IDEMPOTENCY_LOCKS_GUARD = threading.RLock()
 CANDIDATE_REPLY_STATUSES = ["accepted", "confirmed", "arrived", "declined", "negotiating", "no_reply"]
 GAME_STATUSES = ["forming", "inviting", "ready", "cancelled", "finished"]
 
+CANDIDATE_REPLY_NEXT_STEP_POLICIES: dict[str, dict[str, Any]] = {
+    "declined": {
+        "terminal_for_current_offer": True,
+        "requires_explicit_user_request_to_search_alternatives": True,
+        "instruction": (
+            "This tool has recorded that the current user declined or rejected the current offer. "
+            "Unless the same user message explicitly asks to continue looking for another game, stop this turn "
+            "with a short acknowledgement. Do not call search_current_games, search_customers, create_game, or "
+            "create_invite_drafts just because the user explained a preference while declining."
+        ),
+    },
+    "negotiating": {
+        "terminal_for_current_offer": False,
+        "requires_coordination_before_confirmation": True,
+        "instruction": (
+            "This tool has recorded a negotiation on the current offer. Continue by coordinating the current game's "
+            "open question or by replying that you will ask; do not switch to a new search unless the user explicitly "
+            "asks for another game."
+        ),
+    },
+    "no_reply": {
+        "terminal_for_current_offer": True,
+        "instruction": "This tool has recorded no reply. Avoid customer-visible claims that the user confirmed.",
+    },
+    "accepted": {
+        "terminal_for_current_offer": True,
+        "instruction": "This tool has recorded acceptance of the current offer. Reply briefly with the updated public status.",
+    },
+    "confirmed": {
+        "terminal_for_current_offer": True,
+        "instruction": "This tool has recorded confirmation of the current offer. Reply briefly with the updated public status.",
+    },
+    "arrived": {
+        "terminal_for_current_offer": True,
+        "instruction": "This tool has recorded arrival. Reply briefly; no further search is needed from this fact alone.",
+    },
+}
+
+
+def current_game_search_reply_contract(requirement: dict[str, Any], matches: list[dict[str, Any]]) -> dict[str, Any]:
+    match_summaries = [
+        str(item.get("game", {}).get("requirement", {}).get("user_visible_summary") or "").strip()
+        for item in matches
+    ]
+    match_summaries = [item for item in match_summaries if item]
+    return {
+        "source_tool": "search_current_games",
+        "matched_query_requirement": requirement,
+        "matched_result_summaries": match_summaries,
+        "reply_shape": "Use one matched_result_summary plus a short confirmation question.",
+        "customer_visible_rule": (
+            "When a matched current game satisfies the user's request, the customer-visible reply should prioritize "
+            "the game's user_visible_summary and a short confirmation such as 可以不/打吗. Do not expand matched query "
+            "slots or profile-default slots such as game_type, stake, smoke_preference, requester seat count, or backend "
+            "search reasons into the reply unless the field is already in matched_result_summaries or the result differs "
+            "from what the user requested and must be disclosed for decision-making."
+        ),
+        "good_reply_examples": ["七点三缺一，可以不", "七点三缺一，打吗"],
+        "bad_reply_examples": ["七点三缺一，0.5无烟杭麻，打吗", "已按你的画像找到七点三缺一"],
+    }
+
 
 @dataclass(slots=True)
 class ToolDefinition:
@@ -303,7 +364,16 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
     def search_current_games(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
         requirement = normalize_requirement(dict(call.arguments.get("requirement") or {}))
         matches = store.search_current_games(requirement, limit=int(call.arguments.get("limit") or 8), sender_id=sender_id)
-        return ToolResult(name=call.name, called=True, allowed=True, result={"requirement": requirement, "matches": matches})
+        return ToolResult(
+            name=call.name,
+            called=True,
+            allowed=True,
+            result={
+                "requirement": requirement,
+                "matches": matches,
+                "customer_reply_contract": current_game_search_reply_contract(requirement, matches),
+            },
+        )
 
     def search_customers(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
         requirement = normalize_requirement(dict(call.arguments.get("requirement") or {}))
@@ -352,15 +422,26 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         return ToolResult(name=call.name, called=True, allowed=True, result={"drafts": [item.to_dict() for item in drafts]}, state_transitions=transitions)
 
     def record_candidate_reply(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
+        status = str(call.arguments["status"])
         game, transitions = store.record_candidate_reply(
             game_id=str(call.arguments["game_id"]),
             customer_id=str(call.arguments["customer_id"]),
             display_name=str(call.arguments["display_name"]),
-            status=str(call.arguments["status"]),
+            status=status,
             seat_count=int(call.arguments.get("seat_count") or 1),
             trace_id=trace_id,
         )
-        return ToolResult(name=call.name, called=True, allowed=True, result={"game": game.to_dict()}, state_transitions=transitions)
+        return ToolResult(
+            name=call.name,
+            called=True,
+            allowed=True,
+            result={
+                "game": game.to_dict(),
+                "recorded_status": status,
+                "next_step_policy": CANDIDATE_REPLY_NEXT_STEP_POLICIES.get(status, {}),
+            },
+            state_transitions=transitions,
+        )
 
     def update_game_status(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
         game, transition = store.update_game_status(

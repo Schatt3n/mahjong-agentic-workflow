@@ -12,5 +12,6 @@ build/
 *.egg-info/
 logs/
 data/
+runtime_data/
 node_modules/
 *.memory-card.json
