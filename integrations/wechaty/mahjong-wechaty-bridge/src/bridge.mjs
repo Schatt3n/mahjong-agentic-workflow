@@ -11,6 +11,7 @@ const outboundEnabled = process.env.MAHJONG_WECHATY_OUTBOUND_ENABLED
   : true
 const outboundPort = Number(process.env.MAHJONG_WECHATY_OUTBOUND_PORT || '8791')
 const autoSendReply = truthy(process.env.MAHJONG_WECHATY_AUTO_SEND_REPLY)
+const contactAliases = parseContactAliases(process.env.MAHJONG_WECHATY_CONTACT_ALIASES || '')
 const forwardSelfMessages = process.env.MAHJONG_WECHATY_FORWARD_SELF
   ? truthy(process.env.MAHJONG_WECHATY_FORWARD_SELF)
   : true
@@ -52,6 +53,23 @@ function primitive(value) {
 function cleanText(value) {
   const text = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim()
   return text
+}
+
+function parseContactAliases(raw) {
+  const aliases = new Map()
+  for (const part of String(raw || '').split(/[,\n]/)) {
+    const item = part.trim()
+    if (!item || !item.includes('=')) {
+      continue
+    }
+    const [alias, ...targetParts] = item.split('=')
+    const key = contactKey(alias)
+    const target = cleanText(targetParts.join('='))
+    if (key && target) {
+      aliases.set(key, target)
+    }
+  }
+  return aliases
 }
 
 function contactKey(value) {
@@ -269,7 +287,9 @@ async function postJson(url, payload) {
 const bot = WechatyBuilder.build({ name: botName })
 
 async function resolveContact(target) {
-  const requested = cleanText(target)
+  const rawRequested = cleanText(target)
+  const aliasTarget = contactAliases.get(contactKey(rawRequested))
+  const requested = cleanText(aliasTarget || rawRequested)
   const requestedKey = contactKey(requested)
   if (!requested) {
     throw new Error('missing target contact')
@@ -384,6 +404,7 @@ function startOutboundServer() {
           outbound_enabled: outboundEnabled,
           auto_send_reply: autoSendReply,
           known_contact_count: publicKnownContacts().length,
+          contact_alias_count: contactAliases.size,
         })
         return
       }
@@ -469,6 +490,7 @@ console.log(`[${nowText()}] starting ${botName}`)
 console.log(`[${nowText()}] endpoint=${endpoint}`)
 console.log(`[${nowText()}] WECHATY_PUPPET=${process.env.WECHATY_PUPPET || '(default)'}`)
 console.log(`[${nowText()}] auto_send_reply=${autoSendReply}`)
+console.log(`[${nowText()}] contact_alias_count=${contactAliases.size}`)
 
 if (outboundEnabled) {
   startOutboundServer()

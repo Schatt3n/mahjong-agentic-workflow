@@ -91,6 +91,18 @@ export MAHJONG_WECHATY_AUTO_SEND_REPLY=false
 
 如果显式设置 `MAHJONG_WECHATY_AUTO_SEND_REPLY=true`，bridge 会把 runtime 返回的 `final_reply` 直接回复到原会话。测试阶段不建议打开，容易误发或形成回环。
 
+如果 Web puppet 无法通过微信号或备注找到联系人，可以给本地 bridge 配别名映射：
+
+```bash
+export MAHJONG_WECHATY_CONTACT_ALIASES='xml31323=@wechaty-contact-id'
+```
+
+多个映射用英文逗号分隔，例如：
+
+```bash
+export MAHJONG_WECHATY_CONTACT_ALIASES='xml31323=@id1,radon_1=@id2'
+```
+
 ## 测试期路由范围
 
 Wechaty 原始消息会全部写入 `logs/wechaty_weixin_raw.jsonl`，但不一定都会进入 Agent。当前测试阶段默认只让自己发出的消息进入 Agent，避免误处理真实客户消息：
