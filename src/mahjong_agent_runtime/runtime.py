@@ -17,6 +17,7 @@ from .tracing import InMemoryTraceRecorder
 
 
 DEFAULT_REPLY_SELF_REVIEW_PROMPT_PATH = Path(__file__).with_name("prompts").joinpath("agent_runtime_reply_self_review.md")
+REPLY_SELF_REVIEW_TOOL_NAME = "reply_self_review"
 
 
 @dataclass(slots=True)
@@ -177,17 +178,25 @@ class AgentRuntime:
                 self.store.append_tool_turn(message.conversation_id, json.dumps([item.to_dict() for item in pending_tool_results], ensure_ascii=False), trace_id)
                 continue
 
-            final_reply = action.reply_to_user.strip()
-            if action.needs_human and not final_reply:
-                final_reply = "这个我先转人工确认一下。"
-            final_reply = self._review_final_reply(
+            proposed_reply = action.reply_to_user.strip()
+            if action.needs_human and not proposed_reply:
+                proposed_reply = "这个我先转人工确认一下。"
+            review_result = self._run_reply_self_review(
                 message=message,
                 trace_id=trace_id,
                 action=action,
-                proposed_reply=final_reply,
+                proposed_reply=proposed_reply,
                 context_payload=built.payload,
                 turn_budget=turn_budget,
             )
+            if review_result is not None:
+                tool_results.append(review_result)
+                self.trace_recorder.record(trace_id, "tool_result", review_result.to_dict())
+                self.store.append_tool_turn(message.conversation_id, json.dumps([review_result.to_dict()], ensure_ascii=False), trace_id)
+                if not reply_self_review_approved(review_result):
+                    pending_tool_results = [review_result]
+                    continue
+            final_reply = proposed_reply
             self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
             self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "objective_status": action.objective_status})
             break
@@ -215,7 +224,7 @@ class AgentRuntime:
                 self._conversation_locks[key] = lock
             return lock
 
-    def _review_final_reply(
+    def _run_reply_self_review(
         self,
         *,
         message: UserMessage,
@@ -224,9 +233,9 @@ class AgentRuntime:
         proposed_reply: str,
         context_payload: dict[str, Any],
         turn_budget: TokenBudget,
-    ) -> str:
+    ) -> ToolResult | None:
         if not self.reply_self_review_enabled or not proposed_reply:
-            return proposed_reply
+            return None
         client = self.reply_self_review_client or self.llm_client
         review_payload = build_reply_self_review_payload(
             message=message,
@@ -243,7 +252,13 @@ class AgentRuntime:
         self.trace_recorder.record(trace_id, "reply_self_review_budget_checked", budget.to_dict())
         if not budget.allowed:
             self.trace_recorder.record(trace_id, "reply_self_review_failed", {"reason": budget.reason}, level="WARN")
-            return "这个我先转人工确认一下。"
+            return ToolResult(
+                name=REPLY_SELF_REVIEW_TOOL_NAME,
+                called=False,
+                allowed=False,
+                result={"instruction": "Reply review could not run because the turn budget was exhausted. Use needs_human with a short safe handoff reply."},
+                error=budget.reason,
+            )
         started = time.perf_counter()
         try:
             raw_response = client.complete(messages, trace_id=trace_id, timeout_seconds=self.llm_timeout_seconds)
@@ -252,9 +267,15 @@ class AgentRuntime:
                 trace_id,
                 "reply_self_review_error",
                 {"error_type": type(exc).__name__, "error": str(exc), "elapsed_ms": int((time.perf_counter() - started) * 1000)},
-                level="ERROR",
+                    level="ERROR",
             )
-            return "这个我先转人工确认一下。"
+            return ToolResult(
+                name=REPLY_SELF_REVIEW_TOOL_NAME,
+                called=False,
+                allowed=False,
+                result={"instruction": "Reply review failed. Use needs_human with a short safe handoff reply."},
+                error=f"{type(exc).__name__}: {exc}",
+            )
         self.trace_recorder.record(
             trace_id,
             "reply_self_review_response",
@@ -263,23 +284,53 @@ class AgentRuntime:
         review, errors = parse_reply_self_review(raw_response)
         if errors:
             self.trace_recorder.record(trace_id, "reply_self_review_contract_error", {"errors": errors}, level="WARN")
-            return "这个我先转人工确认一下。"
+            return ToolResult(
+                name=REPLY_SELF_REVIEW_TOOL_NAME,
+                called=True,
+                allowed=False,
+                result={
+                    "errors": list(errors),
+                    "raw_response": raw_response,
+                    "instruction": "Reply review returned an invalid contract. Use needs_human with a short safe handoff reply.",
+                },
+                error="Reply self review contract invalid: " + "; ".join(errors),
+            )
         final_reply = str(review.get("final_reply") or "").strip()
-        if review.get("needs_human") or not final_reply:
-            final_reply = "这个我先转人工确认一下。"
+        approved = bool(review.get("approved")) and not bool(review.get("needs_human")) and final_reply == proposed_reply
+        needs_human = bool(review.get("needs_human"))
+        instruction = (
+            "Review approved the proposed customer-visible reply. You may stop with the original reply."
+            if approved
+            else "Review rejected the proposed customer-visible reply. Read violations and generate a new safe reply_to_user in the next AgentAction; do not expose review details to the customer."
+        )
         self.trace_recorder.record(
             trace_id,
             "reply_self_review_result",
             {
-                "approved": bool(review.get("approved")),
-                "needs_human": bool(review.get("needs_human")),
+                "approved": approved,
+                "raw_approved": bool(review.get("approved")),
+                "needs_human": needs_human,
                 "final_reply": final_reply,
                 "reasoning_summary": str(review.get("reasoning_summary") or ""),
                 "violations": list(review.get("violations") or []) if isinstance(review.get("violations"), list) else [],
             },
-            level="WARN" if final_reply != proposed_reply else "INFO",
+            level="WARN" if not approved else "INFO",
         )
-        return final_reply
+        return ToolResult(
+            name=REPLY_SELF_REVIEW_TOOL_NAME,
+            called=True,
+            allowed=True,
+            result={
+                "approved": approved,
+                "raw_approved": bool(review.get("approved")),
+                "needs_human": needs_human,
+                "proposed_reply": proposed_reply,
+                "suggested_safe_reply": final_reply,
+                "reasoning_summary": str(review.get("reasoning_summary") or ""),
+                "violations": list(review.get("violations") or []) if isinstance(review.get("violations"), list) else [],
+                "instruction": instruction,
+            },
+        )
 
 
 def parse_action(raw_response: str) -> tuple[AgentAction, list[str]]:
@@ -293,6 +344,16 @@ def parse_action(raw_response: str) -> tuple[AgentAction, list[str]]:
     if errors:
         return contract_error_action(), errors
     return AgentAction.from_payload(payload), []
+
+
+def reply_self_review_approved(result: ToolResult) -> bool:
+    return (
+        result.name == REPLY_SELF_REVIEW_TOOL_NAME
+        and result.called
+        and result.allowed
+        and result.error is None
+        and bool(result.result.get("approved"))
+    )
 
 
 def validate_action_contract(payload: dict[str, Any]) -> list[str]:

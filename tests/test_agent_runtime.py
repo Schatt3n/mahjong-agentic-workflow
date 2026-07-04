@@ -187,6 +187,21 @@ def test_runtime_reply_self_review_rewrites_leaking_customer_reply() -> None:
                 },
                 ensure_ascii=False,
             ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="根据 reply_self_review 工具结果重写客户可见回复。",
+                reply_to_user="张哥，我帮你问问，有消息跟你说。",
+            ),
+            json.dumps(
+                {
+                    "approved": True,
+                    "needs_human": False,
+                    "final_reply": "张哥，我帮你问问，有消息跟你说。",
+                    "reasoning_summary": "重写后的回复没有泄露后台流程或候选人。",
+                    "violations": [],
+                },
+                ensure_ascii=False,
+            ),
         ]
     )
     runtime = AgentRuntime(
@@ -207,16 +222,20 @@ def test_runtime_reply_self_review_rewrites_leaking_customer_reply() -> None:
         trace_id="trace_reply_self_review",
     )
 
-    assert result.final_reply == "张哥，这桌我帮你安排着，有消息跟你说。"
-    assert len(client.calls) == 2
+    assert result.final_reply == "张哥，我帮你问问，有消息跟你说。"
+    assert len(client.calls) == 4
     review_payload = json.loads(client.calls[1]["messages"][1]["content"])
     assert review_payload["proposed_reply"] == "张哥，邀约草稿已发给冉姐和何哥，等老板审批后就发送邀请。"
     assert review_payload["review_contract"]["available_tools"] == []
     assert "不负责润色文风" in review_payload["review_goal"]
+    retry_payload = json.loads(client.calls[2]["messages"][1]["content"])
+    assert retry_payload["previous_tool_results"][0]["name"] == "reply_self_review"
+    assert retry_payload["previous_tool_results"][0]["result"]["approved"] is False
+    assert retry_payload["previous_tool_results"][0]["result"]["suggested_safe_reply"] == "张哥，这桌我帮你安排着，有消息跟你说。"
     steps = trace_steps(trace.get_trace("trace_reply_self_review"))
-    assert "reply_self_review_prompt" in steps
-    assert "reply_self_review_response" in steps
-    assert "reply_self_review_result" in steps
+    assert steps.count("reply_self_review_prompt") == 2
+    assert steps.count("reply_self_review_response") == 2
+    assert steps.count("reply_self_review_result") == 2
 
 
 def test_runtime_reply_self_review_can_escalate_to_human() -> None:
@@ -236,6 +255,22 @@ def test_runtime_reply_self_review_can_escalate_to_human() -> None:
                     "final_reply": "这个我先确认一下。",
                     "reasoning_summary": "无法确认是否已经真实外发，交给人工。",
                     "violations": ["unverified_external_action"],
+                },
+                ensure_ascii=False,
+            ),
+            action_json(
+                objective_status="needs_human",
+                reasoning_summary="审查工具要求人工确认。",
+                reply_to_user="这个我先转人工确认一下。",
+                needs_human=True,
+            ),
+            json.dumps(
+                {
+                    "approved": True,
+                    "needs_human": False,
+                    "final_reply": "这个我先转人工确认一下。",
+                    "reasoning_summary": "人工兜底回复安全。",
+                    "violations": [],
                 },
                 ensure_ascii=False,
             ),
@@ -262,6 +297,9 @@ def test_runtime_reply_self_review_can_escalate_to_human() -> None:
     assert result.final_reply == "这个我先转人工确认一下。"
     review_event = next(event for event in trace.get_trace("trace_reply_self_review_human") if event.step == "reply_self_review_result")
     assert review_event.content["needs_human"] is True
+    retry_payload = json.loads(client.calls[2]["messages"][1]["content"])
+    assert retry_payload["previous_tool_results"][0]["name"] == "reply_self_review"
+    assert retry_payload["previous_tool_results"][0]["result"]["needs_human"] is True
 
 
 def test_runtime_backend_does_not_interpret_short_confirmation_as_create_game() -> None:

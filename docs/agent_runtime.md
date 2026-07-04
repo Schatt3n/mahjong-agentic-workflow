@@ -26,8 +26,12 @@ flowchart TD
   G --> H["工具执行 / 状态机落库"]
   H --> I["previous_tool_results"]
   I --> C
-  E -- "否" --> J["客户可见回复"]
-  J --> K["final_output trace"]
+  E -- "否" --> J["proposed reply"]
+  J --> K["reply_self_review 内部工具"]
+  K --> L{"通过?"}
+  L -- "否" --> I
+  L -- "是" --> M["客户可见回复"]
+  M --> N["final_output trace"]
 ```
 
 ## 当前工具
@@ -89,11 +93,13 @@ flowchart TD
 ## 回复信息泄露审查
 
 - 主模型负责业务理解、工具选择、状态推进和客户回复草稿。
-- 终态 `reply_to_user` 可以进入 `reply_self_review` 模型审查环节；审查阶段使用独立上下文和 `review_contract`，不提供业务工具。
+- 终态 `reply_to_user` 会进入 `reply_self_review` 内部工具；审查阶段使用独立上下文和 `review_contract`，不提供业务工具。
 - 审查模型只判断客户可见回复是否泄露系统信息、后台流程、其他用户信息或未发生动作。
 - 审查模型不负责润色文风；话术自然度通过主模型提示词、few-shot、badcase 和 eval 持续改进。
+- 审查通过时，runtime 才把主模型原始 `reply_to_user` 输出给用户。
+- 审查不通过时，runtime 不直接采用审查模型改写，而是把 `reply_self_review` 作为 `previous_tool_results` 回喂主模型；主模型负责重新生成安全的客户可见回复。
 - 审查模型可以独立配置：`MAHJONG_REPLY_REVIEW_LLM_MODEL`、`MAHJONG_REPLY_REVIEW_LLM_PROVIDER`、`MAHJONG_REPLY_REVIEW_LLM_API_KEY`、`MAHJONG_REPLY_REVIEW_LLM_BASE_URL`。未配置时使用主模型。
-- 审查失败且无法安全改写时，runtime 转人工；这属于信息泄露出口控制，不用于补业务语义规则。
+- 审查失败、合同错误、超时或预算不足时会以内部工具错误回喂主模型；只有主模型无法继续、预算耗尽或达到最大步数时才转人工。
 
 ## 预算和幂等
 
