@@ -79,13 +79,30 @@ class AgentContextBuilder:
         sender_relationships = self.store.relationship_context_for_sender(message.sender_id, active_games)
         current_message = message.to_dict()
         quoted_message_context = self._resolve_quoted_message_context(message, current_message)
+        quoted_message = message.quoted_message
+        quoted_message_present = quoted_message is not None
+        quoted_message_has_provided_business_ref = bool(
+            quoted_message
+            and (
+                quoted_message.business_ref_type
+                or quoted_message.business_ref_id
+            )
+        )
+        quoted_message_reference_status = "absent"
+        if quoted_message_present:
+            quoted_message_reference_status = "resolved" if quoted_message_context is not None else "unresolved"
+            if quoted_message_context is None and quoted_message_has_provided_business_ref:
+                quoted_message_reference_status = "provided_business_ref"
         audit = {
             **audit,
             "conversation_checkpoint_present": checkpoint is not None,
             "conversation_checkpoint_source_trace_id": checkpoint.source_trace_id if checkpoint else None,
             "sender_relationship_count": len(sender_relationships),
             "active_game_visible_summary_count": len(active_game_visible_summaries),
+            "quoted_message_present": quoted_message_present,
+            "quoted_message_id": quoted_message.message_id if quoted_message else None,
             "quoted_message_reference_resolved": quoted_message_context is not None,
+            "quoted_message_reference_status": quoted_message_reference_status,
             "quoted_message_business_ref_type": quoted_message_context.get("business_ref_type") if quoted_message_context else None,
             "conversation_version": current_version,
             "run_version": run_version,

@@ -93,6 +93,9 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "`quoted_message_context` 是后端根据 messageId 解析出的业务锚点" in prompt
     assert "先把当前短句解释为对引用消息的回应" in prompt
     assert "business_ref_type/business_ref_id" in prompt
+    assert "`current_message.quoted_message` 存在但 `quoted_message_context` 为 null" in prompt
+    assert "不要编造 `game_id`、`draft_id`、`business_ref`" in prompt
+    assert "不能确认就自然追问或转人工" in prompt
     assert "引用消息只是上下文锚点" in prompt
     assert "候选人名单" in prompt
     assert "待审批" in prompt
@@ -252,6 +255,35 @@ def test_runtime_context_resolves_quoted_message_business_reference() -> None:
     assert built.payload["quoted_message_context"]["business_ref_type"] == "outbound_message_draft"
     assert built.payload["quoted_message_context"]["business_ref_id"] == drafts[0].draft_id
     assert built.payload["context_budget"]["quoted_message_reference_resolved"] is True
+
+
+def test_runtime_context_audit_marks_unresolved_quoted_message_reference() -> None:
+    store = InMemoryAgentStore()
+    builder = AgentContextBuilder(store=store, tool_gateway=ToolGateway(store=store))
+
+    built = builder.build(
+        UserMessage(
+            conversation_id="quote_unresolved",
+            sender_id="wang",
+            sender_name="王哥",
+            text="可以",
+            message_id="msg_quote_unresolved_reply",
+            quoted_message=QuotedMessageRef(
+                message_id="missing_message_reference",
+                sender_id="boss",
+                sender_name="老板",
+                text="14:00，0.5无烟，打吗？",
+            ),
+        ),
+        trace_id="trace_quote_unresolved",
+    )
+
+    assert built.payload["quoted_message_context"] is None
+    assert built.payload["current_message"]["quoted_message"]["message_id"] == "missing_message_reference"
+    assert built.payload["context_budget"]["quoted_message_present"] is True
+    assert built.payload["context_budget"]["quoted_message_id"] == "missing_message_reference"
+    assert built.payload["context_budget"]["quoted_message_reference_resolved"] is False
+    assert built.payload["context_budget"]["quoted_message_reference_status"] == "unresolved"
 
 
 def test_runtime_context_includes_active_game_visible_summaries() -> None:
@@ -3178,6 +3210,48 @@ def test_runtime_trace_completeness_requires_context_packing_audit() -> None:
     completeness = validate_trace(without_context_packed)
     assert completeness["complete"] is False
     assert "context_packed" in completeness["missing"]
+
+
+def test_runtime_trace_records_unresolved_quoted_message_reference() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="completed",
+                reasoning_summary="引用消息未解析到业务对象，谨慎追问。",
+                reply_to_user="你说的是哪一桌？",
+            )
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_quote_unresolved_trace",
+            sender_id="ran",
+            sender_name="冉姐",
+            text="可以",
+            message_id="msg_runtime_quote_unresolved_trace",
+            quoted_message=QuotedMessageRef(
+                message_id="missing_wechat_quote_message",
+                sender_id="boss",
+                sender_name="老板",
+                text="14:00，0.5无烟，打吗？",
+            ),
+        ),
+        trace_id="trace_quote_unresolved_trace",
+    )
+
+    events = trace.get_trace("trace_quote_unresolved_trace")
+    assert validate_trace(events)["complete"] is True
+    context_packed = next(event for event in events if event.step == "context_packed")
+    assert context_packed.content["quoted_message_present"] is True
+    assert context_packed.content["quoted_message_id"] == "missing_wechat_quote_message"
+    assert context_packed.content["quoted_message_reference_resolved"] is False
+    assert context_packed.content["quoted_message_reference_status"] == "unresolved"
+    assert result.tool_results == []
+    assert result.final_reply == "你说的是哪一桌？"
 
 
 def test_runtime_duplicate_message_id_returns_cached_result_without_reexecuting_side_effects() -> None:
