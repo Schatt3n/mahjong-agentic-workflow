@@ -3,11 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from mahjong_agent_runtime.copywriting import REAL_OWNER_WECHAT_STYLE_EXAMPLES  # noqa: E402
+
 DEFAULT_DATASET_PATH = ROOT / "eval" / "golden" / "real_owner_chat_golden.jsonl"
 REQUIRED_EVAL_CASE_IDS = {
     "initial_request_uses_profile_defaults_and_searches_pool",
@@ -47,6 +55,7 @@ def validate_dataset(records: list[dict[str, Any]]) -> list[str]:
             errors.extend(_validate_supplement_record(record, records_by_id))
         else:
             errors.append(_record_error(record, f"unsupported kind: {kind!r}"))
+    errors.extend(_validate_real_owner_style_examples(records))
     return errors
 
 
@@ -167,6 +176,86 @@ def _validate_eval_case_turn_refs(record: dict[str, Any], valid_turns: set[int])
 def _record_error(record: dict[str, Any], message: str) -> str:
     record_id = record.get("id") or f"line:{record.get('_line_number')}"
     return f"{record_id}: {message}"
+
+
+def _validate_real_owner_style_examples(records: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    evidence_texts = _collect_style_evidence_texts(records)
+    normalized_evidence = [_normalize_style_text(text) for text in evidence_texts if str(text).strip()]
+    combined_evidence = "\n".join(normalized_evidence)
+
+    for index, example in enumerate(REAL_OWNER_WECHAT_STYLE_EXAMPLES, start=1):
+        good = str(example.get("good") or "").strip()
+        bad = str(example.get("bad") or "").strip()
+        scenario = str(example.get("scenario") or "").strip()
+        style_note = str(example.get("style_note") or "").strip()
+        if not good or not bad or not scenario or not style_note:
+            errors.append(f"REAL_OWNER_WECHAT_STYLE_EXAMPLES[{index}]: scenario/good/bad/style_note are required")
+            continue
+        if _normalize_style_text(good) == _normalize_style_text(bad):
+            errors.append(f"REAL_OWNER_WECHAT_STYLE_EXAMPLES[{index}]: good and bad examples must differ")
+        if not _style_example_backed_by_evidence(good, normalized_evidence, combined_evidence):
+            errors.append(
+                f"REAL_OWNER_WECHAT_STYLE_EXAMPLES[{index}]: good phrase is not backed by real owner dataset: {good!r}"
+            )
+    return errors
+
+
+def _collect_style_evidence_texts(records: list[dict[str, Any]]) -> list[str]:
+    evidence: list[str] = []
+    for record in records:
+        messages = record.get("messages") if isinstance(record.get("messages"), list) else []
+        for message in messages:
+            if isinstance(message, dict):
+                evidence.append(str(message.get("text") or ""))
+        evidence.extend(_adjacent_boss_message_windows(messages))
+        for case in record.get("eval_cases") or []:
+            if not isinstance(case, dict):
+                continue
+            expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
+            evidence.extend(str(item) for item in expected.get("good_examples") or [])
+    return evidence
+
+
+def _adjacent_boss_message_windows(messages: list[Any]) -> list[str]:
+    windows: list[str] = []
+    boss_run: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "boss":
+            boss_run.append(str(message.get("text") or ""))
+            continue
+        windows.extend(_sliding_windows(boss_run, max_size=4))
+        boss_run = []
+    windows.extend(_sliding_windows(boss_run, max_size=4))
+    return windows
+
+
+def _sliding_windows(items: list[str], *, max_size: int) -> list[str]:
+    windows: list[str] = []
+    for start in range(len(items)):
+        for end in range(start + 2, min(len(items), start + max_size) + 1):
+            windows.append("，".join(item for item in items[start:end] if item))
+    return windows
+
+
+def _style_example_backed_by_evidence(good: str, normalized_evidence: list[str], combined_evidence: str) -> bool:
+    normalized_good = _normalize_style_text(good)
+    if not normalized_good:
+        return False
+    if any(normalized_good in evidence for evidence in normalized_evidence):
+        return True
+    required_parts = [
+        _normalize_style_text(part)
+        for part in re.split(r"[\s,，、。.!！?？;；]+", good)
+        if len(_normalize_style_text(part)) >= 2
+    ]
+    return bool(required_parts) and all(part in combined_evidence for part in required_parts)
+
+
+def _normalize_style_text(text: str) -> str:
+    return re.sub(r"[\s,，、。.!！?？;；:：/\\（）()“”\"'`]+", "", str(text)).lower()
 
 
 def main(argv: list[str] | None = None) -> int:

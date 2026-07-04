@@ -81,3 +81,55 @@ def test_real_owner_chat_golden_validator_requires_supplement_contract() -> None
     assert "after_turn not found" in text
     assert "missing profile assumption" in text
     assert "hidden_context_ref not found" in text
+
+
+def test_real_owner_chat_golden_validator_checks_copywriting_style_examples(monkeypatch) -> None:
+    module = load_validator_module()
+    transcript = {
+        "kind": "real_owner_chat_golden",
+        "id": "parent",
+        "source": {"source_image_files": ["one.png"]},
+        "messages": [
+            {"turn": 1, "role": "customer", "text": "帮我约个6.30无烟的", "source_image": "one.png"},
+            {"turn": 2, "role": "boss", "text": "七点三缺一", "source_image": "one.png"},
+            {"turn": 3, "role": "boss", "text": "可以不", "source_image": "one.png"},
+        ],
+        "business_facts": [{"id": "fact", "evidence_turns": [1], "fact": "ok"}],
+        "eval_cases": [],
+    }
+    monkeypatch.setattr(
+        module,
+        "REAL_OWNER_WECHAT_STYLE_EXAMPLES",
+        (
+            {
+                "scenario": "matched game",
+                "good": "七点三缺一，可以不？",
+                "bad": "已为您查询到一个局，请问是否加入？",
+                "style_note": "短句",
+            },
+        ),
+    )
+
+    errors = module._validate_real_owner_style_examples([transcript])
+
+    assert errors == []
+
+
+def test_real_owner_chat_golden_validator_rejects_unbacked_copywriting_style_example(monkeypatch) -> None:
+    module = load_validator_module()
+    monkeypatch.setattr(
+        module,
+        "REAL_OWNER_WECHAT_STYLE_EXAMPLES",
+        (
+            {
+                "scenario": "fake",
+                "good": "这句不是老板说过的话",
+                "bad": "已为您处理",
+                "style_note": "bad",
+            },
+        ),
+    )
+
+    errors = module._validate_real_owner_style_examples([])
+
+    assert "not backed by real owner dataset" in "\n".join(errors)
