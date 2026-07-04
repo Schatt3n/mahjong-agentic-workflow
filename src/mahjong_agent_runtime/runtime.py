@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .context import AgentContextBuilder, estimate_tokens
+from .copywriting import (
+    DEFAULT_CUSTOMER_VISIBLE_TEXT_PROMPT_PATH,
+    action_with_customer_visible_rewrites,
+    build_customer_visible_text_generation_payload,
+    parse_customer_visible_text_generation,
+)
 from .llm import AgentLLMClient
 from .models import AgentAction, AgentRuntimeResult, ToolResult, UserMessage
 from .store import InMemoryAgentStore
@@ -20,6 +26,7 @@ from .tracing import InMemoryTraceRecorder
 DEFAULT_REPLY_SELF_REVIEW_PROMPT_PATH = Path(__file__).with_name("prompts").joinpath("agent_runtime_reply_self_review.md")
 CUSTOMER_VISIBLE_CONTENT_REVIEW_TOOL_NAME = "customer_visible_content_review"
 REPLY_SELF_REVIEW_TOOL_NAME = CUSTOMER_VISIBLE_CONTENT_REVIEW_TOOL_NAME
+CUSTOMER_VISIBLE_TEXT_GENERATION_NAME = "customer_visible_text_generation"
 
 
 @dataclass(slots=True)
@@ -56,8 +63,12 @@ class AgentRuntime:
     trace_recorder: Any = field(default_factory=InMemoryTraceRecorder)
     token_budget: TokenBudget = field(default_factory=TokenBudget)
     review_token_budget: TokenBudget = field(default_factory=TokenBudget)
+    customer_visible_text_generation_token_budget: TokenBudget = field(default_factory=TokenBudget)
     max_steps: int = 8
     llm_timeout_seconds: float = 45.0
+    customer_visible_text_generation_enabled: bool = False
+    customer_visible_text_generation_client: AgentLLMClient | None = None
+    customer_visible_text_generation_prompt_path: Path = DEFAULT_CUSTOMER_VISIBLE_TEXT_PROMPT_PATH
     reply_self_review_enabled: bool = False
     reply_self_review_client: AgentLLMClient | None = None
     reply_self_review_prompt_path: Path = DEFAULT_REPLY_SELF_REVIEW_PROMPT_PATH
@@ -118,6 +129,10 @@ class AgentRuntime:
         review_turn_budget = TokenBudget(
             max_tokens_per_call=self.review_token_budget.max_tokens_per_call,
             max_calls_per_turn=self.review_token_budget.max_calls_per_turn,
+        )
+        text_generation_turn_budget = TokenBudget(
+            max_tokens_per_call=self.customer_visible_text_generation_token_budget.max_tokens_per_call,
+            max_calls_per_turn=self.customer_visible_text_generation_token_budget.max_calls_per_turn,
         )
         self.store.append_user_turn(message, trace_id)
         self.trace_recorder.record(trace_id, "user_input", {"message": message.to_dict()})
@@ -181,6 +196,28 @@ class AgentRuntime:
 
             if action.tool_calls:
                 review_items = customer_visible_items_for_action(action)
+                text_generation_result = self._run_customer_visible_text_generation(
+                    message=message,
+                    trace_id=trace_id,
+                    action=action,
+                    items=review_items,
+                    context_payload=built.payload,
+                    turn_budget=text_generation_turn_budget,
+                    generation_scope="tool_calls",
+                )
+                if text_generation_result is not None:
+                    tool_results.append(text_generation_result)
+                    action = action_with_customer_visible_rewrites(
+                        action,
+                        {
+                            str(item.get("item_id") or ""): str(item.get("final_text") or "")
+                            for item in text_generation_result.result.get("item_rewrites", [])
+                            if isinstance(item, dict)
+                        },
+                    )
+                    actions[-1] = action
+                    self.trace_recorder.record(trace_id, "action_after_customer_visible_text_generation", action.to_dict())
+                    review_items = customer_visible_items_for_action(action)
                 review_result = self._run_customer_visible_content_review(
                     message=message,
                     trace_id=trace_id,
@@ -221,6 +258,35 @@ class AgentRuntime:
             proposed_reply = action.reply_to_user.strip()
             if action.needs_human and not proposed_reply:
                 proposed_reply = "这个我先转人工确认一下。"
+            text_generation_result = self._run_customer_visible_text_generation(
+                message=message,
+                trace_id=trace_id,
+                action=action,
+                items=[
+                    {
+                        "item_id": "reply_to_user",
+                        "source": "reply_to_user",
+                        "recipient_id": message.sender_id,
+                        "recipient_name": message.sender_name,
+                        "text": proposed_reply,
+                    }
+                ],
+                context_payload=built.payload,
+                turn_budget=text_generation_turn_budget,
+                generation_scope="reply_to_user",
+            )
+            if text_generation_result is not None:
+                tool_results.append(text_generation_result)
+                rewrites = {
+                    str(item.get("item_id") or ""): str(item.get("final_text") or "")
+                    for item in text_generation_result.result.get("item_rewrites", [])
+                    if isinstance(item, dict)
+                }
+                if rewrites.get("reply_to_user"):
+                    proposed_reply = rewrites["reply_to_user"].strip()
+                    action = action_with_customer_visible_rewrites(action, rewrites)
+                    actions[-1] = action
+                    self.trace_recorder.record(trace_id, "action_after_customer_visible_text_generation", action.to_dict())
             review_result = self._run_customer_visible_content_review(
                 message=message,
                 trace_id=trace_id,
@@ -272,6 +338,86 @@ class AgentRuntime:
                 lock = threading.RLock()
                 self._conversation_locks[key] = lock
             return lock
+
+    def _run_customer_visible_text_generation(
+        self,
+        *,
+        message: UserMessage,
+        trace_id: str,
+        action: AgentAction,
+        items: list[dict[str, Any]],
+        context_payload: dict[str, Any],
+        turn_budget: TokenBudget,
+        generation_scope: str,
+    ) -> ToolResult | None:
+        if not self.customer_visible_text_generation_enabled or not items:
+            return None
+        client = self.customer_visible_text_generation_client or self.llm_client
+        generation_payload = build_customer_visible_text_generation_payload(
+            message=message,
+            action=action,
+            items=items,
+            context_payload=context_payload,
+            generation_scope=generation_scope,
+        )
+        messages = [
+            {"role": "system", "content": self.customer_visible_text_generation_prompt_path.read_text(encoding="utf-8")},
+            {"role": "user", "content": json.dumps(generation_payload, ensure_ascii=False, sort_keys=True)},
+        ]
+        self.trace_recorder.record(trace_id, "customer_visible_text_generation_prompt", {"messages": messages})
+        budget = turn_budget.reserve(messages)
+        self.trace_recorder.record(trace_id, "customer_visible_text_generation_budget_checked", budget.to_dict())
+        if not budget.allowed:
+            self.trace_recorder.record(
+                trace_id,
+                "customer_visible_text_generation_skipped",
+                {"reason": budget.reason, "generation_scope": generation_scope, "items": items},
+                level="WARN",
+            )
+            return None
+        started = time.perf_counter()
+        try:
+            raw_response = client.complete(messages, trace_id=trace_id, timeout_seconds=self.llm_timeout_seconds)
+        except Exception as exc:
+            self.trace_recorder.record(
+                trace_id,
+                "customer_visible_text_generation_error",
+                {
+                    "generation_scope": generation_scope,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                },
+                level="ERROR",
+            )
+            return None
+        self.trace_recorder.record(
+            trace_id,
+            "customer_visible_text_generation_response",
+            {"content": raw_response, "elapsed_ms": int((time.perf_counter() - started) * 1000), "generation_scope": generation_scope},
+        )
+        generation, errors = parse_customer_visible_text_generation(raw_response, items)
+        if errors:
+            self.trace_recorder.record(
+                trace_id,
+                "customer_visible_text_generation_contract_error",
+                {"errors": errors, "raw_response": raw_response, "generation_scope": generation_scope},
+                level="WARN",
+            )
+            return None
+        result = ToolResult(
+            name=CUSTOMER_VISIBLE_TEXT_GENERATION_NAME,
+            called=True,
+            allowed=True,
+            result={
+                "generation_scope": generation_scope,
+                "items": items,
+                "reasoning_summary": generation.reasoning_summary,
+                "item_rewrites": generation.item_rewrites,
+            },
+        )
+        self.trace_recorder.record(trace_id, "customer_visible_text_generation_result", result.to_dict())
+        return result
 
     def _run_customer_visible_content_review(
         self,

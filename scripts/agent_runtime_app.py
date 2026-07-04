@@ -59,6 +59,7 @@ def build_runtime() -> AgentRuntime:
     llm_client = OpenAICompatibleAgentClient.from_env()
     if llm_client is None:
         raise RuntimeError("MAHJONG_LLM_API_KEY and MAHJONG_LLM_MODEL are required for AgentRuntime.")
+    customer_visible_text_generation_client = build_customer_visible_text_generation_client()
     reply_self_review_client = build_reply_self_review_client()
     store = SQLiteAgentStore(DB_PATH)
     seed_customers(store)
@@ -92,16 +93,44 @@ def build_runtime() -> AgentRuntime:
         tool_gateway=gateway,
         trace_recorder=trace,
         token_budget=main_budget,
+        customer_visible_text_generation_token_budget=TokenBudget(
+            max_tokens_per_call=env_int(
+                "MAHJONG_TEXT_GENERATION_MAX_TOKENS_PER_CALL",
+                env_int("MAHJONG_AGENT_REVIEW_MAX_TOKENS_PER_CALL", main_budget.max_tokens_per_call),
+            ),
+            max_calls_per_turn=env_int("MAHJONG_TEXT_GENERATION_MAX_CALLS_PER_TURN", 8),
+        ),
         review_token_budget=TokenBudget(
             max_tokens_per_call=env_int("MAHJONG_AGENT_REVIEW_MAX_TOKENS_PER_CALL", main_budget.max_tokens_per_call),
             max_calls_per_turn=env_int("MAHJONG_AGENT_REVIEW_MAX_CALLS_PER_TURN", 8),
         ),
         max_steps=env_int("MAHJONG_AGENT_MAX_STEPS", 8),
         llm_timeout_seconds=float(env_int("MAHJONG_AGENT_LLM_TIMEOUT_SECONDS", 45)),
+        customer_visible_text_generation_enabled=env_bool("MAHJONG_TEXT_GENERATION_ENABLED", True),
+        customer_visible_text_generation_client=customer_visible_text_generation_client,
         reply_self_review_enabled=env_bool("MAHJONG_AGENT_REPLY_SELF_REVIEW_ENABLED", True),
         reply_self_review_client=reply_self_review_client,
         context_summary_manager=summary_manager,
     )
+
+
+def build_customer_visible_text_generation_client() -> OpenAICompatibleAgentClient | None:
+    model = os.getenv("MAHJONG_TEXT_GENERATION_LLM_MODEL")
+    if not model:
+        return None
+    provider = (os.getenv("MAHJONG_TEXT_GENERATION_LLM_PROVIDER") or os.getenv("MAHJONG_LLM_PROVIDER") or "openai_compatible").strip().lower()
+    api_key = os.getenv("MAHJONG_TEXT_GENERATION_LLM_API_KEY") or os.getenv("MAHJONG_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("MAHJONG_TEXT_GENERATION_LLM_MODEL is set, but no text generation or default LLM API key is available.")
+    config = AgentLLMConfig(
+        api_key=api_key,
+        model=model,
+        provider=provider,
+        base_url=(os.getenv("MAHJONG_TEXT_GENERATION_LLM_BASE_URL") or os.getenv("MAHJONG_LLM_BASE_URL") or default_base_url(provider)).rstrip("/"),
+        temperature=env_float("MAHJONG_TEXT_GENERATION_LLM_TEMPERATURE", env_float("MAHJONG_LLM_TEMPERATURE", 0.4)),
+        max_tokens=env_int("MAHJONG_TEXT_GENERATION_LLM_MAX_COMPLETION_TOKENS", 1024),
+    )
+    return OpenAICompatibleAgentClient(config=config)
 
 
 def build_reply_self_review_client() -> OpenAICompatibleAgentClient | None:
@@ -501,6 +530,13 @@ def runtime_config(runtime: AgentRuntime) -> dict:
         "max_steps": runtime.max_steps,
         "max_tokens_per_call": runtime.token_budget.max_tokens_per_call,
         "max_calls_per_turn": runtime.token_budget.max_calls_per_turn,
+        "customer_visible_text_generation_enabled": runtime.customer_visible_text_generation_enabled,
+        "customer_visible_text_generation_model": getattr(
+            getattr(runtime.customer_visible_text_generation_client, "config", None), "model", None
+        )
+        or getattr(llm_config, "model", ""),
+        "customer_visible_text_generation_max_tokens_per_call": runtime.customer_visible_text_generation_token_budget.max_tokens_per_call,
+        "customer_visible_text_generation_max_calls_per_turn": runtime.customer_visible_text_generation_token_budget.max_calls_per_turn,
         "review_max_tokens_per_call": runtime.review_token_budget.max_tokens_per_call,
         "review_max_calls_per_turn": runtime.review_token_budget.max_calls_per_turn,
         "customer_visible_content_review_enabled": runtime.reply_self_review_enabled,
