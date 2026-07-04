@@ -130,7 +130,8 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "不要直接说“他是组这个局的人/发起人”" in prompt
     assert "找老板帮忙组局的发起客户/首位玩家" in prompt
     assert "发起客户找老板组局时，默认他本人要打" in prompt
-    assert "`known_players` 里对应客户也要带 `seat_count`" in prompt
+    assert "优先传 `requesting_party.seat_count`" in prompt
+    assert "后端会合并成统一 party/seat_claim" in prompt
     assert "算的，加上你两个，还差两个。" in prompt
     assert "existing_player_ids" in prompt
 
@@ -446,7 +447,93 @@ def test_runtime_shorthand_current_players_sets_requester_seat_count() -> None:
     assert game.requirement["stake_label"] == "2-32"
     assert game.participants[0].customer_id == "zhang"
     assert game.participants[0].seat_count == 2
+    assert game.participants[0].anonymous_seat_count == 1
+    assert game.parties[0].contact_id == "zhang"
+    assert game.parties[0].seat_count == 2
+    assert game.parties[0].anonymous_seat_count == 1
+    assert game.to_dict()["seat_summary"]["claimed_seats"] == 2
+    assert game.to_dict()["seat_claims"][0]["contact_id"] == "zhang"
     assert game.remaining_seats() == 2
+
+
+def test_runtime_create_game_derives_requester_party_from_requirement_count() -> None:
+    store = seeded_store()
+
+    game, _ = store.create_game(
+        conversation_id="runtime_party_contract",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "sichuan_mahjong",
+            "stake": "232",
+            "smoke_preference": "no_smoke",
+            "known_player_count": 2,
+            "needed_seats": 2,
+        },
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_party_contract",
+    )
+
+    assert game.requirement["stake"] == "2"
+    assert game.requirement["cap_score"] == 32.0
+    assert game.requirement["requesting_party"]["contact_id"] == "zhang"
+    assert game.requirement["requesting_party"]["seat_count"] == 2
+    assert game.parties[0].to_dict() == {
+        "party_id": "party_zhang",
+        "contact_id": "zhang",
+        "contact_name": "张哥",
+        "seat_count": 2,
+        "known_member_ids": ["zhang"],
+        "anonymous_seat_count": 1,
+        "status": "joined",
+        "source": "requester",
+    }
+    assert game.seat_summary()["claimed_seats"] == 2
+    assert game.remaining_seats() == 2
+
+
+def test_runtime_tool_gateway_accepts_requesting_party_contract() -> None:
+    store = seeded_store()
+    gateway = ToolGateway(store)
+
+    result = gateway.execute(
+        ToolCall(
+            name="create_game",
+            arguments={
+                "organizer_id": "zhang",
+                "organizer_name": "张哥",
+                "requirement": {
+                    "game_type": "sichuan_mahjong",
+                    "stake": "232",
+                    "smoke_preference": "no_smoke",
+                    "known_player_count": 2,
+                    "needed_seats": 2,
+                },
+                "requesting_party": {
+                    "contact_id": "zhang",
+                    "contact_name": "张哥",
+                    "seat_count": 2,
+                    "known_member_ids": ["zhang"],
+                    "anonymous_seat_count": 1,
+                },
+            },
+            reason="验证party契约。",
+        ),
+        trace_id="trace_party_gateway",
+        conversation_id="runtime_party_gateway",
+        sender_id="zhang",
+        sender_name="张哥",
+        step_index=0,
+        source_message_id="msg_party_gateway",
+    )
+
+    assert result.allowed is True
+    assert result.called is True
+    game_payload = result.result["game"]
+    assert game_payload["parties"][0]["contact_id"] == "zhang"
+    assert game_payload["parties"][0]["seat_count"] == 2
+    assert game_payload["seat_summary"]["claimed_seats"] == 2
+    assert game_payload["remaining_seats"] == 2
 
 
 def test_runtime_reply_self_review_rewrites_leaking_customer_reply() -> None:
@@ -1554,12 +1641,16 @@ def test_runtime_sqlite_preserves_party_size_across_reload(tmp_path) -> None:
     )
 
     assert next(item for item in game.participants if item.customer_id == "zhang").seat_count == 2
+    assert game.parties[0].seat_count == 2
     assert game.remaining_seats() == 2
 
     reopened = SQLiteAgentStore(db_path)
     persisted = reopened.games[game.game_id]
 
     assert next(item for item in persisted.participants if item.customer_id == "zhang").seat_count == 2
+    assert persisted.parties[0].contact_id == "zhang"
+    assert persisted.parties[0].seat_count == 2
+    assert persisted.seat_summary()["claimed_seats"] == 2
     assert persisted.remaining_seats() == 2
 
 

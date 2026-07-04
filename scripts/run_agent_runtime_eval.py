@@ -286,6 +286,29 @@ def validate_result(
         )
     if "persisted_badcase_count" in expected and len(reopened.badcases) != int(expected["persisted_badcase_count"]):
         errors.append(f"persisted_badcase_count expected {expected['persisted_badcase_count']}, got {len(reopened.badcases)}")
+    first_game = next(iter(reopened.games.values()), None)
+    if "persisted_first_game_requirement_contains" in expected:
+        if first_game is None:
+            errors.append("persisted_first_game_requirement_contains expected first game, got none")
+        else:
+            mismatch = mapping_contains(
+                first_game.requirement,
+                dict(expected["persisted_first_game_requirement_contains"]),
+                path="persisted_first_game.requirement",
+            )
+            if mismatch:
+                errors.append(mismatch)
+    if "persisted_first_party_contains" in expected:
+        if first_game is None or not first_game.parties:
+            errors.append("persisted_first_party_contains expected first game party, got none")
+        else:
+            mismatch = mapping_contains(
+                first_game.parties[0].to_dict(),
+                dict(expected["persisted_first_party_contains"]),
+                path="persisted_first_party",
+            )
+            if mismatch:
+                errors.append(mismatch)
     trace_events = trace.get_trace(result.trace_id)
     trace_steps = [event.step for event in trace_events]
     for step in expected.get("trace_steps_contains") or []:
@@ -310,6 +333,8 @@ def count_checks_for_expected(expected: dict[str, Any]) -> int:
         "persisted_game_count",
         "persisted_invite_draft_count",
         "persisted_badcase_count",
+        "persisted_first_game_requirement_contains",
+        "persisted_first_party_contains",
     ):
         if key in expected:
             total += 1
@@ -322,6 +347,23 @@ def count_checks_for_expected(expected: dict[str, Any]) -> int:
 
 def count_checks(scenarios: list[AgentRuntimeScenario]) -> int:
     return sum(count_checks_for_expected(scenario.expected) for scenario in scenarios)
+
+
+def mapping_contains(actual: dict[str, Any], expected: dict[str, Any], *, path: str) -> str | None:
+    for key, expected_value in expected.items():
+        item_path = f"{path}.{key}"
+        if key not in actual:
+            return f"{item_path} missing"
+        actual_value = actual[key]
+        if isinstance(expected_value, dict):
+            if not isinstance(actual_value, dict):
+                return f"{item_path} expected object, got {actual_value!r}"
+            mismatch = mapping_contains(actual_value, expected_value, path=item_path)
+            if mismatch:
+                return mismatch
+        elif actual_value != expected_value:
+            return f"{item_path} expected {expected_value!r}, got {actual_value!r}"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:

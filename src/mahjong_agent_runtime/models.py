@@ -147,6 +147,24 @@ class GameParticipant:
     status: str = "joined"
     source: str = "organizer"
     seat_count: int = 1
+    party_id: str | None = None
+    known_member_ids: list[str] = field(default_factory=list)
+    anonymous_seat_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class Party:
+    party_id: str
+    contact_id: str
+    contact_name: str
+    seat_count: int = 1
+    known_member_ids: list[str] = field(default_factory=list)
+    anonymous_seat_count: int = 0
+    status: str = "joined"
+    source: str = "requester"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,9 +179,14 @@ class Game:
     requirement: dict[str, Any]
     status: GameStatus = GameStatus.FORMING
     participants: list[GameParticipant] = field(default_factory=list)
+    parties: list[Party] = field(default_factory=list)
     seats_total: int = 4
     created_at: datetime = field(default_factory=now)
     updated_at: datetime = field(default_factory=now)
+
+    def __post_init__(self) -> None:
+        if not self.parties:
+            self.parties = parties_from_participants(self.participants)
 
     def remaining_seats(self) -> int:
         confirmed = sum(
@@ -172,6 +195,33 @@ class Game:
             if item.status in {"joined", "confirmed"}
         )
         return max(0, self.seats_total - confirmed)
+
+    def seat_claims(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "party_id": item.party_id or f"party_{item.customer_id}",
+                "contact_id": item.customer_id,
+                "contact_name": item.display_name,
+                "seat_count": max(1, int(item.seat_count)),
+                "known_member_ids": list(item.known_member_ids or [item.customer_id]),
+                "anonymous_seat_count": max(0, int(item.anonymous_seat_count)),
+                "status": item.status,
+                "source": item.source,
+            }
+            for item in self.participants
+            if item.status in {"joined", "confirmed"}
+        ]
+
+    def seat_summary(self) -> dict[str, Any]:
+        claimed = sum(item["seat_count"] for item in self.seat_claims())
+        return {
+            "seats_total": self.seats_total,
+            "claimed_seats": claimed,
+            "remaining_seats": max(0, self.seats_total - claimed),
+            "party_count": len(self.parties),
+            "known_contact_count": len({item.contact_id for item in self.parties if item.contact_id}),
+            "anonymous_seat_count": sum(max(0, int(item.anonymous_seat_count)) for item in self.parties),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,11 +232,39 @@ class Game:
             "requirement": dict(self.requirement),
             "status": self.status.value,
             "participants": [item.to_dict() for item in self.participants],
+            "parties": [item.to_dict() for item in self.parties],
+            "seat_claims": self.seat_claims(),
+            "seat_summary": self.seat_summary(),
             "seats_total": self.seats_total,
             "remaining_seats": self.remaining_seats(),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+
+def parties_from_participants(participants: list[GameParticipant]) -> list[Party]:
+    parties: list[Party] = []
+    seen: set[str] = set()
+    for participant in participants:
+        party_id = participant.party_id or f"party_{participant.customer_id}"
+        if party_id in seen:
+            continue
+        seen.add(party_id)
+        known_member_ids = list(participant.known_member_ids or [participant.customer_id])
+        seat_count = max(1, int(participant.seat_count))
+        parties.append(
+            Party(
+                party_id=party_id,
+                contact_id=participant.customer_id,
+                contact_name=participant.display_name,
+                seat_count=seat_count,
+                known_member_ids=known_member_ids,
+                anonymous_seat_count=max(0, int(participant.anonymous_seat_count or max(0, seat_count - len(known_member_ids)))),
+                status=participant.status,
+                source=participant.source,
+            )
+        )
+    return parties
 
 
 @dataclass(slots=True)

@@ -19,6 +19,7 @@ from .models import (
     InviteStatus,
     OutboundDraftStatus,
     OutboundMessageDraft,
+    Party,
     StateTransition,
     ToolResult,
     new_id,
@@ -418,18 +419,23 @@ class InMemoryAgentStore:
         trace_id: str,
     ) -> tuple[Game, StateTransition]:
         with self._lock:
+            normalized_requirement = normalize_requirement(requirement)
+            default_requester_seat_count = seat_count_from_payload(normalized_requirement, default=1)
             participants = normalize_game_participants(
                 organizer_id=organizer_id,
                 organizer_name=organizer_name,
                 known_players=known_players,
+                default_requester_seat_count=default_requester_seat_count,
             )
+            parties = normalize_game_parties(participants)
             game = Game(
                 game_id=new_id("game"),
                 conversation_id=conversation_id,
                 organizer_id=organizer_id,
                 organizer_name=organizer_name,
-                requirement=normalize_requirement(requirement),
+                requirement=normalize_requirement_with_party(normalized_requirement, parties),
                 participants=participants,
+                parties=parties,
             )
             self.games[game.game_id] = game
             transition = StateTransition(
@@ -901,8 +907,9 @@ def normalize_game_participants(
     organizer_id: str,
     organizer_name: str,
     known_players: list[dict[str, Any]],
+    default_requester_seat_count: int = 1,
 ) -> list[GameParticipant]:
-    """Compatibility: organizer_id is the requesting player, not the store operator."""
+    """Compatibility: organizer_id is the requesting contact, not the store operator."""
     participants: list[GameParticipant] = []
     seen: set[str] = set()
 
@@ -916,13 +923,22 @@ def normalize_game_participants(
             ),
             {},
         )
+        requester_seat_count = seat_count_from_payload(requester_payload, default=default_requester_seat_count)
+        requester_known_member_ids = known_member_ids_from_payload(requester_payload, default_id=requester_id)
         participants.append(
             GameParticipant(
                 customer_id=requester_id,
                 display_name=str(organizer_name or requester_id),
                 status="joined",
                 source="requester",
-                seat_count=seat_count_from_payload(requester_payload, default=1),
+                seat_count=requester_seat_count,
+                party_id=party_id_for_contact(requester_id),
+                known_member_ids=requester_known_member_ids,
+                anonymous_seat_count=anonymous_seat_count_from_payload(
+                    requester_payload,
+                    seat_count=requester_seat_count,
+                    known_member_ids=requester_known_member_ids,
+                ),
             )
         )
         seen.add(requester_id)
@@ -933,20 +949,69 @@ def normalize_game_participants(
         customer_id = str(item.get("customer_id") or "").strip()
         if not customer_id or customer_id in seen:
             continue
+        seat_count = seat_count_from_payload(item, default=1)
+        known_member_ids = known_member_ids_from_payload(item, default_id=customer_id)
         participants.append(
             GameParticipant(
                 customer_id=customer_id,
                 display_name=str(item.get("display_name") or customer_id),
                 status=str(item.get("status") or "joined"),
                 source=str(item.get("source") or "participant"),
-                seat_count=seat_count_from_payload(item, default=1),
+                seat_count=seat_count,
+                party_id=party_id_for_contact(customer_id),
+                known_member_ids=known_member_ids,
+                anonymous_seat_count=anonymous_seat_count_from_payload(
+                    item,
+                    seat_count=seat_count,
+                    known_member_ids=known_member_ids,
+                ),
             )
         )
         seen.add(customer_id)
     return participants
 
 
+def normalize_game_parties(participants: list[GameParticipant]) -> list[Party]:
+    parties: list[Party] = []
+    seen: set[str] = set()
+    for participant in participants:
+        party_id = participant.party_id or party_id_for_contact(participant.customer_id)
+        if party_id in seen:
+            continue
+        seen.add(party_id)
+        seat_count = max(1, min(4, int(participant.seat_count or 1)))
+        known_member_ids = list(participant.known_member_ids or [participant.customer_id])
+        parties.append(
+            Party(
+                party_id=party_id,
+                contact_id=participant.customer_id,
+                contact_name=participant.display_name,
+                seat_count=seat_count,
+                known_member_ids=known_member_ids,
+                anonymous_seat_count=max(
+                    0,
+                    int(participant.anonymous_seat_count or max(0, seat_count - len(known_member_ids))),
+                ),
+                status=participant.status,
+                source=participant.source,
+            )
+        )
+    return parties
+
+
+def normalize_requirement_with_party(requirement: dict[str, Any], parties: list[Party]) -> dict[str, Any]:
+    normalized = dict(requirement)
+    claimed_seats = sum(max(1, int(item.seat_count)) for item in parties if item.status in {"joined", "confirmed"})
+    if claimed_seats and is_blank_value(normalized.get("known_player_count")):
+        normalized["known_player_count"] = claimed_seats
+    if parties:
+        normalized["requesting_party"] = parties[0].to_dict()
+        normalized["seat_claims"] = [item.to_dict() for item in parties]
+    return normalize_requirement(normalized)
+
+
 def seat_count_from_payload(payload: dict[str, Any], *, default: int = 1) -> int:
+    payload = payload if isinstance(payload, dict) else {}
     for key in ("seat_count", "seats", "party_size", "player_count", "current_player_count", "known_player_count"):
         value = payload.get(key)
         if is_blank_value(value):
@@ -956,6 +1021,40 @@ def seat_count_from_payload(payload: dict[str, Any], *, default: int = 1) -> int
         except (TypeError, ValueError):
             continue
     return max(1, min(4, int(default or 1)))
+
+
+def known_member_ids_from_payload(payload: dict[str, Any], *, default_id: str) -> list[str]:
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ("known_member_ids", "member_customer_ids", "members", "customer_ids"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        ids = [str(item).strip() for item in value if str(item or "").strip()]
+        if ids:
+            return ids
+    return [default_id] if default_id else []
+
+
+def anonymous_seat_count_from_payload(
+    payload: dict[str, Any],
+    *,
+    seat_count: int,
+    known_member_ids: list[str],
+) -> int:
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ("anonymous_seat_count", "unknown_member_count", "unknown_seat_count"):
+        value = payload.get(key)
+        if is_blank_value(value):
+            continue
+        try:
+            return max(0, min(4, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return max(0, int(seat_count or 1) - len(known_member_ids))
+
+
+def party_id_for_contact(contact_id: str) -> str:
+    return f"party_{str(contact_id or '').strip()}"
 
 
 def join_projection(game: Game, *, sender_id: str | None, requested_seats: int = 1) -> dict[str, Any]:

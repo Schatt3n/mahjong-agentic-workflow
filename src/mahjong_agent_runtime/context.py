@@ -106,6 +106,15 @@ class AgentContextBuilder:
             "sender_profile": profile.to_dict() if profile else None,
             "sender_relationships": sender_relationships,
             "active_games": [item.to_dict() for item in active_games],
+            "active_parties": [
+                {
+                    "game_id": game.game_id,
+                    "parties": [party.to_dict() for party in game.parties],
+                    "seat_claims": game.seat_claims(),
+                    "seat_summary": game.seat_summary(),
+                }
+                for game in active_games
+            ],
             "outbound_message_drafts": [item.to_dict() for item in self.store.outbound_message_drafts.values()],
             "available_tools": self.tool_gateway.tool_specs_for_prompt(),
             "previous_tool_results": [item.to_dict() for item in previous_tool_results or []],

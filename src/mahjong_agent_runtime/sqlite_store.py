@@ -24,6 +24,7 @@ from .models import (
     InviteStatus,
     OutboundDraftStatus,
     OutboundMessageDraft,
+    Party,
     StateTransition,
     ToolCall,
     ToolResult,
@@ -32,6 +33,8 @@ from .store import (
     ALLOWED_GAME_TRANSITIONS,
     invite_status_from_candidate_status,
     normalize_game_participants,
+    normalize_game_parties,
+    normalize_requirement_with_party,
     normalize_requirement,
     score_customer,
     relationship_anchor_ids,
@@ -616,19 +619,24 @@ class SQLiteAgentStore:
         with self._lock, self._connection:
             from .models import new_id
 
+            normalized_requirement = normalize_requirement(requirement)
+            default_requester_seat_count = seat_count_from_payload(normalized_requirement, default=1)
             participants = normalize_game_participants(
                 organizer_id=organizer_id,
                 organizer_name=organizer_name,
                 known_players=known_players,
+                default_requester_seat_count=default_requester_seat_count,
             )
+            parties = normalize_game_parties(participants)
 
             game = Game(
                 game_id=new_id("game"),
                 conversation_id=conversation_id,
                 organizer_id=organizer_id,
                 organizer_name=organizer_name,
-                requirement=normalize_requirement(requirement),
+                requirement=normalize_requirement_with_party(normalized_requirement, parties),
                 participants=participants,
+                parties=parties,
             )
             transition = StateTransition("game", game.game_id, None, game.status.value, "create_game", trace_id)
             self._save_game(game)
@@ -1040,6 +1048,20 @@ def _game_from_payload(payload: dict[str, Any]) -> Game:
         organizer_name=str(payload.get("organizer_name") or ""),
         known_players=list(payload.get("participants") or []),
     )
+    parties = [
+        Party(
+            party_id=str(item.get("party_id") or f"party_{item.get('contact_id') or item.get('customer_id') or ''}"),
+            contact_id=str(item.get("contact_id") or item.get("customer_id") or ""),
+            contact_name=str(item.get("contact_name") or item.get("display_name") or item.get("contact_id") or ""),
+            seat_count=int(item.get("seat_count") or 1),
+            known_member_ids=[str(member) for member in item.get("known_member_ids") or []],
+            anonymous_seat_count=int(item.get("anonymous_seat_count") or 0),
+            status=str(item.get("status") or "joined"),
+            source=str(item.get("source") or "requester"),
+        )
+        for item in payload.get("parties") or []
+        if isinstance(item, dict)
+    ]
     return Game(
         game_id=str(payload.get("game_id") or ""),
         conversation_id=str(payload.get("conversation_id") or ""),
@@ -1048,6 +1070,7 @@ def _game_from_payload(payload: dict[str, Any]) -> Game:
         requirement=dict(payload.get("requirement") or {}),
         status=GameStatus(str(payload.get("status") or GameStatus.FORMING.value)),
         participants=participants,
+        parties=parties,
         seats_total=int(payload.get("seats_total") or 4),
         created_at=_datetime_from_payload(payload.get("created_at")),
         updated_at=_datetime_from_payload(payload.get("updated_at")),

@@ -235,6 +235,21 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             "status": {"type": "string"},
             "source": {"type": "string"},
             "seat_count": {"type": "integer", "minimum": 1, "maximum": 4},
+            "known_member_ids": {"type": "array", "items": {"type": "string"}},
+            "anonymous_seat_count": {"type": "integer", "minimum": 0, "maximum": 4},
+        },
+    }
+    requesting_party_schema = {
+        "type": "object",
+        "required": ["contact_id", "contact_name", "seat_count"],
+        "additionalProperties": True,
+        "properties": {
+            "contact_id": non_empty_string,
+            "contact_name": non_empty_string,
+            "seat_count": {"type": "integer", "minimum": 1, "maximum": 4},
+            "known_member_ids": {"type": "array", "items": {"type": "string"}},
+            "anonymous_seat_count": {"type": "integer", "minimum": 0, "maximum": 4},
+            "source": {"type": "string"},
         },
     }
     invitation_schema = {
@@ -306,12 +321,16 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         )
 
     def create_game(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
+        known_players = known_players_with_requesting_party(
+            known_players=list(call.arguments.get("known_players") or []),
+            requesting_party=call.arguments.get("requesting_party"),
+        )
         game, transition = store.create_game(
             conversation_id=conversation_id,
             organizer_id=str(call.arguments["organizer_id"]),
             organizer_name=str(call.arguments["organizer_name"]),
             requirement=normalize_requirement(dict(call.arguments.get("requirement") or {})),
-            known_players=list(call.arguments.get("known_players") or []),
+            known_players=known_players,
             trace_id=trace_id,
         )
         return ToolResult(name=call.name, called=True, allowed=True, result={"game": game.to_dict()}, state_transitions=[transition])
@@ -403,6 +422,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
                     "organizer_id": non_empty_string,
                     "organizer_name": non_empty_string,
                     "known_players": {"type": "array", "items": known_player_schema},
+                    "requesting_party": requesting_party_schema,
                 },
             },
             create_game,
@@ -491,6 +511,41 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             update_context_checkpoint,
         ),
     }
+
+
+def known_players_with_requesting_party(
+    *,
+    known_players: list[dict[str, Any]],
+    requesting_party: Any,
+) -> list[dict[str, Any]]:
+    players = [dict(item) for item in known_players if isinstance(item, dict)]
+    if not isinstance(requesting_party, dict):
+        return players
+    contact_id = str(requesting_party.get("contact_id") or requesting_party.get("customer_id") or "").strip()
+    if not contact_id:
+        return players
+    payload = {
+        "customer_id": contact_id,
+        "display_name": str(requesting_party.get("contact_name") or requesting_party.get("display_name") or contact_id),
+        "source": str(requesting_party.get("source") or "requesting_party"),
+        "seat_count": requesting_party.get("seat_count") or requesting_party.get("party_size") or 1,
+        "known_member_ids": list(requesting_party.get("known_member_ids") or [contact_id]),
+        "anonymous_seat_count": requesting_party.get("anonymous_seat_count"),
+    }
+    for index, item in enumerate(players):
+        if str(item.get("customer_id") or "").strip() != contact_id:
+            continue
+        merged = {**item}
+        for key, value in payload.items():
+            if value is None:
+                continue
+            if key not in merged or merged.get(key) in (None, "", [], {}):
+                merged[key] = value
+        players[index] = merged
+        break
+    else:
+        players.insert(0, payload)
+    return players
 
 
 def validate_schema(arguments: dict[str, Any], schema: dict[str, Any]) -> str | None:
