@@ -5,7 +5,9 @@ const DEFAULT_ENDPOINT = 'http://127.0.0.1:8790/api/channels/wechaty/raw'
 
 const endpoint = process.env.MAHJONG_WECHATY_RAW_ENDPOINT || DEFAULT_ENDPOINT
 const botName = process.env.MAHJONG_WECHATY_BOT_NAME || 'mahjong-wechaty-bridge'
-const forwardSelfMessages = truthy(process.env.MAHJONG_WECHATY_FORWARD_SELF)
+const forwardSelfMessages = process.env.MAHJONG_WECHATY_FORWARD_SELF
+  ? truthy(process.env.MAHJONG_WECHATY_FORWARD_SELF)
+  : true
 
 function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase())
@@ -39,6 +41,34 @@ function primitive(value) {
   return String(value)
 }
 
+function cleanText(value) {
+  const text = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim()
+  return text
+}
+
+function jsonable(value, depth = 0) {
+  if (depth > 4) {
+    return String(value)
+  }
+  if (value === null || value === undefined) {
+    return value
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => jsonable(item, depth + 1))
+  }
+  if (typeof value === 'object') {
+    const data = {}
+    for (const [key, item] of Object.entries(value)) {
+      data[key] = jsonable(item, depth + 1)
+    }
+    return data
+  }
+  return String(value)
+}
+
 async function safeCall(label, fn) {
   try {
     const value = await fn()
@@ -48,41 +78,74 @@ async function safeCall(label, fn) {
   }
 }
 
+async function safeObject(label, fn) {
+  try {
+    return await fn()
+  } catch (error) {
+    return { error: `${label}: ${error?.message || String(error)}` }
+  }
+}
+
 async function buildPayload(message) {
-  const room = await safeCall('room', () => message.room())
-  const talker = await safeCall('talker', () => message.talker())
-  const listener = await safeCall('listener', () => message.listener())
+  const rawPayload = message.payload || {}
+  const room = await safeObject('room', () => message.room())
+  const talker = await safeObject('talker', () => message.talker())
+  const listener = await safeObject('listener', () => message.listener())
   const text = await safeCall('text', () => message.text())
   const type = await safeCall('type', () => message.type())
-  const id = primitive(message.id || message.payload?.id || message.payload?.filename || '')
+  const id = primitive(message.id || rawPayload.id || rawPayload.filename || '')
 
   let roomPayload = null
   if (room && typeof room === 'object' && !room.error) {
+    await safeCall('room.ready', () => room.ready?.())
     roomPayload = {
       id: primitive(room.id),
-      topic: await safeCall('room.topic', () => room.topic()),
+      topic: cleanText(await safeCall('room.topic', () => room.topic())),
+      payload: jsonable(room.payload || {}),
     }
   }
 
   let talkerPayload = null
   if (talker && typeof talker === 'object' && !talker.error) {
+    await safeCall('talker.ready', () => talker.ready?.())
     talkerPayload = {
       id: primitive(talker.id),
-      name: await safeCall('talker.name', () => talker.name()),
-      alias: await safeCall('talker.alias', () => talker.alias()),
+      name: cleanText(await safeCall('talker.name', () => talker.name())),
+      alias: cleanText(await safeCall('talker.alias', () => talker.alias())),
+      payload: jsonable(talker.payload || {}),
     }
   }
 
   let listenerPayload = null
   if (listener && typeof listener === 'object' && !listener.error) {
+    await safeCall('listener.ready', () => listener.ready?.())
     listenerPayload = {
       id: primitive(listener.id),
-      name: await safeCall('listener.name', () => listener.name()),
+      name: cleanText(await safeCall('listener.name', () => listener.name())),
+      payload: jsonable(listener.payload || {}),
     }
   }
 
-  const roomId = roomPayload?.id || ''
-  const senderId = talkerPayload?.id || ''
+  const roomId = roomPayload?.id || primitive(rawPayload.roomId || rawPayload.room?.id || '')
+  const senderId = talkerPayload?.id || primitive(rawPayload.talkerId || rawPayload.fromId || '')
+  const senderName =
+    talkerPayload?.name ||
+    cleanText(rawPayload.talkerName || rawPayload.fromName || rawPayload.senderName || '')
+  if (!talkerPayload && senderId) {
+    talkerPayload = {
+      id: senderId,
+      name: senderName,
+      alias: '',
+      payload: {},
+    }
+  }
+  if (!listenerPayload && rawPayload.listenerId) {
+    listenerPayload = {
+      id: primitive(rawPayload.listenerId),
+      name: '',
+      payload: {},
+    }
+  }
   const conversationId = roomId ? `wechaty:room:${roomId}` : `wechaty:contact:${senderId}`
 
   return {
@@ -97,13 +160,13 @@ async function buildPayload(message) {
     is_room: Boolean(roomId),
     room: roomPayload,
     sender_id: senderId,
-    sender_name: talkerPayload?.name || '',
+    sender_name: senderName,
     talker: talkerPayload,
     listener: listenerPayload,
     text: typeof text === 'string' ? text : '',
     raw_text: text,
     self_message: await safeCall('self', () => message.self()),
-    payload: message.payload || null,
+    payload: rawPayload,
   }
 }
 
@@ -148,6 +211,7 @@ bot.on('error', (error) => {
 
 bot.on('message', async (message) => {
   if (!forwardSelfMessages && message.self()) {
+    console.log(`[${nowText()}] skipped self message_id=${message.id || message.payload?.id || '-'}`)
     return
   }
   const payload = await buildPayload(message)
