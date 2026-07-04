@@ -146,6 +146,7 @@ class GameParticipant:
     display_name: str
     status: str = "joined"
     source: str = "organizer"
+    seat_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -165,7 +166,11 @@ class Game:
     updated_at: datetime = field(default_factory=now)
 
     def remaining_seats(self) -> int:
-        confirmed = sum(1 for item in self.participants if item.status in {"joined", "confirmed"})
+        confirmed = sum(
+            max(1, int(item.seat_count))
+            for item in self.participants
+            if item.status in {"joined", "confirmed"}
+        )
         return max(0, self.seats_total - confirmed)
 
     def to_dict(self) -> dict[str, Any]:

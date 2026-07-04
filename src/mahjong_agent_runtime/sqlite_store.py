@@ -38,6 +38,8 @@ from .store import (
     relationship_pair_key,
     score_requirement,
     score_customer_relationships,
+    join_projection,
+    seat_count_from_payload,
 )
 
 
@@ -533,15 +535,29 @@ class SQLiteAgentStore:
                     self._connection.execute(f"DELETE FROM {table}")
             return deleted
 
-    def search_current_games(self, requirement: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
+    def search_current_games(
+        self,
+        requirement: dict[str, Any],
+        limit: int = 8,
+        *,
+        sender_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         scored: list[dict[str, Any]] = []
+        requested_seats = seat_count_from_payload(requirement, default=1)
         for game in self.active_games():
             if game.remaining_seats() <= 0:
                 continue
             score, reasons = score_requirement(requirement, game.requirement)
             if requirement and score <= 0:
                 continue
-            scored.append({"game": game.to_dict(), "score": score, "reasons": reasons or ["active_open_game"]})
+            scored.append(
+                {
+                    "game": game.to_dict(),
+                    "score": score,
+                    "reasons": reasons or ["active_open_game"],
+                    "join_projection": join_projection(game, sender_id=sender_id, requested_seats=requested_seats),
+                }
+            )
         scored.sort(key=lambda item: item["score"], reverse=True)
         return scored[: int(limit)]
 
@@ -701,12 +717,14 @@ class SQLiteAgentStore:
         customer_id: str,
         display_name: str,
         status: str,
+        seat_count: int = 1,
         trace_id: str,
     ) -> tuple[Game, list[StateTransition]]:
         with self._lock, self._connection:
             game = self.require_game(game_id)
             transitions: list[StateTransition] = []
             normalized_status = status.strip()
+            normalized_seat_count = max(1, min(4, int(seat_count or 1)))
             for draft in self.invite_drafts.values():
                 if draft.game_id == game_id and draft.customer_id == customer_id:
                     old = draft.status.value
@@ -714,27 +732,44 @@ class SQLiteAgentStore:
                     draft.updated_at = datetime.now(DEFAULT_TZ)
                     transitions.append(StateTransition("invite_draft", draft.draft_id, old, draft.status.value, "record_candidate_reply", trace_id))
                     self._save_invite(draft)
-            if normalized_status in {"accepted", "confirmed", "arrived"} and not any(
-                item.customer_id == customer_id and item.status in {"joined", "confirmed"} for item in game.participants
-            ):
-                game.participants.append(
-                    GameParticipant(
-                        customer_id=customer_id,
-                        display_name=display_name or customer_id,
-                        status="confirmed",
-                        source="candidate_reply",
+            if normalized_status in {"accepted", "confirmed", "arrived"}:
+                existing_participant = next((item for item in game.participants if item.customer_id == customer_id), None)
+                if existing_participant is None:
+                    game.participants.append(
+                        GameParticipant(
+                            customer_id=customer_id,
+                            display_name=display_name or customer_id,
+                            status="confirmed",
+                            source="candidate_reply",
+                            seat_count=normalized_seat_count,
+                        )
                     )
-                )
-                transitions.append(
-                    StateTransition(
-                        "game_participant",
-                        f"{game.game_id}:{customer_id}",
-                        None,
-                        "confirmed",
-                        "record_candidate_reply",
-                        trace_id,
+                    transitions.append(
+                        StateTransition(
+                            "game_participant",
+                            f"{game.game_id}:{customer_id}",
+                            None,
+                            "confirmed",
+                            "record_candidate_reply",
+                            trace_id,
+                        )
                     )
-                )
+                else:
+                    old_status = existing_participant.status
+                    old_seat_count = max(1, int(existing_participant.seat_count))
+                    existing_participant.status = "confirmed"
+                    existing_participant.seat_count = normalized_seat_count
+                    if old_status != existing_participant.status or old_seat_count != normalized_seat_count:
+                        transitions.append(
+                            StateTransition(
+                                "game_participant",
+                                f"{game.game_id}:{customer_id}",
+                                f"{old_status}:seats={old_seat_count}",
+                                f"{existing_participant.status}:seats={normalized_seat_count}",
+                                "record_candidate_reply",
+                                trace_id,
+                            )
+                        )
             if game.remaining_seats() == 0 and game.status != GameStatus.READY:
                 old = game.status.value
                 game.status = GameStatus.READY

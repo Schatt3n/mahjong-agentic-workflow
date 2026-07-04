@@ -95,8 +95,10 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "必须继续调用 `create_game`、`search_customers`" in prompt
     assert "然后用候选人结果调用 `create_invite_drafts`" in prompt
     assert "只读工具结果里的 `result.requirement` 是刚刚实际执行的查询条件" in prompt
+    assert "`search_current_games` 的每个匹配结果会带 `join_projection`" in prompt
     assert "不要上一轮按固定时间查询，下一轮建局时改成人齐开" in prompt
     assert "后端会做跨工具参数一致性校验" in prompt
+    assert "一个联系人可能代表多个座位" in prompt
     assert "给候选人的 `message_text` 只写候选人需要知道的公共条件" in prompt
     assert "不要写 `asap_when_full`" in prompt
     assert "`duration_kind=flexible` 表示“时长还没定/打多久还不确定”" in prompt
@@ -105,6 +107,7 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "不要直接说“他是组这个局的人/发起人”" in prompt
     assert "找老板帮忙组局的发起客户/首位玩家" in prompt
     assert "发起客户找老板组局时，默认他本人要打" in prompt
+    assert "`known_players` 里对应客户也要带 `seat_count`" in prompt
     assert "算的，加上你两个，还差两个。" in prompt
     assert "existing_player_ids" in prompt
 
@@ -1338,6 +1341,72 @@ def test_runtime_sqlite_create_game_counts_requester_and_repairs_legacy_payload(
     assert repaired.remaining_seats() == 3
 
 
+def test_runtime_game_participants_can_represent_multiple_seats() -> None:
+    store = seeded_store()
+
+    game, _ = store.create_game(
+        conversation_id="runtime_party_size",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "no_smoke"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥", "seat_count": 1}],
+        trace_id="setup_party_size",
+    )
+    game, _ = store.record_candidate_reply(
+        game_id=game.game_id,
+        customer_id="lin01",
+        display_name="林01",
+        status="accepted",
+        seat_count=2,
+        trace_id="trace_party_size_lin",
+    )
+
+    lin = next(item for item in game.participants if item.customer_id == "lin01")
+    assert lin.seat_count == 2
+    assert game.remaining_seats() == 1
+
+    matches = store.search_current_games(
+        {"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "no_smoke", "seat_count": 1},
+        sender_id="k01",
+        limit=5,
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["game"]["remaining_seats"] == 1
+    assert matches[0]["join_projection"] == {
+        "sender_id": "k01",
+        "sender_already_joined": False,
+        "requested_seats": 1,
+        "remaining_seats_before_join": 1,
+        "remaining_seats_after_join": 0,
+        "would_fill_game": True,
+        "would_overfill_game": False,
+    }
+
+
+def test_runtime_sqlite_preserves_party_size_across_reload(tmp_path) -> None:
+    db_path = tmp_path / "runtime_party_size.sqlite3"
+    store = seeded_store(SQLiteAgentStore(db_path))
+
+    game, _ = store.create_game(
+        conversation_id="runtime_sqlite_party_size",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "no_smoke"},
+        known_players=[{"customer_id": "zhang", "display_name": "张哥", "seat_count": 2}],
+        trace_id="setup_sqlite_party_size",
+    )
+
+    assert next(item for item in game.participants if item.customer_id == "zhang").seat_count == 2
+    assert game.remaining_seats() == 2
+
+    reopened = SQLiteAgentStore(db_path)
+    persisted = reopened.games[game.game_id]
+
+    assert next(item for item in persisted.participants if item.customer_id == "zhang").seat_count == 2
+    assert persisted.remaining_seats() == 2
+
+
 def test_runtime_create_game_requires_explicit_organizer_identity() -> None:
     store = seeded_store()
     client = StaticAgentClient(
@@ -1927,6 +1996,7 @@ def test_runtime_candidate_join_is_traced_and_persisted_as_state_transition(tmp_
                             "customer_id": "ran",
                             "display_name": "冉姐",
                             "status": "accepted",
+                            "seat_count": 2,
                         },
                         "reason": "候选人确认参加，记录状态变化。",
                     }
@@ -1953,6 +2023,8 @@ def test_runtime_candidate_join_is_traced_and_persisted_as_state_transition(tmp_
     )
 
     assert any(item.customer_id == "ran" for item in store.games[game.game_id].participants)
+    assert next(item for item in store.games[game.game_id].participants if item.customer_id == "ran").seat_count == 2
+    assert store.games[game.game_id].remaining_seats() == 1
     participant_transition = next(
         transition
         for transition in result.state_transitions
@@ -1974,6 +2046,9 @@ def test_runtime_candidate_join_is_traced_and_persisted_as_state_transition(tmp_
     ]
     assert len(persisted) == 1
     assert persisted[0].to_status == "confirmed"
+    persisted_game = reopened.games[game.game_id]
+    assert next(item for item in persisted_game.participants if item.customer_id == "ran").seat_count == 2
+    assert persisted_game.remaining_seats() == 1
     assert result.final_reply == "好的，加你进来了。"
 
 

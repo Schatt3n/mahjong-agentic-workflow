@@ -337,16 +337,30 @@ class InMemoryAgentStore:
                 self.badcases.clear()
             return deleted
 
-    def search_current_games(self, requirement: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
+    def search_current_games(
+        self,
+        requirement: dict[str, Any],
+        limit: int = 8,
+        *,
+        sender_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             scored: list[dict[str, Any]] = []
+            requested_seats = seat_count_from_payload(requirement, default=1)
             for game in self.active_games():
                 if game.remaining_seats() <= 0:
                     continue
                 score, reasons = score_requirement(requirement, game.requirement)
                 if requirement and score <= 0:
                     continue
-                scored.append({"game": game.to_dict(), "score": score, "reasons": reasons or ["active_open_game"]})
+                scored.append(
+                    {
+                        "game": game.to_dict(),
+                        "score": score,
+                        "reasons": reasons or ["active_open_game"],
+                        "join_projection": join_projection(game, sender_id=sender_id, requested_seats=requested_seats),
+                    }
+                )
             scored.sort(key=lambda item: item["score"], reverse=True)
             return scored[: int(limit)]
 
@@ -508,39 +522,58 @@ class InMemoryAgentStore:
         customer_id: str,
         display_name: str,
         status: str,
+        seat_count: int = 1,
         trace_id: str,
     ) -> tuple[Game, list[StateTransition]]:
         with self._lock:
             game = self.require_game(game_id)
             transitions: list[StateTransition] = []
             normalized_status = status.strip()
+            normalized_seat_count = max(1, min(4, int(seat_count or 1)))
             for draft in self.invite_drafts.values():
                 if draft.game_id == game_id and draft.customer_id == customer_id:
                     old = draft.status.value
                     draft.status = invite_status_from_candidate_status(normalized_status)
                     draft.updated_at = now()
                     transitions.append(StateTransition("invite_draft", draft.draft_id, old, draft.status.value, "record_candidate_reply", trace_id))
-            if normalized_status in {"accepted", "confirmed", "arrived"} and not any(
-                item.customer_id == customer_id and item.status in {"joined", "confirmed"} for item in game.participants
-            ):
-                game.participants.append(
-                    GameParticipant(
-                        customer_id=customer_id,
-                        display_name=display_name or customer_id,
-                        status="confirmed",
-                        source="candidate_reply",
+            if normalized_status in {"accepted", "confirmed", "arrived"}:
+                existing_participant = next((item for item in game.participants if item.customer_id == customer_id), None)
+                if existing_participant is None:
+                    game.participants.append(
+                        GameParticipant(
+                            customer_id=customer_id,
+                            display_name=display_name or customer_id,
+                            status="confirmed",
+                            source="candidate_reply",
+                            seat_count=normalized_seat_count,
+                        )
                     )
-                )
-                transitions.append(
-                    StateTransition(
-                        "game_participant",
-                        f"{game.game_id}:{customer_id}",
-                        None,
-                        "confirmed",
-                        "record_candidate_reply",
-                        trace_id,
+                    transitions.append(
+                        StateTransition(
+                            "game_participant",
+                            f"{game.game_id}:{customer_id}",
+                            None,
+                            "confirmed",
+                            "record_candidate_reply",
+                            trace_id,
+                        )
                     )
-                )
+                else:
+                    old_status = existing_participant.status
+                    old_seat_count = max(1, int(existing_participant.seat_count))
+                    existing_participant.status = "confirmed"
+                    existing_participant.seat_count = normalized_seat_count
+                    if old_status != existing_participant.status or old_seat_count != normalized_seat_count:
+                        transitions.append(
+                            StateTransition(
+                                "game_participant",
+                                f"{game.game_id}:{customer_id}",
+                                f"{old_status}:seats={old_seat_count}",
+                                f"{existing_participant.status}:seats={normalized_seat_count}",
+                                "record_candidate_reply",
+                                trace_id,
+                            )
+                        )
             if game.remaining_seats() == 0 and game.status != GameStatus.READY:
                 old = game.status.value
                 game.status = GameStatus.READY
@@ -727,12 +760,21 @@ def normalize_game_participants(
 
     requester_id = str(organizer_id or "").strip()
     if requester_id:
+        requester_payload = next(
+            (
+                item
+                for item in known_players
+                if isinstance(item, dict) and str(item.get("customer_id") or "").strip() == requester_id
+            ),
+            {},
+        )
         participants.append(
             GameParticipant(
                 customer_id=requester_id,
                 display_name=str(organizer_name or requester_id),
                 status="joined",
                 source="requester",
+                seat_count=seat_count_from_payload(requester_payload, default=1),
             )
         )
         seen.add(requester_id)
@@ -749,10 +791,42 @@ def normalize_game_participants(
                 display_name=str(item.get("display_name") or customer_id),
                 status=str(item.get("status") or "joined"),
                 source=str(item.get("source") or "participant"),
+                seat_count=seat_count_from_payload(item, default=1),
             )
         )
         seen.add(customer_id)
     return participants
+
+
+def seat_count_from_payload(payload: dict[str, Any], *, default: int = 1) -> int:
+    for key in ("seat_count", "seats", "party_size", "player_count", "current_player_count", "known_player_count"):
+        value = payload.get(key)
+        if is_blank_value(value):
+            continue
+        try:
+            return max(1, min(4, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return max(1, min(4, int(default or 1)))
+
+
+def join_projection(game: Game, *, sender_id: str | None, requested_seats: int = 1) -> dict[str, Any]:
+    already_joined = bool(
+        sender_id
+        and any(item.customer_id == sender_id and item.status in {"joined", "confirmed"} for item in game.participants)
+    )
+    remaining_before = game.remaining_seats()
+    seats_to_add = 0 if already_joined else max(1, min(4, int(requested_seats or 1)))
+    remaining_after = max(0, remaining_before - seats_to_add)
+    return {
+        "sender_id": sender_id,
+        "sender_already_joined": already_joined,
+        "requested_seats": seats_to_add,
+        "remaining_seats_before_join": remaining_before,
+        "remaining_seats_after_join": remaining_after,
+        "would_fill_game": remaining_before > 0 and remaining_after == 0,
+        "would_overfill_game": seats_to_add > remaining_before,
+    }
 
 
 def first_present_value(payload: dict[str, Any], *keys: str) -> Any:

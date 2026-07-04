@@ -234,6 +234,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             "display_name": non_empty_string,
             "status": {"type": "string"},
             "source": {"type": "string"},
+            "seat_count": {"type": "integer", "minimum": 1, "maximum": 4},
         },
     }
     invitation_schema = {
@@ -286,7 +287,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
 
     def search_current_games(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
         requirement = dict(call.arguments.get("requirement") or {})
-        matches = store.search_current_games(requirement, limit=int(call.arguments.get("limit") or 8))
+        matches = store.search_current_games(requirement, limit=int(call.arguments.get("limit") or 8), sender_id=sender_id)
         return ToolResult(name=call.name, called=True, allowed=True, result={"requirement": requirement, "matches": matches})
 
     def search_customers(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
@@ -337,6 +338,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             customer_id=str(call.arguments["customer_id"]),
             display_name=str(call.arguments["display_name"]),
             status=str(call.arguments["status"]),
+            seat_count=int(call.arguments.get("seat_count") or 1),
             trace_id=trace_id,
         )
         return ToolResult(name=call.name, called=True, allowed=True, result={"game": game.to_dict()}, state_transitions=transitions)
@@ -438,7 +440,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         ),
         "record_candidate_reply": ToolDefinition(
             "record_candidate_reply",
-            "记录候选人反馈并推进受控状态。",
+            "记录候选人反馈并推进受控状态。若候选人表示“我这边两个人/我们3个”，模型必须把代表座位数写入 seat_count。",
             "medium",
             "state_write",
             {
@@ -450,6 +452,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
                     "customer_id": non_empty_string,
                     "display_name": non_empty_string,
                     "status": {"type": "string", "enum": CANDIDATE_REPLY_STATUSES},
+                    "seat_count": {"type": "integer", "minimum": 1, "maximum": 4},
                 },
             },
             record_candidate_reply,
