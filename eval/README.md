@@ -20,7 +20,7 @@
 - 发现系统回复明显不对：先写入 `badcases/badcases.jsonl`。
 - 发现真实老板表达方式很常见，但当前评估集没有覆盖：写入 `badcases/badcases.jsonl`，修复后提升到 `golden/scenario_golden.jsonl` 或 `regression/`。
 - 修复一个 badcase 后：把稳定预期整理成 golden case，并保留原 badcase 的 `source_scenario_id` 或备注。
-- 标记 `triage_status=fixed` 的 badcase 必须补 `regression_refs`，指向 `boss_trial_golden`、`scenario_golden`、`controlled_workflow_regression`、`agent_runtime_regression` 或具体 `pytest` 用例；legacy 参考评估入口会运行 `scripts/check_badcase_regression_coverage.py` 审计这些引用，防止 fixed badcase 只停留在日志里。
+- 标记 `triage_status=fixed` 的 badcase 必须补 `regression_refs`，指向 `boss_trial_golden`、`scenario_golden`、`real_owner_chat_golden`、`controlled_workflow_regression`、`agent_runtime_regression`、`agent_runtime_v2_regression`、`live_eval` 或具体 `pytest` 用例；当前主链路默认入口会运行 `scripts/check_badcase_regression_coverage.py` 审计这些引用，并且任何未闭环 badcase 都会让评估失败，防止问题只停留在日志里。
 - 新增玩法、规则、通道、状态机能力时：同步补 golden case，避免后续改坏。
 - 发现“页面建议回复/老板话术/候选展示”这类试用台问题：先写入 `badcases/badcases.jsonl`，修复后补到 `golden/boss_trial_golden.jsonl`，并让 `scripts/run_tests.py` 跑过。
 - 老板确认某句回复“像我会说的话”：写入 `few_shot_examples.jsonl`，用于改善后续回复风格。
@@ -83,7 +83,7 @@ PYTHONPATH=src python scripts/run_agent_runtime_v2_eval.py
 PYTHONPATH=src python scripts/run_evals.py
 ```
 
-`run_evals.py` 默认只运行当前主链路的边界检查、Agent Runtime regression 和主链路 pytest。V2、受控 workflow 和旧 trial 相关评估不再混入默认入口。
+`run_evals.py` 默认运行当前主链路的边界检查、fixed badcase 闭环审计、Agent Runtime regression 和主链路 pytest。V2、受控 workflow 和旧 trial 相关评估不再混入默认入口。
 
 运行真实模型 live 评估：
 
@@ -97,7 +97,9 @@ MAHJONG_LLM_PROVIDER=deepseek MAHJONG_LLM_MODEL=deepseek-v4-flash DEEPSEEK_API_K
 MAHJONG_LLM_PROVIDER=deepseek MAHJONG_LLM_MODEL=deepseek-v4-flash DEEPSEEK_API_KEY=*** PYTHONPATH=src python scripts/run_evals.py --live-real-owner
 ```
 
-`run_real_owner_chat_live_eval.py` 会用真实老板聊天里的补充事实构造一个现场：老客户默认 0.5、一人、无烟，当前池里有一个七点三缺一。它会实际调用模型，检查主链路是否先调用 `search_current_games`，并验证最终回复是否接近“七点三缺一，可以不”这类老板式短句。没有配置模型环境变量时脚本会跳过，不影响默认回归。
+`run_real_owner_chat_live_eval.py` 会用真实老板聊天里的补充事实构造一组现场，并实际调用模型验证主链路是否像真人老板一样处理。当前覆盖 9 类高价值场景：老客户画像默认补槽后先查当前局池、追问公开昵称但不泄露私有备注、用户回复“也可以”后确认加入并把局推到人齐、5 小时时长冲突、4 小时时长限制写入上下文、AI/运营闲聊不污染组局状态、长闲聊后恢复局况查询、再次询问人数、拒绝非无烟局并沉淀偏好。
+
+如果通过 `--report-path` 写入报告，会生成完整 JSON 结果，默认总评估的 live 模式会写到 `runtime_data/real_owner_chat_live_eval_report.json`。报告里包含每个场景的最终回复、工具调用、trace step 和检查项，便于复盘“是否真的像老板”和“是否真的调用了正确工具”。没有配置模型环境变量时脚本会跳过，不影响默认回归。
 
 运行 legacy/reference 评估：
 
