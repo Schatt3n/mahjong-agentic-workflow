@@ -83,6 +83,26 @@ def test_real_owner_chat_supplement_captures_profile_defaults_and_privacy_bounda
     assert "老板微信备注" in people_case["expected"]["forbidden_reply_content"]
 
 
+def test_real_owner_chat_supplement_pins_duration_exit_and_human_style() -> None:
+    supplement = next(item for item in read_records() if item["kind"] == "real_owner_chat_eval_supplement")
+    eval_cases = {item["id"]: item for item in supplement["eval_cases"]}
+    facts = {item["id"]: item for item in supplement["business_facts"]}
+
+    assert "group_invite_then_duration_mismatch" in facts
+    assert "客户拒绝并退群" in facts["group_invite_then_duration_mismatch"]["fact"]
+
+    duration_case = eval_cases["group_duration_mismatch_records_exit"]
+    assert duration_case["expected"]["intent"] == "decline_current_group_due_duration"
+    assert "max_duration_hours=4" in duration_case["expected"]["profile_updates"]
+    assert "customer_removed_or_not_joined_current_group" in duration_case["expected"]["state_updates"]
+    assert "5小时局" in duration_case["expected"]["forbidden_next_recommendation"]
+
+    style_case = eval_cases["human_likeness_reply_should_be_short_and_decision_focused"]
+    assert "七点三缺一，可以不" in style_case["expected"]["good_examples"]
+    assert "还没有，还差俩" in style_case["expected"]["good_examples"]
+    assert "根据您的画像和当前局池，我找到一个0.5无烟局" in style_case["expected"]["bad_examples"]
+
+
 def test_real_owner_chat_agent_flow_uses_profile_defaults_to_query_pool() -> None:
     store = InMemoryAgentStore()
     store.upsert_customer(
