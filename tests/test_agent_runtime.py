@@ -167,6 +167,9 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "matched_result_summaries" in prompt
     assert "previous_tool_results[].result.next_step_policy" in prompt
     assert "requires_explicit_user_request_to_search_alternatives=true" in prompt
+    assert "同一个 `tool_calls` 数组也要遵守上面的边界" in prompt
+    assert "只是拒绝原因和画像更新，不等于主动要求你继续找替代局" in prompt
+    assert "即使客户先提到“大模型/AI/机器人/系统”等词" in prompt
     assert "`requirement.user_visible_summary`" in prompt
     assert "不要重新把历史消息里的 `371/272/173`" in prompt
     assert "如果包含时间、局名/公开昵称、缺口短码或下一步确认问题" in prompt
@@ -501,6 +504,8 @@ def test_runtime_customer_visible_text_generation_prompt_defines_boss_tone_and_v
     assert "不得为了变短而删除原文里的决策事实" in prompt
     assert "时间、公开昵称/群昵称、人数、缺口短码" in prompt
     assert "semantic_preserved" in prompt
+    assert "不要输出或保留系统身份/实现词" in prompt
+    assert "即使这些词来自用户原文" in prompt
     assert "不要把“有个1块有烟人齐开的局”改成“有个173”" in prompt
     assert "`stake=1`、`1`、`1.0` 在明显表示档位时说成“1块”" in prompt
     assert "把1改成1块" in prompt or "把 1 改成 1块" in prompt

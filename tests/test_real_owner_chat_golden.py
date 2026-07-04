@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from mahjong_agent_runtime import (
     StaticAgentClient,
     UserMessage,
 )
+from mahjong_agent_runtime.env import load_dotenv_defaults
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,6 +198,33 @@ def test_real_owner_chat_agent_flow_uses_profile_defaults_to_query_pool() -> Non
     assert "无烟" not in result.final_reply
 
 
+def test_runtime_dotenv_loader_uses_defaults_without_overriding_existing_values(tmp_path, monkeypatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# local secrets",
+                "MAHJONG_LLM_MODEL=deepseek-v4-flash",
+                "DEEPSEEK_API_KEY='from-file'",
+                "EXISTING_VALUE=from-file",
+                "INVALID_LINE",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXISTING_VALUE", "from-env")
+    monkeypatch.delenv("MAHJONG_LLM_MODEL", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    loaded = load_dotenv_defaults(env_file)
+
+    assert loaded == {"MAHJONG_LLM_MODEL": "deepseek-v4-flash", "DEEPSEEK_API_KEY": "from-file"}
+    assert "INVALID_LINE" not in loaded
+    assert os.environ["MAHJONG_LLM_MODEL"] == "deepseek-v4-flash"
+    assert os.environ["DEEPSEEK_API_KEY"] == "from-file"
+    assert os.environ["EXISTING_VALUE"] == "from-env"
+
+
 def test_real_owner_chat_live_eval_skips_without_llm_env(monkeypatch, capsys) -> None:
     for name in ("MAHJONG_LLM_API_KEY", "DEEPSEEK_API_KEY", "MAHJONG_LLM_MODEL"):
         monkeypatch.delenv(name, raising=False)
@@ -207,7 +236,7 @@ def test_real_owner_chat_live_eval_skips_without_llm_env(monkeypatch, capsys) ->
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
-    exit_code = module.main([])
+    exit_code = module.main(["--no-dotenv"])
 
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -286,7 +315,7 @@ def test_real_owner_live_eval_duration_limit_scenario_requires_checkpoint(tmp_pa
     assert scenario.required_tool_names == ["update_context_checkpoint"]
     assert "search_current_games" in scenario.forbidden_tool_names
     assert "create_game" in scenario.forbidden_tool_names
-    assert scenario.expected_checkpoint_contains == ["4", "时长"]
+    assert scenario.expected_checkpoint_contains == ["4", "duration_hours"]
 
     store = module.SQLiteAgentStore(tmp_path / "duration_limit.sqlite3")
     module.setup_duration_limit_update(store)

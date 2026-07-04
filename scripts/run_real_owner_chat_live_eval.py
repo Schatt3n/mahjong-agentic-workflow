@@ -23,6 +23,7 @@ from mahjong_agent_runtime import (  # noqa: E402
     ToolGateway,
     UserMessage,
 )
+from mahjong_agent_runtime.env import load_dotenv_defaults  # noqa: E402
 
 
 DEFAULT_DB_PATH = ROOT / "runtime_data" / "real_owner_chat_live_eval.sqlite3"
@@ -517,7 +518,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 "needed_seats": 2,
                 "user_visible_summary": "还没有，还差俩",
             },
-            expected_checkpoint_contains=["4", "时长"],
+            expected_checkpoint_contains=["4", "duration_hours"],
         ),
         LiveEvalScenario(
             scenario_id="casual_chat_should_not_pollute_business_state",
@@ -786,8 +787,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-calls-per-turn", type=int, default=8)
     parser.add_argument("--max-tokens-per-call", type=int, default=int(os.getenv("MAHJONG_AGENT_MAX_TOKENS_PER_CALL", "24000")))
     parser.add_argument("--timeout-seconds", type=float, default=float(os.getenv("MAHJONG_AGENT_LLM_TIMEOUT_SECONDS", "45")))
+    parser.add_argument("--dotenv-path", type=pathlib.Path, default=ROOT / ".env")
+    parser.add_argument("--no-dotenv", action="store_true", help="do not load local .env before resolving LLM config")
     args = parser.parse_args(argv)
 
+    if not args.no_dotenv:
+        load_dotenv_defaults(args.dotenv_path)
     client = OpenAICompatibleAgentClient.from_env()
     if client is None:
         print_json(
