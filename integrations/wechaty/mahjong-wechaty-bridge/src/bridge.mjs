@@ -22,6 +22,37 @@ const forwardSelfMessages = process.env.MAHJONG_WECHATY_FORWARD_SELF
   : true
 const knownContacts = new Map()
 const recentOutboundSignatures = new Map()
+const blockedCustomerVisibleTerms = [
+  'agent',
+  'ai',
+  'llm',
+  'prompt',
+  'trace',
+  'idempotency',
+  'tool',
+  'runtime',
+  'debug',
+  'wechaty',
+  'bridge',
+  '智能助手',
+  '大模型',
+  '模型',
+  '机器人',
+  '系统',
+  '系统账号',
+  '后台',
+  '工具',
+  '提示词',
+  '审批',
+  '草稿',
+  '待审批',
+  '日志',
+  '数据库',
+  '幂等',
+  '测试通道',
+  '测试账号',
+  '个人微信测试',
+]
 
 function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase())
@@ -58,6 +89,19 @@ function primitive(value) {
 function cleanText(value) {
   const text = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim()
   return text
+}
+
+function customerVisibleTextViolations(text) {
+  const clean = cleanText(text)
+  const lower = clean.toLowerCase()
+  const hits = []
+  for (const term of blockedCustomerVisibleTerms) {
+    const needle = term.toLowerCase()
+    if (lower.includes(needle)) {
+      hits.push(term)
+    }
+  }
+  return [...new Set(hits)]
 }
 
 function parseContactAliases(raw) {
@@ -364,6 +408,10 @@ async function sendContactText(target, text) {
   if (!finalText) {
     throw new Error('missing text')
   }
+  const violations = customerVisibleTextViolations(finalText)
+  if (violations.length) {
+    throw new Error('customer visible text contains internal implementation terms')
+  }
   const contact = await resolveContact(target)
   await contact.say(finalText)
   const contactId = primitive(contact.id)
@@ -530,6 +578,10 @@ bot.on('message', async (message) => {
     )
     const finalReply = result?.route_result?.agent_result?.final_reply
     if (sendChannelEnabled && autoSendReplyEnabled && finalReply) {
+      if (customerVisibleTextViolations(finalReply).length) {
+        console.log(`[${nowText()}] skipped auto-send because reply contains internal implementation terms trace_id=${result.trace_id || '-'}`)
+        return
+      }
       await message.say(finalReply)
       markOutboundSignature(payload.conversation_id, finalReply)
       console.log(`[${nowText()}] auto-sent reply trace_id=${result.trace_id || '-'} text=${finalReply}`)

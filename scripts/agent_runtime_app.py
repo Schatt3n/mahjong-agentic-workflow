@@ -1178,11 +1178,11 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
   <button class="danger" onclick="resetState()">清空状态和记忆</button>
   <h2>结果</h2>
   <pre id="output"></pre>
-  <h2>微信测试外发</h2>
-  <p><input id="wechatTarget" value="xml31323" placeholder="微信号、备注名、昵称或 Wechaty contact id"></p>
-  <p><textarea id="wechatText" placeholder="默认会填入上一轮 Agent final_reply"></textarea></p>
-  <button onclick="sendWechatText()">手动发给微信联系人</button>
-  <button class="secondary" onclick="loadWechatBridgeStatus()">Wechaty bridge 状态</button>
+  <h2>微信手动发送</h2>
+  <p><input id="wechatTarget" value="xml31323" placeholder="微信号、备注名、昵称或联系人ID"></p>
+  <p><textarea id="wechatText" placeholder="默认会填入上一轮建议回复"></textarea></p>
+  <button onclick="sendWechatText()">发送给微信联系人</button>
+  <button class="secondary" onclick="loadWechatChannelStatus()">微信通道状态</button>
   <button class="danger" onclick="setWechatSendChannel(false)">暂停微信发送总闸</button>
   <button class="secondary" onclick="setWechatSendChannel(true)">开启微信发送总闸</button>
   <button class="danger" onclick="setWechatAutoSend(false)">暂停自动外发</button>
@@ -1268,16 +1268,22 @@ async function loadWechatyRaw(){
   const data = await res.json();
   wechatyRaw.textContent = JSON.stringify(data, null, 2);
 }
-async function loadWechatBridgeStatus(){
+async function loadWechatChannelStatus(){
   try{
     const res = await fetch(`${WECHATY_OUTBOUND_BASE}/health`);
-    wechatSendOutput.textContent = JSON.stringify(await res.json(), null, 2);
+    const data = await res.json();
+    wechatSendOutput.textContent = JSON.stringify({
+      ok: data.ok,
+      send_channel_enabled: data.send_channel_enabled,
+      auto_send_reply: data.auto_send_reply,
+      known_contact_count: data.known_contact_count
+    }, null, 2);
   }catch(err){
-    wechatSendOutput.textContent = 'Wechaty bridge 外发口不可用：' + err;
+    wechatSendOutput.textContent = '微信发送通道不可用：' + err;
   }
 }
 async function setWechatAutoSend(enabled){
-  const ok = confirm(enabled ? '确认开启 Wechaty 自动外发？' : '确认暂停 Wechaty 自动外发？');
+  const ok = confirm(enabled ? '确认开启自动外发？' : '确认暂停自动外发？');
   if(!ok) return;
   try{
     const res = await fetch(`${WECHATY_OUTBOUND_BASE}/auto-send`,{
