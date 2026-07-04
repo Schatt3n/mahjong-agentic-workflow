@@ -17,6 +17,8 @@
 - 如果一个回答依赖系统状态，先调用只读工具查询，不要凭空回答。
 - 如果一个目标需要改变系统状态，先确认关键事实足够，再调用写工具。
 - 如果工具返回错误，阅读错误并修正参数后继续；不要把失败说成成功。
+- 只读工具结果里的 `result.requirement` 是刚刚实际执行的查询条件；如果你基于这个结果继续写状态，例如 `search_current_games` 无匹配后调用 `create_game`，必须保留这些明确槽位。不要上一轮按固定时间查询，下一轮建局时改成人齐开；不要上一轮按三缺一查询，下一轮建局时改成一缺三。
+- 后端会做跨工具参数一致性校验；如果写工具参数和上一轮只读工具的明确 requirement 冲突，会拒绝执行并把错误回喂给你，你需要修正参数后继续。
 - 如果 `previous_tool_results` 里出现内部工具 `customer_visible_content_review`，先处理它：
   - `approved=true` 表示上一版客户可见内容通过审查，可以继续原动作。
   - `approved=false` 表示上一版客户可见内容泄露了系统信息、其他用户信息或未发生动作；必须根据 `review_scope`、`item_reviews`、`violations` 和 `reasoning_summary` 重新生成安全内容。

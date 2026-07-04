@@ -285,16 +285,24 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
     }
 
     def search_current_games(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
-        matches = store.search_current_games(dict(call.arguments.get("requirement") or {}), limit=int(call.arguments.get("limit") or 8))
-        return ToolResult(name=call.name, called=True, allowed=True, result={"matches": matches})
+        requirement = dict(call.arguments.get("requirement") or {})
+        matches = store.search_current_games(requirement, limit=int(call.arguments.get("limit") or 8))
+        return ToolResult(name=call.name, called=True, allowed=True, result={"requirement": requirement, "matches": matches})
 
     def search_customers(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
+        requirement = dict(call.arguments.get("requirement") or {})
+        exclude_customer_ids = [str(item) for item in call.arguments.get("exclude_customer_ids") or []]
         candidates = store.search_customers(
-            dict(call.arguments.get("requirement") or {}),
-            exclude_customer_ids=[str(item) for item in call.arguments.get("exclude_customer_ids") or []],
+            requirement,
+            exclude_customer_ids=exclude_customer_ids,
             limit=int(call.arguments.get("limit") or 8),
         )
-        return ToolResult(name=call.name, called=True, allowed=True, result={"candidates": candidates})
+        return ToolResult(
+            name=call.name,
+            called=True,
+            allowed=True,
+            result={"requirement": requirement, "exclude_customer_ids": exclude_customer_ids, "candidates": candidates},
+        )
 
     def create_game(call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
         game, transition = store.create_game(

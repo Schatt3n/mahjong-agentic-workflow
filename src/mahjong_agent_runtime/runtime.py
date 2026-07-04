@@ -234,8 +234,42 @@ class AgentRuntime:
                     if not customer_visible_content_review_approved(review_result):
                         pending_tool_results = [review_result]
                         continue
+                previous_step_tool_results = list(pending_tool_results)
                 pending_tool_results = []
+                blocked_by_consistency = False
                 for call_index, call in enumerate(action.tool_calls, start=1):
+                    consistency_error = validate_tool_call_consistency(call, previous_step_tool_results + pending_tool_results)
+                    if consistency_error:
+                        reference_requirement = latest_read_requirement(
+                            previous_step_tool_results + pending_tool_results,
+                            tool_name="search_current_games",
+                        )
+                        result = ToolResult(
+                            name=call.name,
+                            called=False,
+                            allowed=False,
+                            result={
+                                "instruction": (
+                                    "Fix the tool arguments and call the tool again. Preserve explicit requirement fields "
+                                    "from previous read-only tool results unless the user has clearly changed them."
+                                ),
+                                "call": call.to_dict(),
+                                "reference_tool_name": "search_current_games",
+                                "reference_requirement": reference_requirement or {},
+                            },
+                            error=consistency_error,
+                        )
+                        tool_results.append(result)
+                        pending_tool_results.append(result)
+                        self.trace_recorder.record(
+                            trace_id,
+                            "tool_argument_consistency_error",
+                            {"call": call.to_dict(), "error": consistency_error, "step_index": step_index},
+                            level="WARN",
+                        )
+                        self.trace_recorder.record(trace_id, "tool_result", result.to_dict(), level="WARN")
+                        blocked_by_consistency = True
+                        break
                     self.trace_recorder.record(trace_id, "tool_called", {"call": call.to_dict(), "step_index": step_index})
                     result = self.tool_gateway.execute(
                         call,
@@ -253,6 +287,8 @@ class AgentRuntime:
                         step = "state_transition_replayed" if result.deduplicated else "state_transition"
                         self.trace_recorder.record(trace_id, step, transition.to_dict())
                 self.store.append_tool_turn(message.conversation_id, json.dumps([item.to_dict() for item in pending_tool_results], ensure_ascii=False), trace_id)
+                if blocked_by_consistency:
+                    self.trace_recorder.record(trace_id, "tool_argument_consistency_feedback", {"results": [item.to_dict() for item in pending_tool_results]}, level="WARN")
                 continue
 
             proposed_reply = action.reply_to_user.strip()
@@ -563,6 +599,66 @@ def customer_visible_content_review_approved(result: ToolResult) -> bool:
         and result.error is None
         and bool(result.result.get("approved"))
     )
+
+
+CONSISTENT_REQUIREMENT_FIELDS = (
+    "game_type",
+    "stake",
+    "smoke_preference",
+    "start_time_kind",
+    "start_time",
+    "duration_kind",
+    "duration_hours",
+    "known_player_count",
+    "needed_seats",
+)
+
+
+def validate_tool_call_consistency(call: Any, previous_tool_results: list[ToolResult]) -> str | None:
+    if getattr(call, "name", "") != "create_game":
+        return None
+    current_requirement = call.arguments.get("requirement") if isinstance(call.arguments, dict) else None
+    if not isinstance(current_requirement, dict):
+        return None
+    reference_requirement = latest_read_requirement(previous_tool_results, tool_name="search_current_games")
+    if not reference_requirement:
+        return None
+    mismatches: list[str] = []
+    for field in CONSISTENT_REQUIREMENT_FIELDS:
+        expected = normalized_requirement_value(reference_requirement.get(field))
+        if expected in {None, ""}:
+            continue
+        actual = normalized_requirement_value(current_requirement.get(field))
+        if actual != expected:
+            mismatches.append(f"{field}: expected {expected!r} from previous search_current_games, got {actual!r}")
+    if not mismatches:
+        return None
+    return (
+        "tool argument consistency violation: create_game.requirement conflicts with previous "
+        "search_current_games.requirement; " + "; ".join(mismatches)
+    )
+
+
+def latest_read_requirement(previous_tool_results: list[ToolResult], *, tool_name: str) -> dict[str, Any] | None:
+    for result in reversed(previous_tool_results):
+        if result.result.get("reference_tool_name") == tool_name and isinstance(result.result.get("reference_requirement"), dict):
+            return result.result["reference_requirement"]
+        if result.name != tool_name or not result.called or not result.allowed:
+            continue
+        requirement = result.result.get("requirement")
+        if isinstance(requirement, dict):
+            return requirement
+    return None
+
+
+def normalized_requirement_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [normalized_requirement_value(item) for item in value]
+    return value
 
 
 def customer_visible_items_for_action(action: AgentAction) -> list[dict[str, Any]]:

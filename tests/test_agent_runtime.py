@@ -94,6 +94,9 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "不要只回复“留意/看看/帮你问问”就停止" in prompt
     assert "必须继续调用 `create_game`、`search_customers`" in prompt
     assert "然后用候选人结果调用 `create_invite_drafts`" in prompt
+    assert "只读工具结果里的 `result.requirement` 是刚刚实际执行的查询条件" in prompt
+    assert "不要上一轮按固定时间查询，下一轮建局时改成人齐开" in prompt
+    assert "后端会做跨工具参数一致性校验" in prompt
     assert "给候选人的 `message_text` 只写候选人需要知道的公共条件" in prompt
     assert "不要写 `asap_when_full`" in prompt
     assert "`duration_kind=flexible` 表示“时长还没定/打多久还不确定”" in prompt
@@ -1380,6 +1383,120 @@ def test_runtime_create_game_requires_explicit_organizer_identity() -> None:
     second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
     assert second_prompt["previous_tool_results"][0]["error"] == "missing required argument: organizer_id"
     assert result.final_reply == "我先确认一下。"
+
+
+def test_runtime_create_game_must_preserve_previous_search_requirement() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="先按用户明确条件查询现有局。",
+                tool_calls=[
+                    {
+                        "name": "search_current_games",
+                        "arguments": {
+                            "requirement": {
+                                "game_type": "hangzhou_mahjong",
+                                "stake": "0.5",
+                                "smoke_preference": "no_smoke",
+                                "start_time_kind": "scheduled",
+                                "start_time": "16:00",
+                                "known_player_count": 3,
+                                "needed_seats": 1,
+                            }
+                        },
+                        "reason": "用户说四点0.5财敲173无烟，先查有没有匹配局。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="无匹配局后创建新局，但错误丢失了固定时间和人数。",
+                tool_calls=[
+                    {
+                        "name": "create_game",
+                        "arguments": {
+                            "requirement": {
+                                "game_type": "hangzhou_mahjong",
+                                "stake": "0.5",
+                                "smoke_preference": "no_smoke",
+                                "start_time_kind": "asap_when_full",
+                                "known_player_count": 1,
+                                "needed_seats": 3,
+                                "user_visible_summary": "四点0.5财敲173无烟",
+                            },
+                            "organizer_id": "zhang",
+                            "organizer_name": "张哥",
+                            "known_players": [{"customer_id": "zhang", "display_name": "张哥"}],
+                        },
+                        "reason": "创建待组局记录。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="后端返回一致性错误后，保留上一轮查询的明确条件重新创建。",
+                tool_calls=[
+                    {
+                        "name": "create_game",
+                        "arguments": {
+                            "requirement": {
+                                "game_type": "hangzhou_mahjong",
+                                "stake": "0.5",
+                                "smoke_preference": "no_smoke",
+                                "start_time_kind": "scheduled",
+                                "start_time": "16:00",
+                                "known_player_count": 3,
+                                "needed_seats": 1,
+                                "user_visible_summary": "四点0.5财敲173无烟",
+                            },
+                            "organizer_id": "zhang",
+                            "organizer_name": "张哥",
+                            "known_players": [{"customer_id": "zhang", "display_name": "张哥"}],
+                        },
+                        "reason": "修正工具参数，保留四点和173。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="completed",
+                reasoning_summary="已按修正后的条件创建。",
+                reply_to_user="好，我帮你问问，有消息跟你说。",
+            ),
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_requirement_consistency",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="四点0.5财敲173无烟",
+            message_id="msg_runtime_requirement_consistency",
+        ),
+        trace_id="trace_requirement_consistency",
+    )
+
+    assert result.final_reply == "好，我帮你问问，有消息跟你说。"
+    assert [item.name for item in result.tool_results] == ["search_current_games", "create_game", "create_game"]
+    assert result.tool_results[0].result["requirement"]["start_time"] == "16:00"
+    assert result.tool_results[1].called is False
+    assert result.tool_results[1].allowed is False
+    assert "tool argument consistency violation" in (result.tool_results[1].error or "")
+    assert result.tool_results[1].result["reference_requirement"]["start_time_kind"] == "scheduled"
+    assert result.tool_results[2].called is True
+    game = next(iter(store.games.values()))
+    assert game.requirement["start_time_kind"] == "scheduled"
+    assert game.requirement["start_time"] == "16:00"
+    assert game.requirement["known_player_count"] == 3
+    assert game.requirement["needed_seats"] == 1
+    third_prompt = json.loads(client.calls[2]["messages"][1]["content"])
+    assert third_prompt["previous_tool_results"][0]["result"]["reference_requirement"]["start_time"] == "16:00"
+    steps = trace_steps(trace.get_trace("trace_requirement_consistency"))
+    assert "tool_argument_consistency_error" in steps
 
 
 def test_runtime_tool_schema_rejects_empty_critical_strings_without_backend_defaults() -> None:
