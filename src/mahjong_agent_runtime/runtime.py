@@ -102,7 +102,41 @@ class AgentRuntime:
                 )
                 self.trace_recorder.record(actual_trace_id, "final_output", {"reply": cached.final_reply, "reason": "message_deduplicated"})
                 return cached
-            result = self._handle_once(message, trace_id=actual_trace_id)
+            run_id = f"run_{uuid.uuid4().hex[:12]}"
+            run_version, version_transition = self.store.advance_conversation_version(
+                message.conversation_id,
+                trace_id=actual_trace_id,
+                reason="user_message_received",
+            )
+            superseded_counts, superseded_transitions = self.store.supersede_pending_outputs(
+                message.conversation_id,
+                sender_id=message.sender_id,
+                trace_id=actual_trace_id,
+                reason="new_user_message_superseded_previous_pending_output",
+            )
+            self.trace_recorder.record(
+                actual_trace_id,
+                "conversation_version_advanced",
+                {
+                    "conversation_id": message.conversation_id,
+                    "run_id": run_id,
+                    "run_version": run_version,
+                    "transition": version_transition.to_dict(),
+                },
+            )
+            self.trace_recorder.record(
+                actual_trace_id,
+                "pending_outputs_superseded",
+                {
+                    "conversation_id": message.conversation_id,
+                    "run_id": run_id,
+                    "run_version": run_version,
+                    "counts": superseded_counts,
+                    "transitions": [item.to_dict() for item in superseded_transitions],
+                },
+            )
+            result = self._handle_once(message, trace_id=actual_trace_id, run_id=run_id, run_version=run_version)
+            result.state_transitions = [version_transition, *superseded_transitions, *result.state_transitions]
             if self.context_summary_manager is not None:
                 try:
                     summary_result = self.context_summary_manager.maybe_summarize_after_turn(
@@ -121,7 +155,7 @@ class AgentRuntime:
             self.store.remember_message_result(message_key, result)
             return result
 
-    def _handle_once(self, message: UserMessage, *, trace_id: str) -> AgentRuntimeResult:
+    def _handle_once(self, message: UserMessage, *, trace_id: str, run_id: str, run_version: int) -> AgentRuntimeResult:
         turn_budget = TokenBudget(
             max_tokens_per_call=self.token_budget.max_tokens_per_call,
             max_calls_per_turn=self.token_budget.max_calls_per_turn,
@@ -142,7 +176,13 @@ class AgentRuntime:
         final_reply = ""
 
         for step_index in range(1, self.max_steps + 1):
-            built = self.context_builder.build(message, trace_id=trace_id, previous_tool_results=pending_tool_results)
+            built = self.context_builder.build(
+                message,
+                trace_id=trace_id,
+                previous_tool_results=pending_tool_results,
+                run_id=run_id,
+                run_version=run_version,
+            )
             self.trace_recorder.record(trace_id, "context_packed", built.audit)
             self.trace_recorder.record(trace_id, "context_built", built.payload)
             self.trace_recorder.record(trace_id, "llm_prompt", {"messages": built.messages, "step_index": step_index})
@@ -151,7 +191,13 @@ class AgentRuntime:
             if not budget.allowed:
                 final_reply = "这个我先转人工确认一下。"
                 self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "reason": budget.reason}, level="WARN")
-                self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
+                self._append_pending_assistant_turn(
+                    message.conversation_id,
+                    final_reply,
+                    trace_id,
+                    run_id=run_id,
+                    run_version=run_version,
+                )
                 break
 
             started = time.perf_counter()
@@ -166,7 +212,13 @@ class AgentRuntime:
                     level="ERROR",
                 )
                 self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "reason": "llm_error"}, level="WARN")
-                self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
+                self._append_pending_assistant_turn(
+                    message.conversation_id,
+                    final_reply,
+                    trace_id,
+                    run_id=run_id,
+                    run_version=run_version,
+                )
                 break
             self.trace_recorder.record(
                 trace_id,
@@ -237,6 +289,7 @@ class AgentRuntime:
                 previous_step_tool_results = list(pending_tool_results)
                 pending_tool_results = []
                 blocked_by_consistency = False
+                blocked_by_stale_run = False
                 for call_index, call in enumerate(action.tool_calls, start=1):
                     consistency_error = validate_tool_call_consistency(call, previous_step_tool_results + pending_tool_results)
                     if consistency_error:
@@ -270,6 +323,24 @@ class AgentRuntime:
                         self.trace_recorder.record(trace_id, "tool_result", result.to_dict(), level="WARN")
                         blocked_by_consistency = True
                         break
+                    stale_result = self._stale_write_tool_result(
+                        call_name=call.name,
+                        conversation_id=message.conversation_id,
+                        run_id=run_id,
+                        run_version=run_version,
+                    )
+                    if stale_result is not None:
+                        tool_results.append(stale_result)
+                        pending_tool_results.append(stale_result)
+                        self.trace_recorder.record(
+                            trace_id,
+                            "conversation_run_stale",
+                            stale_result.to_dict(),
+                            level="WARN",
+                        )
+                        self.trace_recorder.record(trace_id, "tool_result", stale_result.to_dict(), level="WARN")
+                        blocked_by_stale_run = True
+                        break
                     self.trace_recorder.record(trace_id, "tool_called", {"call": call.to_dict(), "step_index": step_index})
                     result = self.tool_gateway.execute(
                         call,
@@ -287,6 +358,21 @@ class AgentRuntime:
                         step = "state_transition_replayed" if result.deduplicated else "state_transition"
                         self.trace_recorder.record(trace_id, step, transition.to_dict())
                 self.store.append_tool_turn(message.conversation_id, json.dumps([item.to_dict() for item in pending_tool_results], ensure_ascii=False), trace_id)
+                if blocked_by_stale_run:
+                    final_reply = ""
+                    self.trace_recorder.record(
+                        trace_id,
+                        "final_output",
+                        {
+                            "reply": final_reply,
+                            "reason": "conversation_run_stale",
+                            "run_id": run_id,
+                            "run_version": run_version,
+                            "current_version": self.store.conversation_version(message.conversation_id),
+                        },
+                        level="WARN",
+                    )
+                    break
                 if blocked_by_consistency:
                     self.trace_recorder.record(trace_id, "tool_argument_consistency_feedback", {"results": [item.to_dict() for item in pending_tool_results]}, level="WARN")
                 continue
@@ -347,13 +433,51 @@ class AgentRuntime:
                 if not customer_visible_content_review_approved(review_result):
                     pending_tool_results = [review_result]
                     continue
+            if self._run_is_stale(message.conversation_id, run_version):
+                final_reply = ""
+                self.trace_recorder.record(
+                    trace_id,
+                    "conversation_run_stale",
+                    {
+                        "run_id": run_id,
+                        "run_version": run_version,
+                        "current_version": self.store.conversation_version(message.conversation_id),
+                        "blocked": "final_reply",
+                    },
+                    level="WARN",
+                )
+                self.trace_recorder.record(
+                    trace_id,
+                    "final_output",
+                    {
+                        "reply": final_reply,
+                        "reason": "conversation_run_stale",
+                        "run_id": run_id,
+                        "run_version": run_version,
+                        "current_version": self.store.conversation_version(message.conversation_id),
+                    },
+                    level="WARN",
+                )
+                break
             final_reply = proposed_reply
-            self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
+            self._append_pending_assistant_turn(
+                message.conversation_id,
+                final_reply,
+                trace_id,
+                run_id=run_id,
+                run_version=run_version,
+            )
             self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "objective_status": action.objective_status})
             break
         else:
             final_reply = "这个我先转人工确认一下。"
-            self.store.append_assistant_turn(message.conversation_id, final_reply, trace_id)
+            self._append_pending_assistant_turn(
+                message.conversation_id,
+                final_reply,
+                trace_id,
+                run_id=run_id,
+                run_version=run_version,
+            )
             self.trace_recorder.record(trace_id, "final_output", {"reply": final_reply, "reason": "max_steps_exceeded"}, level="WARN")
 
         transitions = [transition for result in tool_results if not result.deduplicated for transition in result.state_transitions]
@@ -364,6 +488,59 @@ class AgentRuntime:
             actions=actions,
             tool_results=tool_results,
             state_transitions=transitions,
+        )
+
+    def _run_is_stale(self, conversation_id: str, run_version: int) -> bool:
+        return self.store.conversation_version(conversation_id) != int(run_version)
+
+    def _stale_write_tool_result(
+        self,
+        *,
+        call_name: str,
+        conversation_id: str,
+        run_id: str,
+        run_version: int,
+    ) -> ToolResult | None:
+        definition = self.tool_gateway.tools.get(call_name) if self.tool_gateway else None
+        if definition is None or definition.execution_mode not in {"state_write", "draft_write"}:
+            return None
+        current_version = self.store.conversation_version(conversation_id)
+        if current_version == int(run_version):
+            return None
+        return ToolResult(
+            name=call_name,
+            called=False,
+            allowed=False,
+            result={
+                "run_id": run_id,
+                "run_version": run_version,
+                "current_version": current_version,
+                "instruction": (
+                    "This run is stale because a newer user message advanced the conversation version. "
+                    "Do not write state or create drafts from the old version; rebuild context from the latest user input."
+                ),
+            },
+            error="stale run: conversation version changed before a state-writing tool could execute",
+        )
+
+    def _append_pending_assistant_turn(
+        self,
+        conversation_id: str,
+        text: str,
+        trace_id: str,
+        *,
+        run_id: str,
+        run_version: int,
+    ) -> None:
+        self.store.append_assistant_turn(
+            conversation_id,
+            text,
+            trace_id,
+            metadata={
+                "delivery_status": "pending_operator_send",
+                "run_id": run_id,
+                "conversation_version": run_version,
+            },
         )
 
     def _conversation_lock(self, conversation_id: str) -> threading.RLock:

@@ -266,9 +266,14 @@ def validate_result(
         errors.append(f"game_count expected {expected['game_count']}, got {len(store.games)}")
     if "invite_draft_count" in expected and len(store.invite_drafts) != int(expected["invite_draft_count"]):
         errors.append(f"invite_draft_count expected {expected['invite_draft_count']}, got {len(store.invite_drafts)}")
-    if "state_transition_count" in expected and len(result.state_transitions) != int(expected["state_transition_count"]):
+    business_transitions = [
+        transition
+        for transition in result.state_transitions
+        if transition.entity_type not in {"conversation_version", "assistant_reply"}
+    ]
+    if "state_transition_count" in expected and len(business_transitions) != int(expected["state_transition_count"]):
         errors.append(
-            f"state_transition_count expected {expected['state_transition_count']}, got {len(result.state_transitions)}"
+            f"state_transition_count expected {expected['state_transition_count']}, got {len(business_transitions)}"
         )
     if "badcase_count" in expected and len(store.badcases) != int(expected["badcase_count"]):
         errors.append(f"badcase_count expected {expected['badcase_count']}, got {len(store.badcases)}")

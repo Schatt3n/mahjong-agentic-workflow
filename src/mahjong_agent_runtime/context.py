@@ -64,6 +64,8 @@ class AgentContextBuilder:
         *,
         trace_id: str,
         previous_tool_results: list[ToolResult] | None = None,
+        run_id: str | None = None,
+        run_version: int | None = None,
     ) -> BuiltContext:
         prompt = self.prompt_path.read_text(encoding="utf-8")
         recent_conversation, audit = self.packing_policy.pack_turns(
@@ -71,6 +73,7 @@ class AgentContextBuilder:
         )
         profile = self.store.customers.get(message.sender_id)
         checkpoint = self.store.get_conversation_checkpoint(message.conversation_id)
+        current_version = self.store.conversation_version(message.conversation_id)
         active_games = self.store.active_games(message.conversation_id)
         sender_relationships = self.store.relationship_context_for_sender(message.sender_id, active_games)
         audit = {
@@ -78,10 +81,24 @@ class AgentContextBuilder:
             "conversation_checkpoint_present": checkpoint is not None,
             "conversation_checkpoint_source_trace_id": checkpoint.source_trace_id if checkpoint else None,
             "sender_relationship_count": len(sender_relationships),
+            "conversation_version": current_version,
+            "run_version": run_version,
+            "run_current": run_version is None or int(run_version) == current_version,
         }
         payload = {
             "runtime": "mahjong_agent_runtime",
             "trace_id": trace_id,
+            "conversation_state": {
+                "conversation_id": message.conversation_id,
+                "current_version": current_version,
+                "run_id": run_id,
+                "run_version": run_version,
+                "run_current": run_version is None or int(run_version) == current_version,
+                "version_contract": (
+                    "每条新用户消息都会推进 conversation version；旧版本未发送的回复、邀约草稿和外发草稿会被标记为 superseded。"
+                    "如果工具结果提示 stale_run，必须停止旧动作并基于当前消息重新判断。"
+                ),
+            },
             "current_message": message.to_dict(),
             "recent_conversation": recent_conversation,
             "conversation_checkpoint": checkpoint.to_dict() if checkpoint else None,

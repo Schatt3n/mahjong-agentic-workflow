@@ -98,6 +98,12 @@ class SQLiteAgentStore:
             }
 
     @property
+    def conversation_versions(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._connection.execute("SELECT conversation_id, version FROM runtime_conversation_versions").fetchall()
+            return {str(row["conversation_id"]): int(row["version"]) for row in rows}
+
+    @property
     def transitions(self) -> list[StateTransition]:
         with self._lock:
             rows = self._connection.execute("SELECT payload FROM runtime_state_transitions ORDER BY id").fetchall()
@@ -175,10 +181,21 @@ class SQLiteAgentStore:
             ),
         )
 
-    def append_assistant_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
+    def append_assistant_turn(
+        self,
+        conversation_id: str,
+        text: str,
+        trace_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         self.append_turn(
             conversation_id,
-            ConversationTurn(role=ConversationRole.ASSISTANT, content=text, trace_id=trace_id),
+            ConversationTurn(
+                role=ConversationRole.ASSISTANT,
+                content=text,
+                trace_id=trace_id,
+                metadata=dict(metadata or {}),
+            ),
         )
 
     def append_tool_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
@@ -221,6 +238,137 @@ class SQLiteAgentStore:
             if row is None:
                 return None
             return _checkpoint_from_payload(_loads(row["payload"]))
+
+    def conversation_version(self, conversation_id: str) -> int:
+        key = conversation_id or "default"
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT version FROM runtime_conversation_versions WHERE conversation_id = ?",
+                (key,),
+            ).fetchone()
+            return int(row["version"]) if row else 0
+
+    def advance_conversation_version(
+        self,
+        conversation_id: str,
+        *,
+        trace_id: str,
+        reason: str,
+    ) -> tuple[int, StateTransition]:
+        key = conversation_id or "default"
+        with self._lock, self._connection:
+            old = self.conversation_version(key)
+            new = old + 1
+            self._connection.execute(
+                """
+                INSERT INTO runtime_conversation_versions(conversation_id, version, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    version=excluded.version,
+                    updated_at=excluded.updated_at
+                """,
+                (key, new, _now_iso()),
+            )
+            transition = StateTransition(
+                "conversation_version",
+                key,
+                str(old),
+                str(new),
+                reason or "user_message_received",
+                trace_id,
+            )
+            self._append_transition(transition)
+            return new, transition
+
+    def supersede_pending_outputs(
+        self,
+        conversation_id: str,
+        *,
+        sender_id: str | None = None,
+        trace_id: str,
+        reason: str,
+    ) -> tuple[dict[str, int], list[StateTransition]]:
+        key = conversation_id or "default"
+        with self._lock, self._connection:
+            transitions: list[StateTransition] = []
+            counts = {
+                "invite_drafts": 0,
+                "outbound_message_drafts": 0,
+                "assistant_replies": 0,
+            }
+            game_ids = {game.game_id for game in self.games.values() if game.conversation_id == key}
+            sender_is_pending_candidate = bool(
+                sender_id
+                and any(
+                    draft.game_id in game_ids
+                    and draft.customer_id == sender_id
+                    and draft.status == InviteStatus.PENDING_APPROVAL
+                    for draft in self.invite_drafts.values()
+                )
+            )
+            for draft in self.invite_drafts.values():
+                if sender_is_pending_candidate:
+                    continue
+                if draft.game_id not in game_ids or draft.status != InviteStatus.PENDING_APPROVAL:
+                    continue
+                old = draft.status.value
+                draft.status = InviteStatus.SUPERSEDED
+                draft.updated_at = datetime.now(DEFAULT_TZ)
+                draft.metadata = {
+                    **dict(draft.metadata),
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["invite_drafts"] += 1
+                transitions.append(StateTransition("invite_draft", draft.draft_id, old, draft.status.value, reason, trace_id))
+                self._save_invite(draft)
+            for draft in self.outbound_message_drafts.values():
+                if sender_is_pending_candidate:
+                    continue
+                if draft.conversation_id != key or draft.status != OutboundDraftStatus.PENDING_APPROVAL:
+                    continue
+                old = draft.status.value
+                draft.status = OutboundDraftStatus.SUPERSEDED
+                draft.updated_at = datetime.now(DEFAULT_TZ)
+                draft.metadata = {
+                    **dict(draft.metadata),
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["outbound_message_drafts"] += 1
+                transitions.append(
+                    StateTransition("outbound_message_draft", draft.draft_id, old, draft.status.value, reason, trace_id)
+                )
+                self._save_outbound_message_draft(draft)
+            rows = self._connection.execute(
+                """
+                SELECT id, payload
+                FROM runtime_conversation_turns
+                WHERE conversation_id = ? AND role = ?
+                """,
+                (key, ConversationRole.ASSISTANT.value),
+            ).fetchall()
+            for row in rows:
+                payload = _loads(row["payload"])
+                turn = _turn_from_payload(payload)
+                if turn.metadata.get("delivery_status") != "pending_operator_send":
+                    continue
+                old = str(turn.metadata.get("delivery_status") or "")
+                turn.metadata = {
+                    **dict(turn.metadata),
+                    "delivery_status": "superseded",
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["assistant_replies"] += 1
+                transitions.append(StateTransition("assistant_reply", turn.trace_id, old, "superseded", reason, trace_id))
+                self._connection.execute(
+                    "UPDATE runtime_conversation_turns SET payload = ? WHERE id = ?",
+                    (_dumps(turn.to_dict()), row["id"]),
+                )
+            for transition in transitions:
+                self._append_transition(transition)
+            return counts, transitions
 
     def upsert_conversation_checkpoint(
         self,
@@ -358,6 +506,7 @@ class SQLiteAgentStore:
             ("state_transitions", "runtime_state_transitions"),
             ("conversation_turns", "runtime_conversation_turns"),
             ("conversation_checkpoints", "runtime_conversation_checkpoints"),
+            ("conversation_versions", "runtime_conversation_versions"),
             ("idempotency_ledger", "runtime_idempotency_ledger"),
             ("message_results", "runtime_message_results"),
         ]
@@ -758,6 +907,11 @@ class SQLiteAgentStore:
             CREATE TABLE IF NOT EXISTS runtime_conversation_checkpoints(
                 conversation_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_conversation_versions(
+                conversation_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS runtime_idempotency_ledger(

@@ -2444,6 +2444,151 @@ def test_runtime_message_idempotency_is_scoped_by_conversation_and_sender() -> N
     assert "message_deduplicated" not in trace_steps(trace.get_trace("trace_collision_sender"))
 
 
+def test_runtime_new_user_message_supersedes_pending_outputs() -> None:
+    store = seeded_store()
+    game, _ = store.create_game(
+        conversation_id="runtime_supersede",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong", "stake": "1"},
+        known_players=[],
+        trace_id="trace_seed_game",
+    )
+    invite_drafts, _ = store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[{"customer_id": "ran", "display_name": "冉姐", "message_text": "1块，打吗？"}],
+        trace_id="trace_seed_invite",
+    )
+    outbound_drafts, _ = store.create_outbound_message_drafts(
+        conversation_id="runtime_supersede",
+        drafts=[
+            {
+                "recipient_id": "group",
+                "recipient_name": "群",
+                "channel": "console",
+                "message_text": "1块有人吗？",
+                "purpose": "group_broadcast",
+            }
+        ],
+        trace_id="trace_seed_outbound",
+    )
+    store.append_assistant_turn(
+        "runtime_supersede",
+        "旧回复，老板还没发送。",
+        "trace_old_reply",
+        metadata={"delivery_status": "pending_operator_send", "conversation_version": 0},
+    )
+    trace = InMemoryTraceRecorder()
+    client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="completed",
+                reasoning_summary="用户补充信息后重新回复。",
+                reply_to_user="好的，我重新看一下。",
+            )
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_supersede",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="烟都可以，0.5 或 1 都行",
+            message_id="msg_runtime_supersede",
+        ),
+        trace_id="trace_runtime_supersede",
+    )
+
+    assert result.final_reply == "好的，我重新看一下。"
+    assert store.conversation_version("runtime_supersede") == 1
+    assert store.invite_drafts[invite_drafts[0].draft_id].status.value == "superseded"
+    assert store.outbound_message_drafts[outbound_drafts[0].draft_id].status.value == "superseded"
+    old_reply = next(turn for turn in store.recent_turns("runtime_supersede", 10) if turn.trace_id == "trace_old_reply")
+    assert old_reply.metadata["delivery_status"] == "superseded"
+    new_reply = next(turn for turn in store.recent_turns("runtime_supersede", 10) if turn.trace_id == "trace_runtime_supersede" and turn.role.value == "assistant")
+    assert new_reply.metadata["delivery_status"] == "pending_operator_send"
+    steps = trace_steps(trace.get_trace("trace_runtime_supersede"))
+    assert "conversation_version_advanced" in steps
+    assert "pending_outputs_superseded" in steps
+    supersede_event = next(event for event in trace.get_trace("trace_runtime_supersede") if event.step == "pending_outputs_superseded")
+    assert supersede_event.content["counts"] == {
+        "invite_drafts": 1,
+        "outbound_message_drafts": 1,
+        "assistant_replies": 1,
+    }
+    transition_types = [item.entity_type for item in result.state_transitions]
+    assert "conversation_version" in transition_types
+    assert "invite_draft" in transition_types
+    assert "outbound_message_draft" in transition_types
+    assert "assistant_reply" in transition_types
+
+
+def test_runtime_stale_run_blocks_state_writing_tools() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+
+    class StaleBeforeWriteClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, messages: list[dict[str, str]], *, trace_id: str, timeout_seconds: float) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                store.advance_conversation_version(
+                    "runtime_stale_run",
+                    trace_id="trace_external_supplement",
+                    reason="simulated_new_user_message_during_running_agent",
+                )
+                return action_json(
+                    objective_status="needs_tool",
+                    reasoning_summary="旧 run 试图创建局。",
+                    tool_calls=[
+                        {
+                            "name": "create_game",
+                            "arguments": {
+                                "requirement": {"game_type": "hangzhou_mahjong", "stake": "1"},
+                                "organizer_id": "zhang",
+                                "organizer_name": "张哥",
+                                "known_players": [],
+                            },
+                            "reason": "创建待组局记录。",
+                        }
+                    ],
+                )
+            return action_json(
+                objective_status="completed",
+                reasoning_summary="不应到达第二轮。",
+                reply_to_user="不应该回复。",
+            )
+
+    runtime = AgentRuntime(llm_client=StaleBeforeWriteClient(), store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_stale_run",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="帮我组一个",
+            message_id="msg_runtime_stale_run",
+        ),
+        trace_id="trace_runtime_stale_run",
+    )
+
+    assert result.final_reply == ""
+    assert store.conversation_version("runtime_stale_run") == 2
+    assert store.games == {}
+    assert result.tool_results[0].name == "create_game"
+    assert result.tool_results[0].called is False
+    assert result.tool_results[0].allowed is False
+    assert "stale run" in str(result.tool_results[0].error)
+    steps = trace_steps(trace.get_trace("trace_runtime_stale_run"))
+    assert "conversation_run_stale" in steps
+    final_event = next(event for event in trace.get_trace("trace_runtime_stale_run") if event.step == "final_output")
+    assert final_event.content["reason"] == "conversation_run_stale"
+
+
 def test_runtime_concurrent_duplicate_message_id_serializes_and_deduplicates_side_effects() -> None:
     store = seeded_store()
     trace = InMemoryTraceRecorder()

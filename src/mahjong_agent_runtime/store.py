@@ -16,6 +16,7 @@ from .models import (
     Game,
     InviteDraft,
     InviteStatus,
+    OutboundDraftStatus,
     OutboundMessageDraft,
     StateTransition,
     ToolResult,
@@ -51,6 +52,7 @@ class InMemoryAgentStore:
     transitions: list[StateTransition] = field(default_factory=list)
     turns: dict[str, list[ConversationTurn]] = field(default_factory=dict)
     conversation_checkpoints: dict[str, ConversationCheckpoint] = field(default_factory=dict)
+    conversation_versions: dict[str, int] = field(default_factory=dict)
     idempotency_ledger: dict[str, ToolResult] = field(default_factory=dict)
     message_results: dict[str, AgentRuntimeResult] = field(default_factory=dict)
     badcases: list[dict[str, Any]] = field(default_factory=list)
@@ -90,8 +92,22 @@ class InMemoryAgentStore:
             ),
         )
 
-    def append_assistant_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
-        self.append_turn(conversation_id, ConversationTurn(role=ConversationRole.ASSISTANT, content=text, trace_id=trace_id))
+    def append_assistant_turn(
+        self,
+        conversation_id: str,
+        text: str,
+        trace_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.append_turn(
+            conversation_id,
+            ConversationTurn(
+                role=ConversationRole.ASSISTANT,
+                content=text,
+                trace_id=trace_id,
+                metadata=dict(metadata or {}),
+            ),
+        )
 
     def append_tool_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
         self.append_turn(conversation_id, ConversationTurn(role=ConversationRole.TOOL, content=text, trace_id=trace_id))
@@ -107,6 +123,110 @@ class InMemoryAgentStore:
     def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpoint | None:
         with self._lock:
             return self.conversation_checkpoints.get(conversation_id)
+
+    def conversation_version(self, conversation_id: str) -> int:
+        with self._lock:
+            return int(self.conversation_versions.get(conversation_id or "default", 0))
+
+    def advance_conversation_version(
+        self,
+        conversation_id: str,
+        *,
+        trace_id: str,
+        reason: str,
+    ) -> tuple[int, StateTransition]:
+        key = conversation_id or "default"
+        with self._lock:
+            old = int(self.conversation_versions.get(key, 0))
+            new = old + 1
+            self.conversation_versions[key] = new
+            transition = StateTransition(
+                entity_type="conversation_version",
+                entity_id=key,
+                from_status=str(old),
+                to_status=str(new),
+                reason=reason or "user_message_received",
+                trace_id=trace_id,
+            )
+            self.transitions.append(transition)
+            return new, transition
+
+    def supersede_pending_outputs(
+        self,
+        conversation_id: str,
+        *,
+        sender_id: str | None = None,
+        trace_id: str,
+        reason: str,
+    ) -> tuple[dict[str, int], list[StateTransition]]:
+        key = conversation_id or "default"
+        with self._lock:
+            transitions: list[StateTransition] = []
+            counts = {
+                "invite_drafts": 0,
+                "outbound_message_drafts": 0,
+                "assistant_replies": 0,
+            }
+            game_ids = {game.game_id for game in self.games.values() if game.conversation_id == key}
+            sender_is_pending_candidate = bool(
+                sender_id
+                and any(
+                    draft.game_id in game_ids
+                    and draft.customer_id == sender_id
+                    and draft.status == InviteStatus.PENDING_APPROVAL
+                    for draft in self.invite_drafts.values()
+                )
+            )
+            for draft in self.invite_drafts.values():
+                if sender_is_pending_candidate:
+                    continue
+                if draft.game_id not in game_ids or draft.status != InviteStatus.PENDING_APPROVAL:
+                    continue
+                old = draft.status.value
+                draft.status = InviteStatus.SUPERSEDED
+                draft.updated_at = now()
+                draft.metadata = {
+                    **dict(draft.metadata),
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["invite_drafts"] += 1
+                transitions.append(
+                    StateTransition("invite_draft", draft.draft_id, old, draft.status.value, reason, trace_id)
+                )
+            for draft in self.outbound_message_drafts.values():
+                if sender_is_pending_candidate:
+                    continue
+                if draft.conversation_id != key or draft.status != OutboundDraftStatus.PENDING_APPROVAL:
+                    continue
+                old = draft.status.value
+                draft.status = OutboundDraftStatus.SUPERSEDED
+                draft.updated_at = now()
+                draft.metadata = {
+                    **dict(draft.metadata),
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["outbound_message_drafts"] += 1
+                transitions.append(
+                    StateTransition("outbound_message_draft", draft.draft_id, old, draft.status.value, reason, trace_id)
+                )
+            for turn in self.turns.get(key, []):
+                if turn.role != ConversationRole.ASSISTANT:
+                    continue
+                if turn.metadata.get("delivery_status") != "pending_operator_send":
+                    continue
+                old = str(turn.metadata.get("delivery_status") or "")
+                turn.metadata = {
+                    **dict(turn.metadata),
+                    "delivery_status": "superseded",
+                    "superseded_by_trace_id": trace_id,
+                    "superseded_reason": reason,
+                }
+                counts["assistant_replies"] += 1
+                transitions.append(StateTransition("assistant_reply", turn.trace_id, old, "superseded", reason, trace_id))
+            self.transitions.extend(transitions)
+            return counts, transitions
 
     def upsert_conversation_checkpoint(
         self,
@@ -194,6 +314,7 @@ class InMemoryAgentStore:
                 "state_transitions": len(self.transitions),
                 "conversation_turns": sum(len(items) for items in self.turns.values()),
                 "conversation_checkpoints": len(self.conversation_checkpoints),
+                "conversation_versions": len(self.conversation_versions),
                 "idempotency_ledger": len(self.idempotency_ledger),
                 "message_results": len(self.message_results),
                 "customers": len(self.customers) if include_customers else 0,
@@ -206,6 +327,7 @@ class InMemoryAgentStore:
             self.transitions.clear()
             self.turns.clear()
             self.conversation_checkpoints.clear()
+            self.conversation_versions.clear()
             self.idempotency_ledger.clear()
             self.message_results.clear()
             if include_customers:

@@ -40,12 +40,14 @@ class InviteStatus(StrEnum):
     DECLINED = "declined"
     NEGOTIATING = "negotiating"
     NO_REPLY = "no_reply"
+    SUPERSEDED = "superseded"
 
 
 class OutboundDraftStatus(StrEnum):
     PENDING_APPROVAL = "pending_approval"
     SENT = "sent"
     CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(slots=True)

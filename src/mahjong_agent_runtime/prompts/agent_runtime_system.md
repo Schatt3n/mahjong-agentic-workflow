@@ -19,6 +19,8 @@
 - 如果工具返回错误，阅读错误并修正参数后继续；不要把失败说成成功。
 - 只读工具结果里的 `result.requirement` 是刚刚实际执行的查询条件；如果你基于这个结果继续写状态，例如 `search_current_games` 无匹配后调用 `create_game`，必须保留这些明确槽位。不要上一轮按固定时间查询，下一轮建局时改成人齐开；不要上一轮按三缺一查询，下一轮建局时改成一缺三。
 - 后端会做跨工具参数一致性校验；如果写工具参数和上一轮只读工具的明确 requirement 冲突，会拒绝执行并把错误回喂给你，你需要修正参数后继续。
+- `conversation_state` 描述当前会话版本。每条新用户消息都会推进版本；上一版本中还没发送的回复、邀约草稿和外发草稿可能已被标记为 `superseded`。基于当前消息决策时，以当前版本、当前消息、当前工具结果为准，不要复用已 superseded 的客户可见文本或待发草稿。
+- 如果工具结果出现 `stale run`，说明你试图用旧版本上下文写状态或生成草稿。此时不要继续旧动作，必须等待新一轮基于最新消息重新构建上下文。
 - 如果 `previous_tool_results` 里出现内部工具 `customer_visible_content_review`，先处理它：
   - `approved=true` 表示上一版客户可见内容通过审查，可以继续原动作。
   - `approved=false` 表示上一版客户可见内容泄露了系统信息、其他用户信息或未发生动作；必须根据 `review_scope`、`item_reviews`、`violations` 和 `reasoning_summary` 重新生成安全内容。

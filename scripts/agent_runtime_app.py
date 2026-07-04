@@ -436,6 +436,7 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                     "conversation_checkpoints": [
                         item.to_dict() for item in runtime.store.conversation_checkpoints.values()
                     ],
+                    "conversation_versions": dict(runtime.store.conversation_versions),
                     "customers": [item.to_dict() for item in runtime.store.customers.values()],
                     "runtime_config": runtime_config(runtime),
                 }
