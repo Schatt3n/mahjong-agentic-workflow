@@ -6,9 +6,11 @@ from pathlib import Path
 
 from mahjong_agent_runtime import (
     AgentRuntime,
+    CustomerProfile,
     InMemoryTraceRecorder,
     SQLiteAgentStore,
     StaticAgentClient,
+    ToolResult,
     ToolGateway,
     UserMessage,
 )
@@ -160,7 +162,102 @@ def test_runtime_manifest_identifies_current_main_chain(tmp_path) -> None:
     assert "legacy_endpoint_aliases" not in manifest
     assert "search_current_games" in manifest["available_tools"]
     assert "update_context_checkpoint" in manifest["available_tools"]
+    assert "/api/reset-state" in manifest["endpoints"]["reset_state"]
     assert "/api/analyze" not in app.json.dumps(manifest, ensure_ascii=False)
+
+
+def test_operator_reset_state_clears_runtime_state_but_preserves_assets(tmp_path) -> None:
+    app = load_app_module()
+    store = SQLiteAgentStore(tmp_path / "agent_runtime_reset.sqlite3")
+    trace = InMemoryTraceRecorder()
+    runtime = AgentRuntime(
+        llm_client=StaticAgentClient(
+            [
+                app.json.dumps(
+                    {
+                        "goal": "测试回复",
+                        "objective_status": "completed",
+                        "reasoning_summary": "模型直接回复。",
+                        "reply_to_user": "收到。",
+                        "tool_calls": [],
+                        "needs_human": False,
+                        "stop_reason": {
+                            "can_stop": True,
+                            "why": "测试场景模拟模型回复。",
+                            "pending_work": [],
+                            "depends_on_tool_results": False,
+                        },
+                        "badcase": None,
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        ),
+        store=store,
+        tool_gateway=ToolGateway(store=store, trace_recorder=trace),
+        trace_recorder=trace,
+    )
+    store.upsert_customer(CustomerProfile(customer_id="zhang", display_name="张哥"))
+    runtime.handle_user_message(
+        UserMessage(
+            conversation_id="reset_conversation",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="帮我组一个",
+            message_id="msg_reset_001",
+        ),
+        trace_id="trace_before_reset",
+    )
+    game, _ = store.create_game(
+        conversation_id="reset_conversation",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={"game_type": "hangzhou_mahjong"},
+        known_players=[],
+        trace_id="trace_before_reset",
+    )
+    store.create_invite_drafts(
+        game_id=game.game_id,
+        invitations=[{"customer_id": "ran", "display_name": "冉姐", "message_text": "冉姐，打吗？"}],
+        trace_id="trace_before_reset",
+    )
+    store.upsert_conversation_checkpoint(
+        conversation_id="reset_conversation",
+        summary="用户正在组局",
+        facts={"stake": "1"},
+        open_questions=[],
+        trace_id="trace_before_reset",
+    )
+    store.remember_result("tool_key", ToolResult(name="search_current_games", called=True, allowed=True))
+    store.record_badcase({"reason": "保留样本"}, trace_id="trace_before_reset", conversation_id="reset_conversation")
+
+    response = app.reset_runtime_state(runtime, {"trace_id": "trace_reset_operator"})
+
+    assert response["deleted"]["games"] == 1
+    assert response["deleted"]["invite_drafts"] == 1
+    assert response["deleted"]["conversation_turns"] > 0
+    assert response["deleted"]["conversation_checkpoints"] == 1
+    assert response["deleted"]["idempotency_ledger"] > 0
+    assert response["deleted"]["message_results"] == 1
+    assert response["deleted"]["customers"] == 0
+    assert response["deleted"]["badcases"] == 0
+    assert store.games == {}
+    assert store.invite_drafts == {}
+    assert store.conversation_checkpoints == {}
+    assert store.idempotent_result("tool_key") is None
+    assert len(store.customers) == 1
+    assert len(store.badcases) == 1
+    steps = [event.step for event in trace.get_trace("trace_reset_operator")]
+    assert steps == ["operator_reset_state_requested", "operator_reset_state_completed"]
+
+
+def test_index_html_has_reset_state_button() -> None:
+    app = load_app_module()
+    html = app.index_html()
+
+    assert "清空状态和记忆" in html
+    assert "/api/reset-state" in html
+    assert "客户画像、badcase/eval 和日志" in html
 
 
 def test_log_tail_exposes_trace_log_path(tmp_path, monkeypatch) -> None:

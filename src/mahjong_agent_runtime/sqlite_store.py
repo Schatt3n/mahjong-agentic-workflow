@@ -293,6 +293,43 @@ class SQLiteAgentStore:
                 (message_id, result.conversation_id, result.trace_id, _dumps(result.to_dict()), _now_iso()),
             )
 
+    def clear_runtime_state(
+        self,
+        *,
+        include_customers: bool = False,
+        include_badcases: bool = False,
+    ) -> dict[str, int]:
+        tables = [
+            ("games", "runtime_games"),
+            ("invite_drafts", "runtime_invite_drafts"),
+            ("outbound_message_drafts", "runtime_outbound_message_drafts"),
+            ("state_transitions", "runtime_state_transitions"),
+            ("conversation_turns", "runtime_conversation_turns"),
+            ("conversation_checkpoints", "runtime_conversation_checkpoints"),
+            ("idempotency_ledger", "runtime_idempotency_ledger"),
+            ("message_results", "runtime_message_results"),
+        ]
+        if include_customers:
+            tables.append(("customers", "runtime_customers"))
+        else:
+            tables.append(("customers", ""))
+        if include_badcases:
+            tables.append(("badcases", "runtime_badcases"))
+        else:
+            tables.append(("badcases", ""))
+        with self._lock, self._connection:
+            deleted: dict[str, int] = {}
+            for key, table in tables:
+                if not table:
+                    deleted[key] = 0
+                    continue
+                row = self._connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                deleted[key] = int(row["count"] if row else 0)
+            for _, table in tables:
+                if table:
+                    self._connection.execute(f"DELETE FROM {table}")
+            return deleted
+
     def search_current_games(self, requirement: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
         scored: list[dict[str, Any]] = []
         for game in self.active_games():

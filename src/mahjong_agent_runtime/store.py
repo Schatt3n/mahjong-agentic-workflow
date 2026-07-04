@@ -161,6 +161,39 @@ class InMemoryAgentStore:
         with self._lock:
             self.message_results.setdefault(message_id, result)
 
+    def clear_runtime_state(
+        self,
+        *,
+        include_customers: bool = False,
+        include_badcases: bool = False,
+    ) -> dict[str, int]:
+        with self._lock:
+            deleted = {
+                "games": len(self.games),
+                "invite_drafts": len(self.invite_drafts),
+                "outbound_message_drafts": len(self.outbound_message_drafts),
+                "state_transitions": len(self.transitions),
+                "conversation_turns": sum(len(items) for items in self.turns.values()),
+                "conversation_checkpoints": len(self.conversation_checkpoints),
+                "idempotency_ledger": len(self.idempotency_ledger),
+                "message_results": len(self.message_results),
+                "customers": len(self.customers) if include_customers else 0,
+                "badcases": len(self.badcases) if include_badcases else 0,
+            }
+            self.games.clear()
+            self.invite_drafts.clear()
+            self.outbound_message_drafts.clear()
+            self.transitions.clear()
+            self.turns.clear()
+            self.conversation_checkpoints.clear()
+            self.idempotency_ledger.clear()
+            self.message_results.clear()
+            if include_customers:
+                self.customers.clear()
+            if include_badcases:
+                self.badcases.clear()
+            return deleted
+
     def search_current_games(self, requirement: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
         with self._lock:
             scored: list[dict[str, Any]] = []

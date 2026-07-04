@@ -130,6 +130,7 @@ def runtime_manifest(runtime: AgentRuntime) -> dict:
             "traces": ["/api/traces"],
             "logs": ["/api/logs"],
             "badcases": ["/api/badcases"],
+            "reset_state": ["/api/reset-state"],
             "runtime": ["/api/runtime"],
             "health": ["/api/health"],
         },
@@ -227,6 +228,51 @@ def record_manual_badcase(runtime: AgentRuntime, payload: dict) -> dict:
         "source_trace_id": source_trace_id,
         "tool_result": result.to_dict(),
         "trace": trace_payload(runtime, audit_trace_id),
+    }
+
+
+def reset_runtime_state(runtime: AgentRuntime, payload: dict) -> dict:
+    trace_id = str(payload.get("trace_id") or f"trace_operator_reset_{os.urandom(6).hex()}")
+    include_customers = bool(payload.get("include_customers"))
+    include_badcases = bool(payload.get("include_badcases"))
+    runtime.trace_recorder.record(
+        trace_id,
+        "operator_reset_state_requested",
+        {
+            "include_customers": include_customers,
+            "include_badcases": include_badcases,
+            "reason": str(payload.get("reason") or "operator requested clearing runtime state and memory"),
+        },
+        level="WARN",
+    )
+    deleted = runtime.store.clear_runtime_state(
+        include_customers=include_customers,
+        include_badcases=include_badcases,
+    )
+    with runtime._conversation_locks_guard:
+        runtime._conversation_locks.clear()
+    runtime.trace_recorder.record(
+        trace_id,
+        "operator_reset_state_completed",
+        {
+            "deleted": deleted,
+            "preserved": {
+                "customers": not include_customers,
+                "badcases": not include_badcases,
+                "trace_log": True,
+            },
+        },
+        level="WARN",
+    )
+    return {
+        "trace_id": trace_id,
+        "deleted": deleted,
+        "preserved": {
+            "customers": not include_customers,
+            "badcases": not include_badcases,
+            "trace_log": True,
+        },
+        "trace": trace_payload(runtime, trace_id),
     }
 
 
@@ -334,6 +380,11 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             self._json(record_manual_badcase(runtime, payload))
             return
+        if parsed.path == "/api/reset-state":
+            runtime = get_runtime()
+            payload = self._read_json()
+            self._json(reset_runtime_state(runtime, payload))
+            return
         self.send_error(404)
 
     def log_message(self, fmt: str, *args) -> None:
@@ -404,6 +455,8 @@ textarea,input,button{font:inherit}
 input,textarea{width:100%;box-sizing:border-box;border:1px solid #b9c7bd;border-radius:8px;padding:12px;background:white}
 textarea{min-height:140px}
 button{border:1px solid #2f7d62;background:#2f7d62;color:white;border-radius:8px;padding:10px 16px;cursor:pointer}
+button.secondary{border-color:#b9c7bd;background:white;color:#1f2a24}
+button.danger{border-color:#b42318;background:#b42318;color:white}
 pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius:8px;padding:16px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 </style>
@@ -419,6 +472,7 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
   <button onclick="sendMessage()">发送</button>
   <button onclick="loadState()">刷新状态</button>
   <button onclick="recordBadcase()">标记 badcase</button>
+  <button class="danger" onclick="resetState()">清空状态和记忆</button>
   <h2>结果</h2>
   <pre id="output"></pre>
   <h2>人工 badcase</h2>
@@ -455,6 +509,18 @@ async function recordBadcase(){
 async function loadState(){
   const res = await fetch('/api/state');
   state.textContent = JSON.stringify(await res.json(), null, 2);
+}
+async function resetState(){
+  const ok = confirm('确认清空当前测试状态和记忆？会删除局、草稿、对话上下文、checkpoint、幂等缓存和消息结果；默认保留客户画像、badcase/eval 和日志。');
+  if(!ok) return;
+  const res = await fetch('/api/reset-state',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({reason:'operator clicked reset state and memory'})
+  });
+  output.textContent = JSON.stringify(await res.json(), null, 2);
+  window.lastTraceId = '';
+  await loadState();
 }
 loadState();
 </script>
