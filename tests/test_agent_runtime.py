@@ -499,6 +499,8 @@ def test_runtime_default_eval_runner_only_targets_current_main_chain() -> None:
     assert "run_agent_runtime_eval.py" in runner
     assert "tests/test_agent_runtime.py" in runner
     assert "tests/test_real_owner_chat_golden.py" in runner
+    assert "--live-real-owner" in runner
+    assert "scripts/run_real_owner_chat_live_eval.py" in runner
     assert "tests/test_agent_runtime_v3.py" not in runner
     assert "tests/test_agent_v3_app.py" not in runner
     assert "run_agent_runtime_v3_eval.py" not in runner

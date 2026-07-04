@@ -139,6 +139,14 @@ python scripts/run_agent_runtime_eval.py
 python scripts/run_evals.py
 ```
 
+带真实模型的老板聊天 live 评测：
+
+```bash
+python scripts/run_evals.py --live-real-owner
+```
+
+该模式会调用配置好的 LLM，验证真实老板聊天样本中的工具调用和最终话术；默认评测不会调用模型。
+
 全量测试：
 
 ```bash
