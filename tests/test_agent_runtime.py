@@ -91,6 +91,15 @@ def test_runtime_system_prompt_requires_customer_visible_reply_self_check() -> N
     assert "才使用 `objective_status=needs_human`" in prompt
     assert "用户只是问“有没有局/现在有人吗/通宵有人吗/0.5有人吗/人齐开有没有”" in prompt
     assert "必须先调用 `search_current_games`" in prompt
+    assert "`173=一缺三`" in prompt
+    assert "`0.5`、`0，5`、`0、5`、`0 5`" in prompt
+    assert "默认地区是杭州" in prompt
+    assert "时间 + 档位 + 人数短码/缺口 + 烟况" in prompt
+    assert "如果没有匹配局，继续按组局目标调用 `create_game`" in prompt
+    assert "如果有一个或多个匹配局，回复可选现成局" in prompt
+    assert "最终只用“好/好的/我帮你看看/我帮你问问”这类短句承接" in prompt
+    assert "有明确时间词" in prompt
+    assert "必须用 `start_time_kind=scheduled`" in prompt
     assert "不要只回复“留意/看看/帮你问问”就停止" in prompt
     assert "必须继续调用 `create_game`、`search_customers`" in prompt
     assert "然后用候选人结果调用 `create_invite_drafts`" in prompt
