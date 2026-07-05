@@ -17,6 +17,7 @@ from mahjong_agent_runtime import (
     InMemoryAgentStore,
     InMemoryTraceRecorder,
     JsonlTraceRecorder,
+    MessageReference,
     QuotedMessageRef,
     SQLiteAgentStore,
     StaticAgentClient,
@@ -628,6 +629,65 @@ def test_runtime_resolves_platform_message_reference_linked_to_invite_draft(tmp_
         == "冉姐"
     )
     assert built.payload["context_budget"]["quoted_message_reference_resolved"] is True
+
+
+def test_runtime_quoted_message_context_uses_public_sender_name(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime_platform_sender_reference.sqlite3"
+    store = SQLiteAgentStore(db_path)
+    store.upsert_customer(
+        CustomerProfile(
+            customer_id="liu",
+            display_name="刘峻甫-21M-高分子-宜宾",
+            public_name="刘峻甫",
+            private_remark="老板备注：测试白名单",
+            notes="内部备注：好哥们儿",
+        )
+    )
+    store.register_message_reference(
+        MessageReference(
+            message_id="wechat_msg_from_liu_001",
+            conversation_id="wechaty:contact:liu",
+            business_ref_type="customer_message",
+            business_ref_id="wechat_msg_from_liu_001",
+            text="哪些人啊",
+            channel="wechaty",
+            sender_id="liu",
+            sender_name="刘峻甫-21M-高分子-宜宾",
+            metadata={
+                "source": "wechaty_inbound",
+                "private_note": "老板备注：这条只给自己看",
+            },
+        )
+    )
+
+    reopened = SQLiteAgentStore(db_path)
+    built = AgentContextBuilder(store=reopened, tool_gateway=ToolGateway(reopened)).build(
+        UserMessage(
+            conversation_id="wechaty:contact:liu",
+            sender_id="liu",
+            sender_name="刘峻甫",
+            text="不是这个",
+            message_id="wechat_msg_from_liu_002",
+            quoted_message=QuotedMessageRef(message_id="wechat_msg_from_liu_001"),
+        ),
+        trace_id="trace_platform_sender_reference_quote",
+    )
+
+    exposed = json.dumps(
+        {
+            "quoted_message_context": built.payload["quoted_message_context"],
+            "current_message": built.payload["current_message"],
+        },
+        ensure_ascii=False,
+    )
+    assert "刘峻甫" in exposed
+    assert "高分子" not in exposed
+    assert "宜宾" not in exposed
+    assert "老板备注" not in exposed
+    assert "好哥们儿" not in exposed
+    assert "private_note" not in exposed
+    assert built.payload["quoted_message_context"]["sender_name"] == "刘峻甫"
+    assert built.payload["current_message"]["quoted_message"]["sender_name"] == "刘峻甫"
 
 
 def test_runtime_review_prompt_rejects_internal_enum_and_backend_workflow_leakage() -> None:
