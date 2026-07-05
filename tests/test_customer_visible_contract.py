@@ -10,6 +10,7 @@ from mahjong_agent_runtime.customer_visible_contract import (
     PREFERRED_CANDIDATE_INVITE_PHRASES,
     PREFERRED_OPERATION_ACK_PHRASES,
     PREFERRED_REQUESTER_CURRENT_GAME_PHRASES,
+    compact_customer_visible_text,
     customer_visible_contract_snapshot,
     customer_visible_text_contract_violations,
 )
@@ -82,6 +83,17 @@ def test_customer_visible_text_contract_violations_group_shared_terms() -> None:
 
     assert "implementation_identity_term:智能助手" in violations
     assert "internal_process_term:草稿" in violations
+    assert "internal_process_term:审批" in violations
+    assert "internal_enum:asap_when_full" in violations
+
+
+def test_customer_visible_text_contract_normalizes_spacing_width_and_case() -> None:
+    assert compact_customer_visible_text("Ａ I / 智能 助手 / asap when full") == "ai智能助手asapwhenfull"
+
+    violations = customer_visible_text_contract_violations("我是Ａ I，不要写成智能 助手，asap when full 后等审 批。")
+
+    assert "implementation_identity_term:AI" in violations
+    assert "implementation_identity_term:智能助手" in violations
     assert "internal_process_term:审批" in violations
     assert "internal_enum:asap_when_full" in violations
 

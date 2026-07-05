@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unicodedata
+
 
 FORBIDDEN_CUSTOMER_SERVICE_PHRASES: tuple[str, ...] = (
     "为您",
@@ -80,6 +82,7 @@ def customer_visible_contract_snapshot() -> dict[str, tuple[str, ...]]:
 
 def customer_visible_text_contract_violations(text: str) -> list[str]:
     content = str(text or "")
+    compact_content = compact_customer_visible_text(content)
     checks = (
         ("customer_service_phrase", FORBIDDEN_CUSTOMER_SERVICE_PHRASES),
         ("implementation_identity_term", FORBIDDEN_IMPLEMENTATION_IDENTITY_TERMS),
@@ -87,8 +90,17 @@ def customer_visible_text_contract_violations(text: str) -> list[str]:
         ("internal_enum", INTERNAL_ENUM_EXAMPLES),
     )
     violations: list[str] = []
+    seen: set[tuple[str, str]] = set()
     for category, terms in checks:
         for term in terms:
-            if term and term in content:
+            compact_term = compact_customer_visible_text(term)
+            violation_key = (category, compact_term or term)
+            if term and violation_key not in seen and (term in content or (compact_term and compact_term in compact_content)):
+                seen.add(violation_key)
                 violations.append(f"{category}:{term}")
     return violations
+
+
+def compact_customer_visible_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(char for char in normalized if char.isalnum())
