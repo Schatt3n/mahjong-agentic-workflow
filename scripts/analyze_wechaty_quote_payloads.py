@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections import Counter
@@ -64,6 +65,25 @@ def looks_like_wechat_display_quote(value: Any) -> bool:
     return isinstance(value, str) and bool(WECHAT_DISPLAY_QUOTE_PATTERN.match(value))
 
 
+def parse_wechat_display_quote(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    match = WECHAT_DISPLAY_QUOTE_PATTERN.match(value)
+    if not match:
+        return None
+    quoted_text = str(match.group("quoted") or "").strip()
+    reply_text = str(match.group("reply") or "").strip()
+    if not quoted_text or not reply_text:
+        return None
+    quote_message_id = f"display_quote_{hashlib.sha256(quoted_text.encode('utf-8')).hexdigest()[:12]}"
+    return {
+        "kind": "wechat_display_quote",
+        "message_id": quote_message_id,
+        "quoted_text": quoted_text,
+        "reply_text": reply_text,
+    }
+
+
 def find_quote_like_fields(value: Any, *, prefix: str = "$") -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     if isinstance(value, dict):
@@ -119,6 +139,22 @@ def _message_summary(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _replay_payload(summary: dict[str, Any], parsed_quote: dict[str, str]) -> dict[str, Any]:
+    return {
+        "conversation_id": summary.get("conversation_id"),
+        "sender_id": summary.get("sender_id"),
+        "sender_name": summary.get("sender_name"),
+        "message_id": summary.get("source_message_id"),
+        "text": parsed_quote["reply_text"],
+        "self_message": summary.get("self_message"),
+        "quoted_message": {
+            "message_id": parsed_quote["message_id"],
+            "text": parsed_quote["quoted_text"],
+            "metadata": {"source": parsed_quote["kind"]},
+        },
+    }
+
+
 def analyze_records(records: Iterable[dict[str, Any]], *, max_records: int | None = None) -> dict[str, Any]:
     total_records = 0
     decode_errors: list[dict[str, Any]] = []
@@ -143,11 +179,16 @@ def analyze_records(records: Iterable[dict[str, Any]], *, max_records: int | Non
         for candidate in candidates:
             path_counts[candidate["path"]] += 1
         if candidates:
+            summary = _message_summary(record)
+            parsed_quote = parse_wechat_display_quote(summary.get("text"))
+            replay_payload = _replay_payload(summary, parsed_quote) if parsed_quote else None
             candidate_records.append(
                 {
-                    **_message_summary(record),
+                    **summary,
                     "candidate_count": len(candidates),
                     "candidates": candidates,
+                    "parsed_quote": parsed_quote,
+                    "runtime_replay_payload": replay_payload,
                 }
             )
 

@@ -14,6 +14,16 @@ def load_module():
     return module
 
 
+def load_app_module():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "agent_runtime_app.py"
+    spec = importlib.util.spec_from_file_location("agent_runtime_app_for_quote_analysis_test", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_detects_nested_payload_quote_field() -> None:
     module = load_module()
 
@@ -116,6 +126,12 @@ def test_detects_wechat_display_quote_text() -> None:
     candidate = report["candidate_records"][0]
     assert candidate["source_message_id"] == "m_display_quote"
     assert any(item["path"] == "$.text" and item["kind"] == "wechat_display_quote" for item in candidate["candidates"])
+    assert candidate["parsed_quote"]["kind"] == "wechat_display_quote"
+    assert candidate["parsed_quote"]["quoted_text"] == "超大牌西斗门店（10点-23点）：财敲1    371   八点半开"
+    assert candidate["parsed_quote"]["reply_text"] == "人齐"
+    assert candidate["runtime_replay_payload"]["text"] == "人齐"
+    assert candidate["runtime_replay_payload"]["quoted_message"]["text"] == "超大牌西斗门店（10点-23点）：财敲1    371   八点半开"
+    assert candidate["runtime_replay_payload"]["quoted_message"]["metadata"] == {"source": "wechat_display_quote"}
 
 
 def test_unwraps_wechaty_raw_log_envelope_for_quote_summary() -> None:
@@ -149,6 +165,20 @@ def test_unwraps_wechaty_raw_log_envelope_for_quote_summary() -> None:
     assert candidate["sender_id"] == "friend"
     assert candidate["sender_name"] == "朋友"
     assert any(item["path"] == "$.text" and item["kind"] == "wechat_display_quote" for item in candidate["candidates"])
+    assert candidate["parsed_quote"]["reply_text"] == "1元，无烟，371"
+    assert candidate["runtime_replay_payload"] == {
+        "conversation_id": "wechaty:room:room1",
+        "sender_id": "friend",
+        "sender_name": "朋友",
+        "message_id": "m_enveloped_display_quote",
+        "text": "1元，无烟，371",
+        "self_message": False,
+        "quoted_message": {
+            "message_id": candidate["parsed_quote"]["message_id"],
+            "text": "發一發·杭州 福利官小發：1元，173，22.00开始，无烟",
+            "metadata": {"source": "wechat_display_quote"},
+        },
+    }
 
 
 def test_non_quote_record_is_counted_without_candidates() -> None:
@@ -168,3 +198,50 @@ def test_non_quote_record_is_counted_without_candidates() -> None:
     assert report["total_records"] == 1
     assert report["candidate_record_count"] == 0
     assert report["candidate_records"] == []
+
+
+def test_quote_candidate_without_display_quote_has_no_replay_payload() -> None:
+    module = load_module()
+
+    report = module.analyze_records(
+        [
+            {
+                "conversation_id": "wechaty:contact:alice",
+                "source_message_id": "m_quote_object",
+                "text": "可以",
+                "payload": {"quote": {"id": "q1", "text": "14:00，0.5无烟，打吗？"}},
+            }
+        ]
+    )
+
+    candidate = report["candidate_records"][0]
+    assert candidate["parsed_quote"] is None
+    assert candidate["runtime_replay_payload"] is None
+
+
+def test_runtime_replay_payload_can_be_built_by_wechaty_input(monkeypatch) -> None:
+    module = load_module()
+    app = load_app_module()
+    monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "all")
+
+    report = module.analyze_records(
+        [
+            {
+                "conversation_id": "wechaty:room:test",
+                "source_message_id": "m_display_quote",
+                "sender_id": "friend",
+                "sender_name": "朋友",
+                "text": "「發一發·杭州 福利官小發：1元，173，22.00开始，无烟」\n- - - - - - - - - - - - - - -\n1元，无烟，371",
+            }
+        ]
+    )
+    replay_payload = report["candidate_records"][0]["runtime_replay_payload"]
+
+    message, audit = app.build_wechaty_user_message(replay_payload)
+
+    assert message is not None
+    assert message.text == "1元，无烟，371"
+    assert message.quoted_message is not None
+    assert message.quoted_message.text == "發一發·杭州 福利官小發：1元，173，22.00开始，无烟"
+    assert message.quoted_message.metadata == {"source": "wechat_display_quote"}
+    assert audit["quoted_message"]["metadata"] == {"source": "wechat_display_quote"}
