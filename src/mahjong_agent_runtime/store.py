@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from .models import (
@@ -12,6 +13,7 @@ from .models import (
     ConversationTurn,
     CustomerProfile,
     CustomerRelationship,
+    DEFAULT_TZ,
     GameParticipant,
     GameStatus,
     Game,
@@ -27,6 +29,13 @@ from .models import (
     now,
 )
 
+
+DEFAULT_ASAP_GAME_TTL_HOURS = 4
+DEFAULT_UNKNOWN_DURATION_HOURS = 4
+DEFAULT_OVERNIGHT_DURATION_HOURS = 8
+START_KIND_SCHEDULED = "scheduled"
+START_KIND_ASAP_WHEN_FULL = "asap_" "when_full"
+DURATION_KIND_OVERNIGHT = "overnight"
 
 ALLOWED_GAME_TRANSITIONS = {
     GameStatus.FORMING.value: {
@@ -268,6 +277,7 @@ class InMemoryAgentStore:
 
     def active_games(self, conversation_id: str | None = None) -> list[Game]:
         with self._lock:
+            self._expire_stale_games_locked(trace_id="system_lifecycle")
             games = [
                 item
                 for item in self.games.values()
@@ -501,11 +511,13 @@ class InMemoryAgentStore:
             return scored[: int(limit)]
 
     def active_game_for_customer(self, customer_id: str) -> Game | None:
-        for game in self.games.values():
-            if game.status.value not in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}:
-                continue
-            if any(item.customer_id == customer_id and item.status in {"joined", "confirmed"} for item in game.participants):
-                return game
+        with self._lock:
+            self._expire_stale_games_locked(trace_id="system_lifecycle")
+            for game in self.games.values():
+                if game.status.value not in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}:
+                    continue
+                if any(item.customer_id == customer_id and item.status in {"joined", "confirmed"} for item in game.participants):
+                    return game
         return None
 
     def create_game(
@@ -537,6 +549,7 @@ class InMemoryAgentStore:
                 participants=participants,
                 parties=parties,
             )
+            apply_game_lifecycle(game)
             self.games[game.game_id] = game
             transition = StateTransition(
                 entity_type="game",
@@ -548,6 +561,17 @@ class InMemoryAgentStore:
             )
             self.transitions.append(transition)
             return game, transition
+
+    def _expire_stale_games_locked(self, *, trace_id: str) -> list[StateTransition]:
+        stamp = now()
+        transitions: list[StateTransition] = []
+        for game in self.games.values():
+            transition = expire_game_if_stale(game, at=stamp, trace_id=trace_id)
+            if transition is not None:
+                transitions.append(transition)
+        if transitions:
+            self.transitions.extend(transitions)
+        return transitions
 
     def create_invite_drafts(
         self,
@@ -748,6 +772,8 @@ class InMemoryAgentStore:
             if target.value != old and target.value not in allowed:
                 raise ValueError(f"illegal game status transition: {old}->{target.value}")
             game.status = target
+            if target in {GameStatus.CANCELLED, GameStatus.FINISHED}:
+                game.closed_reason = reason or target.value
             game.updated_at = now()
             transition = StateTransition("game", game.game_id, old, target.value, reason or "update_game_status", trace_id)
             self.transitions.append(transition)
@@ -855,6 +881,135 @@ def normalize_requirement(requirement: dict[str, Any] | None) -> dict[str, Any]:
     elif base_number is not None:
         normalized.setdefault("stake_label", format_number(base_number))
     return normalized
+
+
+def apply_game_lifecycle(game: Game) -> None:
+    lifecycle = derive_game_lifecycle(game.requirement, created_at=game.created_at)
+    game.planned_start_at = lifecycle["planned_start_at"]
+    game.planned_end_at = lifecycle["planned_end_at"]
+    game.expires_at = lifecycle["expires_at"]
+    game.requirement = {
+        **dict(game.requirement),
+        **lifecycle["requirement_patch"],
+    }
+
+
+def expire_game_if_stale(game: Game, *, at: datetime, trace_id: str) -> StateTransition | None:
+    if game.status.value not in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}:
+        return None
+    if game.expires_at is None:
+        apply_game_lifecycle(game)
+    if game.expires_at is None or at < game.expires_at:
+        return None
+    old = game.status.value
+    if game.status == GameStatus.READY or game.remaining_seats() <= 0:
+        game.status = GameStatus.FINISHED
+        game.closed_reason = "game_time_elapsed"
+    else:
+        game.status = GameStatus.CANCELLED
+        game.closed_reason = "expired_without_full_table"
+    game.updated_at = at
+    return StateTransition("game", game.game_id, old, game.status.value, game.closed_reason, trace_id)
+
+
+def derive_game_lifecycle(requirement: dict[str, Any], *, created_at: datetime) -> dict[str, Any]:
+    requirement = dict(requirement or {})
+    created_at = normalize_datetime(created_at)
+    start_kind = str(requirement.get("start_time_kind") or "").strip()
+    planned_start_at = first_datetime_value(
+        requirement,
+        "planned_start_at",
+        "start_at",
+        "start_datetime",
+        "start_time_at",
+    )
+    if planned_start_at is None and start_kind == START_KIND_SCHEDULED:
+        planned_start_at = parse_start_time_on_created_date(requirement.get("start_time"), created_at=created_at)
+    duration_hours = duration_hours_from_requirement(requirement)
+    planned_end_at: datetime | None = None
+    if planned_start_at is not None:
+        planned_end_at = planned_start_at + timedelta(hours=duration_hours)
+
+    if start_kind == START_KIND_ASAP_WHEN_FULL:
+        expires_at = created_at + timedelta(hours=DEFAULT_ASAP_GAME_TTL_HOURS)
+    elif planned_end_at is not None:
+        expires_at = planned_end_at
+    elif planned_start_at is not None:
+        expires_at = planned_start_at + timedelta(hours=DEFAULT_UNKNOWN_DURATION_HOURS)
+    else:
+        expires_at = created_at + timedelta(hours=DEFAULT_ASAP_GAME_TTL_HOURS)
+
+    patch: dict[str, Any] = {
+        "lifecycle_expires_at": expires_at.isoformat(),
+        "lifecycle_ttl_hours": round((expires_at - created_at).total_seconds() / 3600, 3),
+    }
+    if planned_start_at is not None:
+        patch["planned_start_at"] = planned_start_at.isoformat()
+    if planned_end_at is not None:
+        patch["planned_end_at"] = planned_end_at.isoformat()
+    if start_kind == START_KIND_ASAP_WHEN_FULL:
+        patch["latest_start_at"] = expires_at.isoformat()
+    return {
+        "planned_start_at": planned_start_at,
+        "planned_end_at": planned_end_at,
+        "expires_at": expires_at,
+        "requirement_patch": patch,
+    }
+
+
+def duration_hours_from_requirement(requirement: dict[str, Any]) -> float:
+    raw = first_present_value(requirement, "duration_hours", "duration")
+    parsed = parse_number(raw)
+    if parsed is not None and parsed > 0:
+        return min(24.0, parsed)
+    duration_kind = str(requirement.get("duration_kind") or "").strip()
+    if duration_kind == DURATION_KIND_OVERNIGHT:
+        return DEFAULT_OVERNIGHT_DURATION_HOURS
+    return DEFAULT_UNKNOWN_DURATION_HOURS
+
+
+def first_datetime_value(payload: dict[str, Any], *keys: str) -> datetime | None:
+    for key in keys:
+        value = payload.get(key)
+        if is_blank_value(value):
+            continue
+        parsed = parse_datetime_value(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def parse_datetime_value(value: Any) -> datetime | None:
+    if is_blank_value(value):
+        return None
+    if isinstance(value, datetime):
+        return normalize_datetime(value)
+    try:
+        return normalize_datetime(datetime.fromisoformat(str(value)))
+    except ValueError:
+        return None
+
+
+def normalize_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=DEFAULT_TZ)
+    return value
+
+
+def parse_start_time_on_created_date(value: Any, *, created_at: datetime) -> datetime | None:
+    if is_blank_value(value):
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r"(?P<hour>\d{1,2})(?::|：)?(?P<minute>\d{2})?", text)
+    if match is None:
+        match = re.fullmatch(r"(?P<hour>\d{1,2})\s*(?:点|时)(?P<minute>\d{1,2})?", text)
+    if match is None:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return created_at.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 def parse_stake_value(value: Any) -> tuple[float, float | None] | None:

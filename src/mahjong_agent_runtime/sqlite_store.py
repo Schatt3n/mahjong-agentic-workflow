@@ -50,6 +50,8 @@ from .store import (
     join_projection,
     game_for_model_context,
     seat_count_from_payload,
+    apply_game_lifecycle,
+    expire_game_if_stale,
 )
 
 
@@ -423,6 +425,7 @@ class SQLiteAgentStore:
             return checkpoint, transition
 
     def active_games(self, conversation_id: str | None = None) -> list[Game]:
+        self._expire_stale_games(trace_id="system_lifecycle")
         games = [
             item
             for item in self.games.values()
@@ -723,6 +726,7 @@ class SQLiteAgentStore:
         return scored[: int(limit)]
 
     def active_game_for_customer(self, customer_id: str) -> Game | None:
+        self._expire_stale_games(trace_id="system_lifecycle")
         for game in self.games.values():
             if game.status.value not in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}:
                 continue
@@ -762,10 +766,24 @@ class SQLiteAgentStore:
                 participants=participants,
                 parties=parties,
             )
+            apply_game_lifecycle(game)
             transition = StateTransition("game", game.game_id, None, game.status.value, "create_game", trace_id)
             self._save_game(game)
             self._append_transition(transition)
             return game, transition
+
+    def _expire_stale_games(self, *, trace_id: str) -> list[StateTransition]:
+        with self._lock, self._connection:
+            stamp = datetime.now(DEFAULT_TZ)
+            transitions: list[StateTransition] = []
+            for game in self.games.values():
+                transition = expire_game_if_stale(game, at=stamp, trace_id=trace_id)
+                if transition is None:
+                    continue
+                transitions.append(transition)
+                self._save_game(game)
+                self._append_transition(transition)
+            return transitions
 
     def create_invite_drafts(
         self,
@@ -976,6 +994,8 @@ class SQLiteAgentStore:
             if target.value != old and target.value not in allowed:
                 raise ValueError(f"illegal game status transition: {old}->{target.value}")
             game.status = target
+            if target in {GameStatus.CANCELLED, GameStatus.FINISHED}:
+                game.closed_reason = reason or target.value
             game.updated_at = datetime.now(DEFAULT_TZ)
             transition = StateTransition("game", game.game_id, old, target.value, reason or "update_game_status", trace_id)
             self._save_game(game)
@@ -1290,6 +1310,10 @@ def _game_from_payload(payload: dict[str, Any]) -> Game:
         participants=participants,
         parties=parties,
         seats_total=int(payload.get("seats_total") or 4),
+        planned_start_at=_optional_datetime_from_payload(payload.get("planned_start_at")),
+        planned_end_at=_optional_datetime_from_payload(payload.get("planned_end_at")),
+        expires_at=_optional_datetime_from_payload(payload.get("expires_at") or payload.get("lifecycle_expires_at")),
+        closed_reason=str(payload.get("closed_reason") or ""),
         created_at=_datetime_from_payload(payload.get("created_at")),
         updated_at=_datetime_from_payload(payload.get("updated_at")),
     )
@@ -1422,8 +1446,16 @@ def _runtime_result_from_payload(payload: dict[str, Any]) -> AgentRuntimeResult:
 
 def _datetime_from_payload(value: Any) -> datetime:
     if value:
-        return datetime.fromisoformat(str(value))
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=DEFAULT_TZ)
     return datetime.now(DEFAULT_TZ)
+
+
+def _optional_datetime_from_payload(value: Any) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=DEFAULT_TZ)
 
 
 def _dumps(payload: dict[str, Any]) -> str:

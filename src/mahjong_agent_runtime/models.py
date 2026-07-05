@@ -248,6 +248,10 @@ class Game:
     participants: list[GameParticipant] = field(default_factory=list)
     parties: list[Party] = field(default_factory=list)
     seats_total: int = 4
+    planned_start_at: datetime | None = None
+    planned_end_at: datetime | None = None
+    expires_at: datetime | None = None
+    closed_reason: str = ""
     created_at: datetime = field(default_factory=now)
     updated_at: datetime = field(default_factory=now)
 
@@ -304,6 +308,10 @@ class Game:
             "seat_summary": self.seat_summary(),
             "seats_total": self.seats_total,
             "remaining_seats": self.remaining_seats(),
+            "planned_start_at": self.planned_start_at.isoformat() if self.planned_start_at else None,
+            "planned_end_at": self.planned_end_at.isoformat() if self.planned_end_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "closed_reason": self.closed_reason,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }

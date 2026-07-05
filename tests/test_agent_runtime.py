@@ -5,6 +5,7 @@ import importlib.util
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,8 @@ from mahjong_agent_runtime import (
     UserMessage,
 )
 from mahjong_agent_runtime.runtime import build_reply_self_review_payload, message_idempotency_key, normalize_item_reviews
-from mahjong_agent_runtime.store import normalize_requirement
+from mahjong_agent_runtime.models import GameStatus, now
+from mahjong_agent_runtime.store import apply_game_lifecycle, normalize_requirement
 from mahjong_agent_runtime.tracing import trace_steps, validate_trace
 
 
@@ -2623,6 +2625,141 @@ def test_runtime_search_current_games_projects_remaining_seats_after_sender_join
     assert matches[0]["join_projection"]["remaining_seats_before_join"] == 2
     assert matches[0]["join_projection"]["remaining_seats_after_join"] == 1
     assert matches[0]["join_projection"]["would_fill_game"] is False
+
+
+def test_runtime_search_current_games_excludes_expired_scheduled_game() -> None:
+    store = seeded_store()
+    stamp = now().replace(microsecond=0)
+    planned_start_at = stamp - timedelta(hours=6)
+
+    game, _ = store.create_game(
+        conversation_id="runtime_expired_scheduled_game",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "no_smoke",
+            "start_time_kind": "scheduled",
+            "planned_start_at": planned_start_at.isoformat(),
+            "duration_hours": 4,
+        },
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_expired_scheduled_create",
+    )
+
+    assert game.planned_start_at == planned_start_at
+    assert game.planned_end_at == planned_start_at + timedelta(hours=4)
+    assert game.expires_at == game.planned_end_at
+
+    matches = store.search_current_games(
+        {"game_type": "hangzhou_mahjong", "stake": "0.5", "smoke_preference": "no_smoke"},
+        sender_id="liu",
+        limit=5,
+    )
+
+    assert matches == []
+    assert store.games[game.game_id].status == GameStatus.CANCELLED
+    assert store.games[game.game_id].closed_reason == "expired_without_full_table"
+
+
+def test_runtime_asap_when_full_game_expires_after_four_hours() -> None:
+    store = seeded_store()
+
+    game, _ = store.create_game(
+        conversation_id="runtime_expired_asap_game",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "1",
+            "smoke_preference": "any",
+            "start_time_kind": "asap_when_full",
+        },
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_expired_asap_create",
+    )
+    game.created_at = now().replace(microsecond=0) - timedelta(hours=5)
+    apply_game_lifecycle(game)
+
+    matches = store.search_current_games(
+        {"game_type": "hangzhou_mahjong", "stake": "1", "smoke_preference": "any"},
+        sender_id="liu",
+        limit=5,
+    )
+
+    assert matches == []
+    assert game.status == GameStatus.CANCELLED
+    assert game.closed_reason == "expired_without_full_table"
+    assert game.requirement["latest_start_at"] == game.expires_at.isoformat()
+
+
+def test_runtime_ready_game_finishes_after_planned_end_and_releases_players() -> None:
+    store = seeded_store()
+    stamp = now().replace(microsecond=0)
+    planned_start_at = stamp - timedelta(hours=5)
+
+    game, _ = store.create_game(
+        conversation_id="runtime_finished_ready_game",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "1",
+            "smoke_preference": "any",
+            "start_time_kind": "scheduled",
+            "planned_start_at": planned_start_at.isoformat(),
+            "duration_hours": 4,
+        },
+        known_players=[
+            {"customer_id": "zhang", "display_name": "张哥"},
+            {"customer_id": "lin01", "display_name": "林01"},
+            {"customer_id": "liu", "display_name": "刘哥"},
+            {"customer_id": "wang", "display_name": "王哥"},
+        ],
+        trace_id="trace_finished_ready_create",
+    )
+    game.status = GameStatus.READY
+
+    assert store.active_game_for_customer("zhang") is None
+    assert game.status == GameStatus.FINISHED
+    assert game.closed_reason == "game_time_elapsed"
+
+
+def test_runtime_sqlite_search_current_games_excludes_expired_game_and_persists_status(tmp_path) -> None:
+    db_path = tmp_path / "runtime_expired_game.sqlite3"
+    store = seeded_store(SQLiteAgentStore(db_path))
+    planned_start_at = now().replace(microsecond=0) - timedelta(hours=6)
+
+    game, _ = store.create_game(
+        conversation_id="runtime_sqlite_expired_game",
+        organizer_id="zhang",
+        organizer_name="张哥",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "no_smoke",
+            "start_time_kind": "scheduled",
+            "planned_start_at": planned_start_at.isoformat(),
+            "duration_hours": 4,
+        },
+        known_players=[{"customer_id": "zhang", "display_name": "张哥"}],
+        trace_id="trace_sqlite_expired_create",
+    )
+
+    matches = store.search_current_games(
+        {"game_type": "hangzhou_mahjong", "stake": "0.5", "smoke_preference": "no_smoke"},
+        sender_id="liu",
+        limit=5,
+    )
+    persisted = store.require_game(game.game_id)
+    reopened = SQLiteAgentStore(db_path).require_game(game.game_id)
+
+    assert matches == []
+    assert persisted.status == GameStatus.CANCELLED
+    assert persisted.closed_reason == "expired_without_full_table"
+    assert reopened.status == GameStatus.CANCELLED
+    assert reopened.closed_reason == "expired_without_full_table"
 
 
 def test_search_current_games_does_not_treat_target_game_population_as_sender_party_size() -> None:
