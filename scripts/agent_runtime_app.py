@@ -388,11 +388,89 @@ TRANSCRIPT_FIELD_SOURCES = [
 ]
 
 
+SAFE_USER_MESSAGE_METADATA_KEYS = {
+    "channel",
+    "platform_name",
+    "source",
+    "message_type",
+    "source_message_id",
+    "is_room",
+    "self_message",
+    "has_text",
+    "text_source",
+    "modalities",
+    "media_candidates",
+    "raw_observation_summary",
+    "media_requires_transcription",
+    "media_requires_ocr",
+    "transcript_confidence",
+    "ocr_confidence",
+    "language",
+}
+
+
 def safe_text_preview(value: object, limit: int = 120) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def safe_metadata_media_candidates(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    safe_items: list[dict] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        safe_item = {
+            "path": safe_text_preview(item.get("path"), 160),
+            "kind": safe_text_preview(item.get("kind"), 40),
+            "value_type": safe_text_preview(item.get("value_type"), 40),
+        }
+        text_preview = safe_text_preview(item.get("text_preview"), 120)
+        if text_preview:
+            safe_item["text_preview"] = text_preview
+        safe_items.append({key: val for key, val in safe_item.items() if val not in {"", None}})
+    return safe_items
+
+
+def safe_metadata_observation_summary(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    summary: dict[str, int] = {}
+    for key in ("quote_candidate_count", "media_candidate_count"):
+        try:
+            summary[key] = max(int(value.get(key) or 0), 0)
+        except (TypeError, ValueError):
+            continue
+    return summary
+
+
+def sanitize_user_message_metadata(metadata: object) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    sanitized: dict[str, object] = {}
+    for key, value in metadata.items():
+        if key not in SAFE_USER_MESSAGE_METADATA_KEYS:
+            continue
+        if key == "modalities":
+            if isinstance(value, list):
+                sanitized[key] = [safe_text_preview(item, 40) for item in value[:12] if str(item or "").strip()]
+            continue
+        if key == "media_candidates":
+            sanitized[key] = safe_metadata_media_candidates(value)
+            continue
+        if key == "raw_observation_summary":
+            sanitized[key] = safe_metadata_observation_summary(value)
+            continue
+        if isinstance(value, bool) or value is None:
+            sanitized[key] = value
+        elif isinstance(value, (int, float)):
+            sanitized[key] = value
+        elif isinstance(value, str):
+            sanitized[key] = safe_text_preview(value, 160)
+    return sanitized
 
 
 def text_from_wechaty_payload(payload: dict) -> tuple[str, str]:
@@ -432,8 +510,8 @@ def compact_media_candidates(raw_observation: dict) -> list[dict]:
         value = candidate.get("value")
         kind = media_kind_from_hint(raw_kind) or media_kind_from_hint(path) or media_kind_from_hint(value)
         item = {
-            "path": path,
-            "kind": kind or "unknown_media",
+            "path": safe_text_preview(path, 160),
+            "kind": safe_text_preview(kind or "unknown_media", 40),
             "value_type": type(value).__name__,
         }
         if isinstance(value, str):
@@ -480,7 +558,7 @@ def build_wechaty_message_metadata(payload: dict, *, text: str, text_source: str
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     has_transcript = bool(text and text_source and text_source != "text")
     return {
-        **dict(metadata),
+        **sanitize_user_message_metadata(metadata),
         "channel": "wechaty",
         "platform_name": str(payload.get("platform_name") or "wechaty"),
         "message_type": payload.get("message_type"),
@@ -651,7 +729,7 @@ def build_api_user_message(payload: dict) -> tuple[UserMessage | None, list[str]
             text=str(payload["text"]).strip(),
             message_id=str(payload.get("message_id") or "").strip() or None,
             quoted_message=parse_quoted_message_ref(payload),
-            metadata=dict(metadata),
+            metadata=sanitize_user_message_metadata(metadata),
         ),
         [],
     )

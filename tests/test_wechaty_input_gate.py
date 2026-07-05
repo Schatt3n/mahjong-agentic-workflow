@@ -139,6 +139,82 @@ def test_build_wechaty_user_message_routes_transcribed_voice_with_metadata(monke
     assert audit["metadata"]["media_candidates"][0]["kind"] == "voice"
 
 
+def test_build_wechaty_user_message_sanitizes_metadata_before_context(monkeypatch) -> None:
+    monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "all")
+    message, audit = app.build_wechaty_user_message(
+        {
+            "conversation_id": "wechaty:contact:friend",
+            "sender_id": "friend",
+            "sender_name": "朋友",
+            "message_id": "msg_metadata_boundary",
+            "message_type": 7,
+            "text": "现在有人打牌吗",
+            "self_message": False,
+            "metadata": {
+                "source": "wechaty_bridge",
+                "raw_provider_payload": {"secret": "do-not-send-to-model"},
+                "audio_transcript": "这个字段已经用于 text，不再保留到 metadata",
+                "private_note": "老板备注不该进入模型上下文",
+                "modalities": ["text", "voice"],
+                "raw_observation_summary": {"quote_candidate_count": "2", "ignored": "x"},
+            },
+        }
+    )
+
+    assert message is not None
+    assert message.metadata["source"] == "wechaty_bridge"
+    assert message.metadata["channel"] == "wechaty"
+    assert message.metadata["modalities"] == ["text"]
+    assert message.metadata["raw_observation_summary"] == {"quote_candidate_count": 0, "media_candidate_count": 0}
+    assert "raw_provider_payload" not in message.metadata
+    assert "private_note" not in message.metadata
+    assert "audio_transcript" not in message.metadata
+    assert "raw_provider_payload" not in audit["metadata"]
+
+
+def test_build_api_user_message_sanitizes_metadata() -> None:
+    message, missing = app.build_api_user_message(
+        {
+            "conversation_id": "api_conv",
+            "sender_id": "api_user",
+            "sender_name": "接口用户",
+            "text": "今晚有局吗",
+            "metadata": {
+                "channel": "manual_console",
+                "source_message_id": "src_001",
+                "raw_payload": {"secret": "not-for-model"},
+                "private_note": "不要进上下文",
+                "modalities": ["text", "image"],
+                "media_candidates": [
+                    {
+                        "path": "$.raw_observation.media_candidates[0]",
+                        "kind": "image",
+                        "value_type": "str",
+                        "value": "large-raw-value",
+                        "text_preview": "截图 OCR 摘要",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert missing == []
+    assert message is not None
+    assert message.metadata["channel"] == "manual_console"
+    assert message.metadata["source_message_id"] == "src_001"
+    assert message.metadata["modalities"] == ["text", "image"]
+    assert message.metadata["media_candidates"] == [
+        {
+            "path": "$.raw_observation.media_candidates[0]",
+            "kind": "image",
+            "value_type": "str",
+            "text_preview": "截图 OCR 摘要",
+        }
+    ]
+    assert "raw_payload" not in message.metadata
+    assert "private_note" not in message.metadata
+
+
 def test_build_wechaty_user_message_blocks_untranscribed_media_with_audit(monkeypatch) -> None:
     monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "all")
     message, audit = app.build_wechaty_user_message(
