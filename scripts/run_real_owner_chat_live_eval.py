@@ -63,6 +63,7 @@ class LiveEvalScenario:
     required_reply_any: list[list[str]] = field(default_factory=list)
     required_reply_contains: list[str] = field(default_factory=list)
     forbidden_reply_contains: list[str] = field(default_factory=list)
+    forbidden_model_context_contains: list[str] = field(default_factory=list)
     forbidden_trace_steps: list[str] = field(default_factory=lambda: ["action_contract_error", "llm_error"])
     expected_tool_result_paths: dict[str, dict[str, Any]] = field(default_factory=dict)
     expected_active_game_count: int | None = None
@@ -566,6 +567,16 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 "可以不",
                 *common_forbidden,
             ],
+            forbidden_model_context_contains=[
+                "夏日-老板备注",
+                "笑脸-老板备注",
+                "可星-老板备注",
+                "可室外抽烟",
+                "偶尔迟到",
+                "熟人带局",
+                "经常喊人",
+                "不稳定",
+            ],
             expected_active_game_count=1,
             expected_active_game_seat_summary={
                 "claimed_seats": 3,
@@ -908,8 +919,15 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
     ]
 
 
-def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[str], store: SQLiteAgentStore) -> dict[str, Any]:
+def validate_result(
+    result: Any,
+    scenario: LiveEvalScenario,
+    trace_events: list[Any],
+    store: SQLiteAgentStore,
+) -> dict[str, Any]:
     final_reply = str(result.final_reply or "")
+    trace_steps = [item.step for item in trace_events]
+    model_context_text = customer_supplied_model_context_text(trace_events)
     tool_names = [item.name for item in result.tool_results if item.name not in {"customer_visible_text_generation", "customer_visible_content_review"}]
     checks: list[dict[str, Any]] = []
     for tool_name in scenario.required_tool_names:
@@ -975,6 +993,15 @@ def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[s
                 "passed": item not in final_reply,
                 "forbidden": item,
                 "actual": final_reply,
+            }
+        )
+    for item in scenario.forbidden_model_context_contains:
+        checks.append(
+            {
+                "name": f"model_context_should_not_contain_{item}",
+                "passed": item not in model_context_text,
+                "forbidden": item,
+                "actual_preview": context_preview_around(model_context_text, item),
             }
         )
     for step in scenario.forbidden_trace_steps:
@@ -1049,6 +1076,32 @@ def validate_result(result: Any, scenario: LiveEvalScenario, trace_steps: list[s
         "final_reply": final_reply,
         "tool_names": tool_names,
     }
+
+
+def customer_supplied_model_context_text(trace_events: list[Any]) -> str:
+    payloads: list[Any] = []
+    for event in trace_events:
+        if event.step == "context_built":
+            payloads.append(event.content)
+            continue
+        if event.step == "llm_prompt":
+            user_messages: list[dict[str, Any]] = []
+            for message in event.content.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") != "system":
+                    user_messages.append(message)
+            payloads.append({"messages": user_messages, "step_index": event.content.get("step_index")})
+    return json.dumps(payloads, ensure_ascii=False, sort_keys=True)
+
+
+def context_preview_around(text: str, needle: str, window: int = 120) -> str:
+    if not needle:
+        return ""
+    index = text.find(needle)
+    if index < 0:
+        return ""
+    start = max(index - window, 0)
+    end = min(index + len(needle) + window, len(text))
+    return text[start:end]
 
 
 def value_at_path(payload: Any, dotted_path: str) -> Any:
@@ -1135,8 +1188,9 @@ def run_scenario(client: OpenAICompatibleAgentClient, args: argparse.Namespace, 
     runtime = build_runtime(client, store, trace, args)
     trace_id = f"trace_owner_real_live_eval_{scenario.scenario_id}"
     result = runtime.handle_user_message(scenario.message, trace_id=trace_id)
-    trace_steps = [item.step for item in trace.get_trace(trace_id)]
-    validation = validate_result(result, scenario, trace_steps, store)
+    trace_events = trace.get_trace(trace_id)
+    trace_steps = [item.step for item in trace_events]
+    validation = validate_result(result, scenario, trace_events, store)
     return {
         "status": "passed" if validation["passed"] else "failed",
         "trace_id": result.trace_id,
