@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+"""Goal-driven Agent 主运行时。
+
+设计理念：
+- 主 loop 只负责编排，不承载具体业务语义规则。
+- 模型负责理解用户目标、规划下一步、提出工具调用或回复。
+- 后端负责合同校验、预算控制、工具权限、幂等、顺序、状态落库和审计。
+- 凡是客户可见文本，不管来自最终回复还是工具参数，都先经过话术生成和安全审查。
+"""
+
 import json
 import threading
 import time
@@ -34,6 +43,12 @@ from .visibility import (
 
 @dataclass(slots=True)
 class TurnBudgets:
+    """一次用户消息处理过程中的三类 LLM 预算。
+
+    agent 用于主模型循环；review 用于客户可见文本审查；text_generation 用于话术生成。
+    三者分开统计，避免话术/审查把主 agent 的预算吃光，也方便后续单独调参。
+    """
+
     agent: TokenBudget
     review: TokenBudget
     text_generation: TokenBudget
@@ -41,6 +56,12 @@ class TurnBudgets:
 
 @dataclass(slots=True)
 class ModelActionStep:
+    """主模型单步输出的标准包装。
+
+    一轮 LLM 调用可能得到合法 AgentAction，也可能因为超时、预算、合同错误而直接结束。
+    这个对象把这些结果收敛成主 loop 能理解的统一结构。
+    """
+
     action: AgentAction | None
     raw_response: str = ""
     errors: list[str] = field(default_factory=list)
@@ -50,6 +71,12 @@ class ModelActionStep:
 
 @dataclass(slots=True)
 class ActionProcessingResult:
+    """处理一个 AgentAction 后交还给主 loop 的结果。
+
+    tool_results 是本轮真实或虚拟工具结果；pending_tool_results 会回喂给下一轮模型；
+    final_reply 表示本次用户消息已经可以结束；continue_loop 表示工具结果还需要模型继续判断。
+    """
+
     action: AgentAction
     tool_results: list[ToolResult] = field(default_factory=list)
     pending_tool_results: list[ToolResult] = field(default_factory=list)
@@ -60,6 +87,12 @@ class ActionProcessingResult:
 
 @dataclass(slots=True)
 class AgentRuntime:
+    """Agent 运行时的总控编排器。
+
+    它不是业务规则引擎，而是受控执行环境：接收用户消息，构建上下文，调用模型，
+    校验模型输出，执行工具，把工具结果回喂模型，并保证状态写入、客户可见文本和日志审计安全可控。
+    """
+
     llm_client: AgentLLMClient
     store: InMemoryAgentStore = field(default_factory=InMemoryAgentStore)
     tool_gateway: ToolGateway | None = None
@@ -81,6 +114,8 @@ class AgentRuntime:
     _conversation_locks_guard: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """初始化默认工具网关、trace 注入和上下文构建器。"""
+
         if self.tool_gateway is None:
             self.tool_gateway = ToolGateway(self.store)
         if self.tool_gateway.trace_recorder is None:
@@ -88,6 +123,12 @@ class AgentRuntime:
         self.context_builder = AgentContextBuilder(self.store, self.tool_gateway)
 
     def handle_user_message(self, message: UserMessage, *, trace_id: str | None = None) -> AgentRuntimeResult:
+        """处理一条用户消息的外层入口。
+
+        这里负责会话级并发锁、消息幂等、run/version 推进、旧的待发送回复失效、摘要 checkpoint 触发。
+        真正的 agent loop 放在 _handle_once，避免外层入口和模型循环混在一起。
+        """
+
         with self._conversation_lock(message.conversation_id):
             actual_trace_id = trace_id or f"trace_{uuid.uuid4().hex[:12]}"
             message_key = message_idempotency_key(message)
@@ -159,6 +200,12 @@ class AgentRuntime:
             return result
 
     def _handle_once(self, message: UserMessage, *, trace_id: str, run_id: str, run_version: int) -> AgentRuntimeResult:
+        """执行一次目标驱动 agent loop。
+
+        loop 的核心节奏是：构建上下文 -> 调主模型 -> 校验合同 -> 分流到工具或回复 ->
+        把工具结果回喂模型。它只决定流程走向，不在这里写具体业务 if-else。
+        """
+
         budgets = self._fresh_turn_budgets()
         self.store.append_user_turn(message, trace_id)
         self.trace_recorder.record(trace_id, "user_input", {"message": message.to_dict()})
@@ -264,6 +311,12 @@ class AgentRuntime:
         )
 
     def _fresh_turn_budgets(self) -> TurnBudgets:
+        """为当前用户消息复制一份独立预算计数器。
+
+        TokenBudget 内部有 calls_this_turn 状态；每条用户消息必须从 0 开始统计，
+        不能复用 runtime 级默认对象，否则不同消息会互相污染预算。
+        """
+
         return TurnBudgets(
             agent=TokenBudget(
                 max_tokens_per_call=self.token_budget.max_tokens_per_call,
@@ -289,6 +342,12 @@ class AgentRuntime:
         run_version: int,
         step_index: int,
     ) -> Any:
+        """构建本轮喂给主模型的上下文并完整写 trace。
+
+        previous_tool_results 是上一轮工具结果，模型需要看到它才能决定下一步。
+        这里同时记录 context_packed、context_built、llm_prompt，保证每次决策可回溯。
+        """
+
         built = self.context_builder.build(
             message,
             trace_id=trace_id,
@@ -312,6 +371,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> ModelActionStep:
+        """调用主模型并解析成 AgentAction。
+
+        这里只做预算、超时、原始响应记录和合同解析；不执行工具、不落库业务状态。
+        如果模型失败或预算不足，返回一个可被主 loop 终止的安全结果。
+        """
+
         budget_decision = budget.reserve(built_messages)
         self.trace_recorder.record(trace_id, "budget_checked", budget_decision.to_dict())
         if not budget_decision.allowed:
@@ -364,6 +429,12 @@ class AgentRuntime:
         errors: list[str],
         step_index: int,
     ) -> list[ToolResult]:
+        """把模型合同错误包装成工具结果回喂模型。
+
+        设计上不直接把合同错误变成人工兜底；如果还有 loop 步数，就给模型一次修正机会。
+        这能让主模型学会遵守 AgentAction 契约，同时不执行任何不可信工具。
+        """
+
         self.trace_recorder.record(trace_id, "action_contract_error", {"errors": errors, "step_index": step_index}, level="WARN")
         feedback = ToolResult(
             name="agent_action_contract",
@@ -388,6 +459,12 @@ class AgentRuntime:
         step_index: int,
         previous_tool_result_count: int,
     ) -> None:
+        """记录模型提出的目标、计划、状态和工具名。
+
+        这一步是可观测的关键：当回复或工具调用不符合预期时，可以从 trace 看到模型当时的目标理解、
+        计划修订原因和它准备调用哪些工具。
+        """
+
         self.trace_recorder.record(trace_id, "action_proposed", action.to_dict())
         self.trace_recorder.record(
             trace_id,
@@ -417,6 +494,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> ActionProcessingResult:
+        """处理包含 tool_calls 的 AgentAction。
+
+        工具参数里可能包含候选人邀约等客户可见文本，所以先做话术生成和安全审查；
+        审查通过后才进入真正的工具执行。审查失败会把结果回喂模型，让模型重写而不是硬编码兜底。
+        """
+
         processor = self._customer_visible_processor()
         collected_results: list[ToolResult] = []
         review_items = customer_visible_items_for_action(action)
@@ -491,6 +574,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> ActionProcessingResult:
+        """顺序执行模型提出的工具调用。
+
+        后端在这里做跨工具参数一致性、过期 run 拦截、工具网关执行、状态变更日志和工具结果落入短期记忆。
+        这里是模型意图变成系统动作的边界，因此必须比普通函数调用更保守。
+        """
+
         tool_results: list[ToolResult] = []
         pending_tool_results: list[ToolResult] = []
         blocked_by_consistency = False
@@ -602,6 +691,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> ActionProcessingResult:
+        """处理不需要继续调用工具的最终回复。
+
+        最终回复也属于客户可见文本，所以同样经过话术生成和内容审查。
+        审查通过后只写入 pending assistant turn，由外部通道决定是否真正发送。
+        """
+
         processor = self._customer_visible_processor()
         collected_results: list[ToolResult] = []
         proposed_reply = action.reply_to_user.strip()
@@ -692,6 +787,11 @@ class AgentRuntime:
         return ActionProcessingResult(action=action, tool_results=collected_results, final_reply=proposed_reply, stop_loop=True)
 
     def _apply_customer_visible_rewrites(self, action: AgentAction, result: ToolResult, *, trace_id: str) -> AgentAction:
+        """把话术生成器返回的改写结果应用回 AgentAction。
+
+        工具调用参数中的 message_text 可能被改写；主 loop 后续必须使用改写后的 action 做审查和执行。
+        """
+
         rewrites = self._customer_visible_rewrites(result)
         if not rewrites:
             return action
@@ -701,6 +801,8 @@ class AgentRuntime:
 
     @staticmethod
     def _customer_visible_rewrites(result: ToolResult) -> dict[str, str]:
+        """从话术生成工具结果中提取 item_id -> final_text 映射。"""
+
         return {
             str(item.get("item_id") or ""): str(item.get("final_text") or "")
             for item in result.result.get("item_rewrites", [])
@@ -708,6 +810,8 @@ class AgentRuntime:
         }
 
     def _run_is_stale(self, conversation_id: str, run_version: int) -> bool:
+        """判断当前 run 是否已经被同会话的新消息超越。"""
+
         return self.store.conversation_version(conversation_id) != int(run_version)
 
     def _stale_write_tool_result(
@@ -718,6 +822,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> ToolResult | None:
+        """为过期 run 的写工具生成一个拒绝执行结果。
+
+        如果用户在旧流程还没结束时又补充了新消息，旧流程不能再创建局、生成草稿或写状态；
+        否则会出现“用户刚改条件，旧条件还在落库”的并发错乱。
+        """
+
         definition = self.tool_gateway.tools.get(call_name) if self.tool_gateway else None
         if definition is None or definition.execution_mode not in {"state_write", "draft_write"}:
             return None
@@ -749,6 +859,12 @@ class AgentRuntime:
         run_id: str,
         run_version: int,
     ) -> None:
+        """记录一条待外发的 assistant 回复。
+
+        当前系统默认外发前仍可审批/关闭通道，因此这里标记为 pending_operator_send，
+        真正发送由 Web/WeChaty 通道层决定。
+        """
+
         self.store.append_assistant_turn(
             conversation_id,
             text,
@@ -761,6 +877,8 @@ class AgentRuntime:
         )
 
     def _conversation_lock(self, conversation_id: str) -> threading.RLock:
+        """返回会话级锁，保证同一个 conversation 内的消息顺序处理。"""
+
         key = conversation_id or "default"
         with self._conversation_locks_guard:
             lock = self._conversation_locks.get(key)
@@ -770,6 +888,12 @@ class AgentRuntime:
             return lock
 
     def _customer_visible_processor(self) -> CustomerVisibleProcessor:
+        """创建客户可见文本处理器。
+
+        这是主 loop 与“话术生成/安全审查”子链路的边界。runtime 只提供依赖和开关，
+        具体生成、审查、合同解析都在 visibility.py 中完成。
+        """
+
         return CustomerVisibleProcessor(
             llm_client=self.llm_client,
             trace_recorder=self.trace_recorder,
@@ -793,6 +917,11 @@ class AgentRuntime:
         turn_budget: TokenBudget,
         generation_scope: str,
     ) -> ToolResult | None:
+        """兼容入口：运行客户可见话术生成。
+
+        一些脚本仍直接调用 runtime 的旧私有方法，所以保留薄封装；实际逻辑已迁移到 CustomerVisibleProcessor。
+        """
+
         return self._customer_visible_processor().run_text_generation(
             message=message,
             trace_id=trace_id,
@@ -814,6 +943,11 @@ class AgentRuntime:
         turn_budget: TokenBudget,
         review_scope: str,
     ) -> ToolResult | None:
+        """兼容入口：运行客户可见内容审查。
+
+        保留这个方法是为了不破坏现有脚本调用；主逻辑已从 runtime 拆到 visibility.py。
+        """
+
         return self._customer_visible_processor().run_content_review(
             message=message,
             trace_id=trace_id,
@@ -826,4 +960,9 @@ class AgentRuntime:
 
 
 def message_idempotency_key(message: UserMessage) -> str:
+    """生成用户消息幂等键。
+
+    幂等维度包含 conversation、sender 和 source message id，防止上游重复投递导致同一消息被处理两次。
+    """
+
     return f"conversation:{message.conversation_id}:sender:{message.sender_id}:message:{message.message_id}"

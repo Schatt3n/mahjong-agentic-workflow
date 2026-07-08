@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+"""客户可见文本生成与审查。
+
+设计理念：
+- 主 agent 可以提出回复和邀约草稿，但凡是客户可能看到的文本，都必须走统一处理链路。
+- 话术生成负责把结构化、僵硬的文本改得更像老板说话。
+- 内容审查只负责信息泄露和未验证动作风险，不做业务规划，不决定工具调用。
+- 这一层是生产安全边界，不应该散落在主 loop 或具体工具里。
+"""
+
 import json
 import time
 from dataclasses import dataclass
@@ -25,6 +34,12 @@ CUSTOMER_VISIBLE_TEXT_GENERATION_NAME = "customer_visible_text_generation"
 
 @dataclass(slots=True)
 class CustomerVisibleProcessor:
+    """客户可见文本处理器。
+
+    它把“话术生成”和“安全审查”从主 runtime 中拆出来。
+    runtime 只负责判断什么时候调用它；它负责构建专用上下文、调用模型、校验返回合同和写 trace。
+    """
+
     llm_client: AgentLLMClient
     trace_recorder: Any
     timeout_seconds: float
@@ -46,6 +61,12 @@ class CustomerVisibleProcessor:
         turn_budget: TokenBudget,
         generation_scope: str,
     ) -> ToolResult | None:
+        """运行客户可见话术生成。
+
+        generation_scope 用来区分是最终回复还是工具参数里的邀约草稿。
+        如果开关关闭、没有文本或预算不足，就不阻断主流程，直接返回 None。
+        """
+
         if not self.text_generation_enabled or not items:
             return None
         client = self.text_generation_client or self.llm_client
@@ -126,6 +147,12 @@ class CustomerVisibleProcessor:
         turn_budget: TokenBudget,
         review_scope: str,
     ) -> ToolResult | None:
+        """运行客户可见内容审查。
+
+        审查结果以 ToolResult 形式返回给主 loop：通过则继续执行，失败则作为工具结果回喂主模型修正。
+        当审查模型异常或预算不足时，返回 allowed=False，要求主流程走安全兜底或人工。
+        """
+
         if not self.review_enabled or not review_items:
             return None
         client = self.review_client or self.llm_client
@@ -239,6 +266,8 @@ class CustomerVisibleProcessor:
 
 
 def customer_visible_content_review_approved(result: ToolResult) -> bool:
+    """判断审查工具结果是否整体通过。"""
+
     return (
         result.name == CUSTOMER_VISIBLE_CONTENT_REVIEW_TOOL_NAME
         and result.called
@@ -249,6 +278,12 @@ def customer_visible_content_review_approved(result: ToolResult) -> bool:
 
 
 def customer_visible_items_for_action(action: AgentAction) -> list[dict[str, Any]]:
+    """从 AgentAction 的工具参数里提取客户可见文本。
+
+    目前主要提取邀约草稿。即使这些文本还没有真正发出去，也可能被老板复制或自动外发，
+    所以必须在工具执行前统一审查。
+    """
+
     items: list[dict[str, Any]] = []
     for call_index, call in enumerate(action.tool_calls, start=1):
         if call.name == "create_invite_drafts":
@@ -289,6 +324,12 @@ def customer_visible_items_for_action(action: AgentAction) -> list[dict[str, Any
 
 
 def normalize_item_reviews(review: dict[str, Any], review_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把审查模型返回的 item_reviews 归一成稳定结构。
+
+    兼容早期只有 final_reply 的旧格式，也处理模型漏字段的情况。
+    后续审批逻辑只消费归一后的结构，避免到处写兼容分支。
+    """
+
     raw_reviews = review.get("item_reviews")
     if not isinstance(raw_reviews, list):
         legacy_safe_text = str(review.get("final_reply") or "").strip()
@@ -333,6 +374,8 @@ def normalize_review_item_contract(
     reasoning_summary: str,
     violations: list[str],
 ) -> dict[str, Any]:
+    """归一单条审查结果，并叠加确定性的文本合同检查。"""
+
     contract_violations = customer_visible_text_contract_violations(suggested_safe_text)
     normalized_violations = list(violations)
     for violation in contract_violations:
@@ -347,6 +390,12 @@ def normalize_review_item_contract(
 
 
 def item_reviews_approved(item_reviews: list[dict[str, Any]], review_items: list[dict[str, Any]]) -> bool:
+    """判断每个客户可见文本是否都被原文通过。
+
+    审查通过的定义很严格：数量一致、item_id 一致、approved=true、safe_text 与原文一致、
+    且确定性合同检查没有发现系统信息泄露。
+    """
+
     original_by_id = {str(item.get("item_id") or ""): str(item.get("text") or "") for item in review_items}
     if len(item_reviews) != len(review_items):
         return False
@@ -372,6 +421,12 @@ def build_reply_self_review_payload(
     context_payload: dict[str, Any],
     review_scope: str,
 ) -> dict[str, Any]:
+    """构建审查模型专用上下文。
+
+    审查模型不需要完整主 agent 上下文，只需要当前消息、关系、现有局摘要、最近对话尾部、
+    待审文本和审查合同。这样既省 token，也避免审查模型越权做规划。
+    """
+
     return {
         "current_message": message.to_dict(),
         "sender_profile": context_payload.get("sender_profile"),
@@ -416,6 +471,8 @@ def build_reply_self_review_payload(
 
 
 def parse_reply_self_review(raw_response: str) -> tuple[dict[str, Any], list[str]]:
+    """解析并校验审查模型的 JSON 输出。"""
+
     try:
         payload = json.loads(raw_response)
     except json.JSONDecodeError as exc:

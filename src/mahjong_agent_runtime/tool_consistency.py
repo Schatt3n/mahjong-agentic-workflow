@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""跨工具参数一致性校验。
+
+设计理念：
+- 模型可以根据工具结果动态调整计划，但不能在没有用户新输入的情况下偷偷改关键条件。
+- 例如上一轮按 16:00/0.5/无烟搜索现有局，下一轮 create_game 不能变成人齐开/1块/有烟。
+- 这类校验是生产边界，不是补业务 if-else；它保护的是“读到什么条件，就按什么条件继续写”。
+"""
+
 from typing import Any
 
 from .models import ToolResult
@@ -20,6 +28,12 @@ CONSISTENT_REQUIREMENT_FIELDS = (
 
 
 def validate_tool_call_consistency(call: Any, previous_tool_results: list[ToolResult]) -> str | None:
+    """校验当前写工具是否和上一轮读工具条件一致。
+
+    当前只约束 create_game 与最近一次 search_current_games 的 requirement。
+    如果发现关键槽位漂移，返回错误文本给主 loop，主 loop 会把错误作为工具结果回喂模型修正。
+    """
+
     if getattr(call, "name", "") != "create_game":
         return None
     current_requirement = call.arguments.get("requirement") if isinstance(call.arguments, dict) else None
@@ -47,6 +61,12 @@ def validate_tool_call_consistency(call: Any, previous_tool_results: list[ToolRe
 
 
 def latest_read_requirement(previous_tool_results: list[ToolResult], *, tool_name: str) -> dict[str, Any] | None:
+    """从工具结果中找到最近一次读工具使用的 requirement。
+
+    同时兼容普通工具结果和之前一致性校验失败时返回的 reference_requirement，
+    这样模型连续修正多轮时仍能看到原始参考条件。
+    """
+
     for result in reversed(previous_tool_results):
         if result.result.get("reference_tool_name") == tool_name and isinstance(result.result.get("reference_requirement"), dict):
             return result.result["reference_requirement"]
@@ -59,6 +79,8 @@ def latest_read_requirement(previous_tool_results: list[ToolResult], *, tool_nam
 
 
 def normalized_requirement_value(value: Any) -> Any:
+    """把 requirement 字段归一成可比较的值。"""
+
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, (int, float, bool)) or value is None:

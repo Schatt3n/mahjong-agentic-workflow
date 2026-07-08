@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""主模型 AgentAction 输出合同校验。
+
+设计理念：
+- LLM 可以决定下一步做什么，但必须用后端规定的结构化合同表达。
+- 合同校验只检查结构、状态约束和安全不变量，不写麻将业务 if-else。
+- 合同不合法时，后端不执行任何工具，而是把错误作为工具结果回喂模型修正。
+"""
+
 import json
 from typing import Any
 
@@ -7,6 +15,12 @@ from .models import AgentAction
 
 
 def parse_action(raw_response: str) -> tuple[AgentAction, list[str]]:
+    """把模型原始文本解析为 AgentAction。
+
+    返回值始终包含一个 AgentAction；如果解析失败，返回 contract_error_action 和错误列表，
+    这样主 loop 可以统一处理，不需要在每个调用点写异常分支。
+    """
+
     try:
         payload = json.loads(raw_response)
     except json.JSONDecodeError as exc:
@@ -20,6 +34,12 @@ def parse_action(raw_response: str) -> tuple[AgentAction, list[str]]:
 
 
 def validate_action_contract(payload: dict[str, Any]) -> list[str]:
+    """校验主模型输出是否符合 AgentAction 合同。
+
+    重点检查 required keys、字段类型、tool_calls 结构、objective_status 与 reply/tool 的互斥关系，
+    以及 stop_reason 是否能解释为什么继续或停止。
+    """
+
     errors: list[str] = []
     for key in [
         "goal",
@@ -87,6 +107,12 @@ def validate_action_contract(payload: dict[str, Any]) -> list[str]:
 
 
 def validate_objective_plan_contract(raw_plan: Any) -> list[str]:
+    """校验模型输出的目标计划列表。
+
+    计划用于可观测和多步任务推进，不直接驱动数据库写入；
+    因此这里只做结构约束，具体是否执行仍由 tool_calls 和 ToolGateway 决定。
+    """
+
     if raw_plan is None:
         return []
     if not isinstance(raw_plan, list):
@@ -113,6 +139,12 @@ def validate_objective_plan_contract(raw_plan: Any) -> list[str]:
 
 
 def validate_stop_reason_contract(stop_reason: dict[str, Any], status: Any) -> list[str]:
+    """校验模型声明的停止原因。
+
+    这个字段要求模型显式说明“为什么能停”或“为什么还要继续调用工具”，
+    方便排查模型过早停止、漏调用工具或无意义循环。
+    """
+
     errors: list[str] = []
     for key in ["can_stop", "why", "pending_work", "depends_on_tool_results"]:
         if key not in stop_reason:
@@ -143,6 +175,12 @@ def validate_stop_reason_contract(stop_reason: dict[str, Any], status: Any) -> l
 
 
 def contract_error_action() -> AgentAction:
+    """生成合同错误时的安全兜底 AgentAction。
+
+    该 action 不会触发工具执行；它只是给主 loop 一个稳定对象，
+    实际上主 loop 会优先把错误回喂给模型修正。
+    """
+
     return AgentAction(
         goal="contract_error",
         objective_status="needs_human",
