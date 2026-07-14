@@ -50,6 +50,16 @@ class OutboundDraftStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class PendingInputBatchStatus(StrEnum):
+    """Lifecycle of a fragmented-input batch before it reaches the main Agent."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    IGNORED = "ignored"
+    FAILED = "failed"
+
+
 @dataclass(slots=True)
 class QuotedMessageRef:
     message_id: str
@@ -102,6 +112,51 @@ class UserMessage:
         data["sent_at"] = self.sent_at.isoformat()
         data["quoted_message"] = self.quoted_message.to_dict() if self.quoted_message else None
         return data
+
+
+@dataclass(slots=True)
+class PendingInputBatch:
+    """Durable fragments waiting for a model-driven input-boundary decision.
+
+    A batch is scoped by ``conversation_id + sender_id`` so multiple people in a
+    group can type concurrently without mixing their unfinished utterances.
+    ``version`` is advanced for every new fragment and acts as an optimistic
+    concurrency token for delayed workers.
+    """
+
+    batch_id: str
+    conversation_id: str
+    sender_id: str
+    sender_name: str
+    fragments: list[dict[str, Any]] = field(default_factory=list)
+    version: int = 1
+    status: PendingInputBatchStatus = PendingInputBatchStatus.PENDING
+    quiet_deadline: datetime = field(default_factory=now)
+    source_channel: str = ""
+    decision: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=now)
+    updated_at: datetime = field(default_factory=now)
+
+    @property
+    def batch_key(self) -> str:
+        return f"{self.conversation_id}\x1f{self.sender_id}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "batch_key": self.batch_key,
+            "conversation_id": self.conversation_id,
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "fragments": [dict(item) for item in self.fragments],
+            "version": self.version,
+            "status": self.status.value,
+            "quiet_deadline": self.quiet_deadline.isoformat(),
+            "source_channel": self.source_channel,
+            "decision": dict(self.decision),
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
 
 
 @dataclass(slots=True)

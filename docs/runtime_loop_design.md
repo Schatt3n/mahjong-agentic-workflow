@@ -96,6 +96,9 @@ flowchart TB
 sequenceDiagram
   participant U as User/Channel
   participant A as agent_runtime_app.py
+  participant B as PendingInputBuffer
+  participant G as Input Boundary Model
+  participant Q as Quiet Scheduler
   participant R as AgentRuntime
   participant L as AgentLoop
   participant C as ContextLifecycleManager
@@ -106,6 +109,16 @@ sequenceDiagram
   participant V as Visible Processor
 
   U->>A: 用户消息
+  A->>B: 按 conversation_id + sender_id 追加片段
+  B->>G: 片段 + 画像 + 最近对话 + quiet_period_elapsed
+  alt 模型判断还可能继续输入
+    G-->>A: wait_for_more_input
+    A-->>U: 静默，不生成客户可见回复
+    Q->>B: 静默截止后读取持久化批次
+    B->>G: quiet_period_elapsed=true
+  else 已形成可处理输入边界
+    G-->>A: process_business / process_casual / ignore
+  end
   A->>R: UserMessage
   R->>R: conversation lock + message idempotency
   R->>S: advance conversation_version
@@ -153,6 +166,20 @@ sequenceDiagram
 - 记录 message result，支持重复消息直接返回同一结果。
 
 它不写麻将语义，不直接决定“要不要组局”，也不直接操作业务工具。
+
+### 5.1 输入边界层
+
+输入边界层位于通道适配器和 `AgentRuntime` 之间，解决用户把一句话拆成多条发送的问题。它不是主 Agent 的业务规划步骤，也不是后端关键词分类器。
+
+- 聚合范围：`conversation_id + sender_id`，同一群里不同用户不会串片段。
+- 模型输入：当前批次全部原始片段、发送者画像、最近对话、通道信息、`quiet_period_elapsed`。
+- 模型动作：`process_business`、`process_casual`、`wait_for_more_input`、`ignore`。
+- 超时规则：未超时允许等待；超时后模型必须在业务、闲聊、忽略中选择，不能无限等待。
+- 持久化：批次和静默截止时间存入 SQLite，进程重启后调度器仍可继续处理。
+- 并发控制：调度器通过 `batch_id + version + pending status` 做 CAS 领取，只有一个节点能处理指定版本。
+- 旧结果失效：处理过程中收到新片段，批次版本递增并回到 pending；旧版本不能写状态、创建草稿或产生最终外发。
+
+例如连续收到“老板 / 帮我组个局 / 0.5，无烟，人齐开”，前两条可以被模型判断为等待补充；第三条到达后，主 Agent 只收到一次包含三条原文的聚合消息。
 
 ## 6. 主 Agent Loop
 
@@ -521,6 +548,8 @@ conversation:{conversation_id}:sender:{sender_id}:message:{message_id}
 
 如果旧 run 试图继续写状态或生成草稿，后端会拒绝，并把 `stale_run` 结果回喂模型。模型必须停止旧动作，等待新一轮上下文。
 
+碎片化输入还增加了一层批次版本校验。即使旧主流程已经开始执行，只要同一发送者又补充了新片段，`processing.py` 会在写工具和最终回复前检查 `input_batch_id + input_batch_version`。不匹配时旧流程只能结束，不能把过时回复发给客户。
+
 ## 16. 数据库设计
 
 当前默认使用 SQLite，适合单店、本地 MacBook、几百客户规模试运行。
@@ -541,6 +570,7 @@ conversation:{conversation_id}:sender:{sender_id}:message:{message_id}
 | `runtime_message_references` | 引用消息到业务对象的映射 |
 | `runtime_task_memories` | 当前任务短期记忆 |
 | `runtime_pending_memory_candidates` | 待确认长期画像候选 |
+| `runtime_pending_input_batches` | 碎片化输入批次、静默截止时间、处理状态、决策和版本 |
 | `runtime_badcases` | badcase/eval 样本 |
 
 大部分业务对象以 JSON payload 存储，外层保留常用索引字段。这种设计方便本地快速迭代，也方便后续迁移到更规范的关系模型。

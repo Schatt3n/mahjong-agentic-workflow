@@ -9,10 +9,12 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,9 @@ from mahjong_agent_runtime import (  # noqa: E402
     CustomerProfile,
     JsonlTraceRecorder,
     OpenAICompatibleAgentClient,
+    PendingInputBatch,
+    PendingInputBatchStatus,
+    PendingInputScheduler,
     QuotedMessageRef,
     SQLiteAgentStore,
     TokenBudget,
@@ -51,6 +56,7 @@ from mahjong_agent_runtime import (  # noqa: E402
     ToolGateway,
     ToolResult,
     UserMessage,
+    aggregate_pending_input_batch,
 )
 from mahjong_agent_runtime.summary import ContextSummaryManager, ContextSummaryPolicy  # noqa: E402
 from mahjong_agent_runtime.tracing import validate_trace  # noqa: E402
@@ -94,6 +100,7 @@ WECHAT_DISPLAY_QUOTE_PATTERN = re.compile(
 
 
 RUNTIME: AgentRuntime | None = None
+INPUT_SCHEDULER: PendingInputScheduler | None = None
 
 
 def build_runtime() -> AgentRuntime:
@@ -402,6 +409,8 @@ SAFE_USER_MESSAGE_METADATA_KEYS = {
     "source_message_id",
     "is_room",
     "self_message",
+    "reply_target_id",
+    "conversation_target_type",
     "has_text",
     "text_source",
     "modalities",
@@ -607,10 +616,15 @@ def has_wechaty_ocr_text(payload: dict) -> bool:
 
 def build_wechaty_message_metadata(payload: dict, *, text: str, text_source: str) -> dict:
     raw_observation = payload.get("raw_observation") if isinstance(payload.get("raw_observation"), dict) else {}
+    raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     media_candidates = compact_media_candidates(raw_observation)
     modalities = infer_wechaty_modalities(payload, text=text, media_candidates=media_candidates)
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     has_transcript = bool(text and text_source and text_source != "text")
+    self_message = bool(payload.get("self_message"))
+    sender_id = str(payload.get("sender_id") or raw_payload.get("talkerId") or "").strip()
+    listener_id = str(raw_payload.get("listenerId") or "").strip()
+    reply_target_id = listener_id if self_message and listener_id else sender_id
     return {
         **sanitize_user_message_metadata(metadata),
         "channel": "wechaty",
@@ -618,7 +632,9 @@ def build_wechaty_message_metadata(payload: dict, *, text: str, text_source: str
         "message_type": payload.get("message_type"),
         "source_message_id": str(payload.get("source_message_id") or payload.get("message_id") or ""),
         "is_room": bool(payload.get("is_room")),
-        "self_message": bool(payload.get("self_message")),
+        "self_message": self_message,
+        "reply_target_id": reply_target_id,
+        "conversation_target_type": "room" if bool(payload.get("is_room")) else "contact",
         "has_text": bool(text),
         "text_source": text_source or None,
         "modalities": modalities,
@@ -937,7 +953,9 @@ def parse_wechaty_input_gate_response(raw_response: str) -> tuple[dict, list[str
     except json.JSONDecodeError as exc:
         return (
             {
+                "action": "ignore",
                 "should_route": False,
+                "should_wait": False,
                 "category": "uncertain",
                 "confidence": 0.0,
                 "reasoning_summary": "入口分流模型没有返回合法 JSON。",
@@ -948,7 +966,9 @@ def parse_wechaty_input_gate_response(raw_response: str) -> tuple[dict, list[str
     if not isinstance(payload, dict):
         return (
             {
+                "action": "ignore",
                 "should_route": False,
+                "should_wait": False,
                 "category": "uncertain",
                 "confidence": 0.0,
                 "reasoning_summary": "入口分流模型返回值不是对象。",
@@ -984,9 +1004,23 @@ def parse_wechaty_input_gate_response(raw_response: str) -> tuple[dict, list[str
     evidence = [str(item).strip() for item in evidence_raw if str(item).strip()][:3] if isinstance(evidence_raw, list) else []
     if not isinstance(evidence_raw, list):
         errors.append("evidence must be array")
+    allowed_actions = {"process_business", "process_casual", "wait_for_more_input", "ignore"}
+    action = str(payload.get("action") or "").strip()
+    if not action:
+        if payload.get("should_route") is True:
+            action = "process_business"
+        elif category in {"casual_chat", "non_mahjong"}:
+            action = "process_casual"
+        else:
+            action = "ignore"
+    if action not in allowed_actions:
+        errors.append(f"action invalid {action!r}")
+        action = "ignore"
     return (
         {
-            "should_route": bool(payload.get("should_route")) if isinstance(payload.get("should_route"), bool) else False,
+            "action": action,
+            "should_route": action == "process_business",
+            "should_wait": action == "wait_for_more_input",
             "category": category,
             "confidence": confidence,
             "reasoning_summary": reasoning_summary,
@@ -996,7 +1030,13 @@ def parse_wechaty_input_gate_response(raw_response: str) -> tuple[dict, list[str
     )
 
 
-def build_wechaty_input_gate_payload(message: UserMessage, runtime: AgentRuntime) -> dict:
+def build_wechaty_input_gate_payload(
+    message: UserMessage,
+    runtime: AgentRuntime,
+    *,
+    input_batch: PendingInputBatch | None = None,
+    quiet_period_elapsed: bool = False,
+) -> dict:
     recent_turns = [
         item.to_dict()
         for item in runtime.store.recent_turns(
@@ -1010,6 +1050,22 @@ def build_wechaty_input_gate_payload(message: UserMessage, runtime: AgentRuntime
         "runtime": "mahjong_agent_runtime",
         "gate": "wechaty_input_gate",
         "current_message": message.to_dict(),
+        "input_window": {
+            "enabled": input_batch is not None,
+            "quiet_period_elapsed": bool(quiet_period_elapsed),
+            "quiet_period_seconds": env_float("MAHJONG_INPUT_QUIET_PERIOD_SECONDS", 30.0),
+            "batch_id": input_batch.batch_id if input_batch else None,
+            "batch_version": input_batch.version if input_batch else None,
+            "fragment_count": len(input_batch.fragments) if input_batch else 1,
+            "fragments": [
+                {
+                    "message_id": str(item.get("message_id") or ""),
+                    "text": str(item.get("text") or ""),
+                    "sent_at": str(item.get("sent_at") or ""),
+                }
+                for item in (input_batch.fragments if input_batch else [message.to_dict()])
+            ],
+        },
         "recent_conversation": recent_turns,
         "sender_profile": profile.to_dict() if profile else None,
         "active_games": active_games,
@@ -1022,20 +1078,34 @@ def build_wechaty_input_gate_payload(message: UserMessage, runtime: AgentRuntime
             ],
             "do_not_route_when": ["日常闲聊", "与麻将馆运营无关", "纯表情或无意义内容"],
             "no_user_reply_from_gate": True,
+            "adaptive_wait": (
+                "信息可能仍在分段输入且尚未静默时，可以 wait_for_more_input；"
+                "静默期已结束后禁止再次等待，必须处理、闲聊或忽略。"
+            ),
         },
         "output_contract": {
             "format": "json_object",
-            "required_keys": ["should_route", "category", "confidence", "reasoning_summary", "evidence"],
+            "required_keys": ["action", "should_route", "category", "confidence", "reasoning_summary", "evidence"],
+            "actions": ["process_business", "process_casual", "wait_for_more_input", "ignore"],
             "categories": ["operational", "followup_answer", "candidate_reply", "casual_chat", "non_mahjong", "uncertain"],
         },
     }
 
 
-def run_wechaty_input_gate(message: UserMessage, *, trace_id: str, runtime: AgentRuntime) -> dict:
+def run_wechaty_input_gate(
+    message: UserMessage,
+    *,
+    trace_id: str,
+    runtime: AgentRuntime,
+    input_batch: PendingInputBatch | None = None,
+    quiet_period_elapsed: bool = False,
+) -> dict:
     if not env_bool("MAHJONG_WECHATY_INPUT_GATE_ENABLED", True):
         return {
             "enabled": False,
+            "action": "process_business",
             "should_route": True,
+            "should_wait": False,
             "category": "disabled",
             "confidence": 1.0,
             "reasoning_summary": "Wechaty input gate disabled by env.",
@@ -1043,7 +1113,12 @@ def run_wechaty_input_gate(message: UserMessage, *, trace_id: str, runtime: Agen
             "errors": [],
         }
     client = build_wechaty_input_gate_client() or runtime.llm_client
-    payload = build_wechaty_input_gate_payload(message, runtime)
+    payload = build_wechaty_input_gate_payload(
+        message,
+        runtime,
+        input_batch=input_batch,
+        quiet_period_elapsed=quiet_period_elapsed,
+    )
     messages = [
         {"role": "system", "content": WECHATY_INPUT_GATE_PROMPT_PATH.read_text(encoding="utf-8")},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
@@ -1060,7 +1135,9 @@ def run_wechaty_input_gate(message: UserMessage, *, trace_id: str, runtime: Agen
         fail_open = env_bool("MAHJONG_WECHATY_INPUT_GATE_FAIL_OPEN", False)
         decision = {
             "enabled": True,
+            "action": "process_business" if fail_open else "ignore",
             "should_route": fail_open,
+            "should_wait": False,
             "category": "uncertain",
             "confidence": 0.0,
             "reasoning_summary": f"入口分流模型调用失败：{type(exc).__name__}",
@@ -1079,10 +1156,27 @@ def run_wechaty_input_gate(message: UserMessage, *, trace_id: str, runtime: Agen
         "raw_response": raw_response,
         "elapsed_ms": int((time.perf_counter() - started) * 1000),
     }
+    if quiet_period_elapsed and decision.get("action") == "wait_for_more_input":
+        business_like = decision.get("category") in {
+            "operational",
+            "followup_answer",
+            "candidate_reply",
+            "uncertain",
+        }
+        decision.update(
+            {
+                "action": "process_business" if business_like else "process_casual",
+                "should_route": business_like,
+                "should_wait": False,
+            }
+        )
+        decision.setdefault("normalizations", []).append(
+            "wait_for_more_input was converted because quiet period already elapsed"
+        )
     runtime.trace_recorder.record(trace_id, "wechaty_input_gate_response", {"content": raw_response, "elapsed_ms": decision["elapsed_ms"]})
     runtime.trace_recorder.record(trace_id, "wechaty_input_gate_decision", decision, level="WARN" if errors else "INFO")
     if errors and not env_bool("MAHJONG_WECHATY_INPUT_GATE_FAIL_OPEN", False):
-        decision["should_route"] = False
+        decision.update({"action": "ignore", "should_route": False, "should_wait": False})
     return decision
 
 
@@ -1497,6 +1591,255 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
     return message, audit
 
 
+def input_quiet_period_seconds() -> float:
+    """Return the inactivity window used to close one fragmented utterance."""
+
+    return max(0.1, env_float("MAHJONG_INPUT_QUIET_PERIOD_SECONDS", 30.0))
+
+
+def input_aggregation_enabled(channel: str) -> bool:
+    """Allow channels to adopt aggregation independently during rollout."""
+
+    if channel == "wechaty":
+        return env_bool("MAHJONG_WECHATY_INPUT_AGGREGATION_ENABLED", True)
+    return env_bool("MAHJONG_API_INPUT_AGGREGATION_ENABLED", False)
+
+
+def buffer_input_fragment(
+    runtime: AgentRuntime,
+    message: UserMessage,
+    *,
+    trace_id: str,
+) -> tuple[PendingInputBatch, bool]:
+    """Persist one fragment and reset the durable quiet-period deadline."""
+
+    deadline = datetime.now().astimezone() + timedelta(seconds=input_quiet_period_seconds())
+    batch, transition, added = runtime.store.upsert_pending_input_fragment(
+        message,
+        trace_id=trace_id,
+        quiet_deadline=deadline,
+    )
+    runtime.trace_recorder.record(
+        trace_id,
+        "input_fragment_buffered" if added else "input_fragment_deduplicated",
+        {
+            "batch": batch.to_dict(),
+            "transition": transition.to_dict() if transition else None,
+            "source_message_id": message.message_id,
+            "quiet_period_seconds": input_quiet_period_seconds(),
+        },
+    )
+    return batch, added
+
+
+def dispatch_pending_input_batch(
+    runtime: AgentRuntime,
+    batch: PendingInputBatch,
+    *,
+    trace_id: str,
+    quiet_period_elapsed: bool,
+    trigger: str,
+    audit: dict | None = None,
+) -> dict:
+    """Let the model close or extend an input window, then enter one real flow.
+
+    The model owns the semantic decision. The backend only persists the batch,
+    compare-and-set claims its exact version, and records the terminal status.
+    """
+
+    route_audit = dict(audit or {})
+    aggregate = aggregate_pending_input_batch(
+        batch,
+        quiet_period_elapsed=quiet_period_elapsed,
+        trigger=trigger,
+    )
+    gate_decision = run_wechaty_input_gate(
+        aggregate,
+        trace_id=trace_id,
+        runtime=runtime,
+        input_batch=batch,
+        quiet_period_elapsed=quiet_period_elapsed,
+    )
+    runtime.store.record_pending_input_decision(
+        batch_id=batch.batch_id,
+        expected_version=batch.version,
+        decision=gate_decision,
+    )
+    route_audit["input_gate"] = gate_decision
+    route_audit["input_batch"] = batch.to_dict()
+    route_audit["quiet_period_elapsed"] = quiet_period_elapsed
+
+    if gate_decision.get("action") == "wait_for_more_input" and not quiet_period_elapsed:
+        route_audit.update(
+            {
+                "routed_to_agent": False,
+                "reason": "model_waiting_for_more_input",
+                "waiting_for_more_input": True,
+            }
+        )
+        runtime.trace_recorder.record(trace_id, "input_batch_waiting", route_audit)
+        return {
+            "routed_to_agent": False,
+            "waiting_for_more_input": True,
+            "input_status": PendingInputBatchStatus.PENDING.value,
+            "input_batch": batch.to_dict(),
+            "audit": route_audit,
+            "agent_result": None,
+        }
+
+    claimed, claim_transition = runtime.store.claim_pending_input_batch(
+        batch_id=batch.batch_id,
+        expected_version=batch.version,
+        trace_id=trace_id,
+    )
+    if claimed is None:
+        route_audit.update(
+            {
+                "routed_to_agent": False,
+                "reason": "input_batch_version_superseded_before_dispatch",
+                "waiting_for_more_input": True,
+            }
+        )
+        runtime.trace_recorder.record(trace_id, "input_batch_dispatch_superseded", route_audit, level="WARN")
+        return {
+            "routed_to_agent": False,
+            "waiting_for_more_input": True,
+            "input_status": "superseded",
+            "input_batch": batch.to_dict(),
+            "audit": route_audit,
+            "agent_result": None,
+        }
+
+    runtime.trace_recorder.record(
+        trace_id,
+        "input_batch_claimed",
+        {
+            "batch": claimed.to_dict(),
+            "transition": claim_transition.to_dict() if claim_transition else None,
+            "trigger": trigger,
+        },
+    )
+    action = str(gate_decision.get("action") or "ignore")
+    result: AgentRuntimeResult | None = None
+    terminal_status = PendingInputBatchStatus.IGNORED
+    try:
+        if action == "process_business":
+            route_audit.update({"routed_to_agent": True, "reason": "input_batch_ready_for_business"})
+            runtime.trace_recorder.record(trace_id, "input_batch_routed_to_agent", route_audit)
+            result = runtime.handle_user_message(aggregate, trace_id=trace_id)
+            terminal_status = PendingInputBatchStatus.COMPLETED
+        elif action == "process_casual" and env_bool("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", True):
+            route_audit.update({"routed_to_agent": False, "reason": "wechaty_input_gate_routed_to_casual_chat"})
+            runtime.trace_recorder.record(trace_id, "input_batch_routed_to_casual_chat", route_audit)
+            if route_audit.get("channel") == "wechaty":
+                runtime.trace_recorder.record(trace_id, "wechaty_raw_message_routed_to_casual_chat", route_audit)
+            result = handle_wechaty_casual_chat(
+                aggregate,
+                trace_id=trace_id,
+                runtime=runtime,
+                gate_decision=gate_decision,
+            )
+            terminal_status = PendingInputBatchStatus.COMPLETED
+        else:
+            route_audit.update({"routed_to_agent": False, "reason": "input_batch_ignored"})
+            runtime.trace_recorder.record(trace_id, "input_batch_ignored", route_audit)
+
+        finished, finish_transition = runtime.store.finish_pending_input_batch(
+            batch_id=claimed.batch_id,
+            expected_version=claimed.version,
+            status=terminal_status,
+            trace_id=trace_id,
+            decision=gate_decision,
+        )
+        if finished is None:
+            runtime.trace_recorder.record(
+                trace_id,
+                "input_batch_result_superseded",
+                {
+                    "batch_id": claimed.batch_id,
+                    "batch_version": claimed.version,
+                    "generated_reply_suppressed": bool(result and result.final_reply),
+                },
+                level="WARN",
+            )
+            result_payload = result.to_dict() if result else None
+            if result_payload is not None:
+                result_payload["final_reply"] = ""
+            return {
+                "routed_to_agent": action == "process_business",
+                "waiting_for_more_input": True,
+                "input_status": "superseded",
+                "input_batch": claimed.to_dict(),
+                "audit": route_audit,
+                "agent_result": result_payload,
+            }
+        runtime.trace_recorder.record(
+            trace_id,
+            "input_batch_finished",
+            {
+                "batch": finished.to_dict(),
+                "transition": finish_transition.to_dict() if finish_transition else None,
+            },
+        )
+        result_payload = result.to_dict() if result else None
+        response = {
+            "routed_to_agent": action == "process_business",
+            "waiting_for_more_input": False,
+            "input_status": finished.status.value,
+            "input_batch": finished.to_dict(),
+            "audit": route_audit,
+            "agent_result": result_payload,
+        }
+        if action == "process_casual" and result_payload is not None:
+            response["casual_chat_result"] = result_payload
+        return response
+    except Exception as exc:
+        runtime.store.finish_pending_input_batch(
+            batch_id=claimed.batch_id,
+            expected_version=claimed.version,
+            status=PendingInputBatchStatus.FAILED,
+            trace_id=trace_id,
+            decision={**gate_decision, "error_type": type(exc).__name__, "error": str(exc)},
+        )
+        runtime.trace_recorder.record(
+            trace_id,
+            "input_batch_dispatch_failed",
+            {"batch_id": claimed.batch_id, "error_type": type(exc).__name__, "error": str(exc)},
+            level="ERROR",
+        )
+        raise
+
+
+def route_user_message_with_aggregation(
+    runtime: AgentRuntime,
+    message: UserMessage,
+    *,
+    trace_id: str,
+    channel: str,
+    audit: dict | None = None,
+) -> dict:
+    """Buffer a fragment and dispatch only when the model closes the window."""
+
+    batch, added = buffer_input_fragment(runtime, message, trace_id=trace_id)
+    if not added:
+        return {
+            "routed_to_agent": False,
+            "waiting_for_more_input": batch.status == PendingInputBatchStatus.PENDING,
+            "input_status": "duplicate",
+            "input_batch": batch.to_dict(),
+            "audit": {**dict(audit or {}), "reason": "duplicate_source_message"},
+            "agent_result": None,
+        }
+    return dispatch_pending_input_batch(
+        runtime,
+        batch,
+        trace_id=trace_id,
+        quiet_period_elapsed=False,
+        trigger=f"{channel}_message_arrived",
+        audit=audit,
+    )
+
+
 def route_wechaty_raw_to_agent(payload: dict, *, trace_id: str) -> dict:
     message, audit = build_wechaty_user_message(payload)
     trace_recorder = JsonlTraceRecorder(TRACE_PATH)
@@ -1504,27 +1847,141 @@ def route_wechaty_raw_to_agent(payload: dict, *, trace_id: str) -> dict:
         trace_recorder.record(trace_id, "wechaty_raw_message_not_routed", audit)
         return {"routed_to_agent": False, "audit": audit, "agent_result": None}
     runtime = get_runtime()
+    if input_aggregation_enabled("wechaty"):
+        return route_user_message_with_aggregation(
+            runtime,
+            message,
+            trace_id=trace_id,
+            channel="wechaty",
+            audit=audit,
+        )
     gate_decision = run_wechaty_input_gate(message, trace_id=trace_id, runtime=runtime)
     audit["input_gate"] = gate_decision
-    if not gate_decision.get("should_route"):
-        category = str(gate_decision.get("category") or "").strip()
-        if (
-            env_bool("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", True)
-            and category in {"casual_chat", "non_mahjong"}
-            and not gate_decision.get("errors")
-        ):
-            audit["routed_to_agent"] = False
-            audit["reason"] = "wechaty_input_gate_routed_to_casual_chat"
-            runtime.trace_recorder.record(trace_id, "wechaty_raw_message_routed_to_casual_chat", audit)
-            result = handle_wechaty_casual_chat(message, trace_id=trace_id, runtime=runtime, gate_decision=gate_decision)
-            return {"routed_to_agent": False, "audit": audit, "agent_result": result.to_dict(), "casual_chat_result": result.to_dict()}
-        audit["routed_to_agent"] = False
-        audit["reason"] = "wechaty_input_gate_not_routed"
+    action = str(gate_decision.get("action") or "ignore")
+    if action == "process_casual" and env_bool("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", True):
+        audit.update({"routed_to_agent": False, "reason": "wechaty_input_gate_routed_to_casual_chat"})
+        runtime.trace_recorder.record(trace_id, "wechaty_raw_message_routed_to_casual_chat", audit)
+        result = handle_wechaty_casual_chat(message, trace_id=trace_id, runtime=runtime, gate_decision=gate_decision)
+        return {
+            "routed_to_agent": False,
+            "audit": audit,
+            "agent_result": result.to_dict(),
+            "casual_chat_result": result.to_dict(),
+        }
+    if action != "process_business":
+        audit.update({"routed_to_agent": False, "reason": "wechaty_input_gate_not_routed"})
         runtime.trace_recorder.record(trace_id, "wechaty_raw_message_not_routed", audit)
         return {"routed_to_agent": False, "audit": audit, "agent_result": None}
     runtime.trace_recorder.record(trace_id, "wechaty_raw_message_routed_to_agent", audit)
     result = runtime.handle_user_message(message, trace_id=trace_id)
     return {"routed_to_agent": True, "audit": audit, "agent_result": result.to_dict()}
+
+
+def request_local_json(path: str, *, payload: dict | None = None, timeout_seconds: float = 3.0) -> dict:
+    """Call the local Wechaty bridge without introducing a third-party client."""
+
+    base_url = os.getenv("MAHJONG_WECHATY_OUTBOUND_BASE_URL", "http://127.0.0.1:8791").rstrip("/")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = Request(
+        f"{base_url}{path}",
+        data=body,
+        method="POST" if payload is not None else "GET",
+        headers={"Content-Type": "application/json; charset=utf-8"} if payload is not None else {},
+    )
+    with urlopen(request, timeout=max(0.1, timeout_seconds)) as response:
+        parsed = json.loads(response.read().decode("utf-8"))
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def deliver_delayed_wechaty_reply(
+    runtime: AgentRuntime,
+    batch: PendingInputBatch,
+    route_result: dict,
+    *,
+    trace_id: str,
+) -> dict:
+    """Send a delayed result only when both Wechaty outbound switches allow it."""
+
+    result = route_result.get("agent_result") if isinstance(route_result.get("agent_result"), dict) else {}
+    reply = str(result.get("final_reply") or "").strip()
+    if not reply:
+        delivery = {"sent": False, "reason": "no_customer_visible_reply"}
+        runtime.trace_recorder.record(trace_id, "delayed_reply_delivery_skipped", delivery)
+        return delivery
+    aggregate = aggregate_pending_input_batch(batch, quiet_period_elapsed=True, trigger="quiet_period_elapsed")
+    metadata = aggregate.metadata if isinstance(aggregate.metadata, dict) else {}
+    if batch.source_channel != "wechaty":
+        delivery = {"sent": False, "reason": "source_channel_has_no_delayed_sender", "channel": batch.source_channel}
+        runtime.trace_recorder.record(trace_id, "delayed_reply_delivery_skipped", delivery)
+        return delivery
+    if metadata.get("conversation_target_type") == "room":
+        delivery = {"sent": False, "reason": "delayed_room_send_not_supported_by_current_bridge"}
+        runtime.trace_recorder.record(trace_id, "delayed_reply_delivery_skipped", delivery, level="WARN")
+        return delivery
+    target = str(metadata.get("reply_target_id") or batch.sender_id).strip()
+    try:
+        health = request_local_json("/health", timeout_seconds=env_float("MAHJONG_WECHATY_OUTBOUND_TIMEOUT_SECONDS", 3.0))
+        if not bool(health.get("send_channel_enabled")) or not bool(health.get("auto_send_reply")):
+            delivery = {
+                "sent": False,
+                "reason": "wechaty_outbound_switch_disabled",
+                "send_channel_enabled": bool(health.get("send_channel_enabled")),
+                "auto_send_reply": bool(health.get("auto_send_reply")),
+            }
+            runtime.trace_recorder.record(trace_id, "delayed_reply_delivery_skipped", delivery)
+            return delivery
+        response = request_local_json(
+            "/send",
+            payload={
+                "to": target,
+                "text": reply,
+                "source": "delayed_input_batch_reply",
+                "source_trace_id": trace_id,
+                "source_message_id": aggregate.message_id,
+            },
+            timeout_seconds=env_float("MAHJONG_WECHATY_OUTBOUND_TIMEOUT_SECONDS", 3.0),
+        )
+        delivery = {"sent": bool(response.get("ok")), "target": target, "response": response}
+        runtime.trace_recorder.record(
+            trace_id,
+            "delayed_reply_delivered" if delivery["sent"] else "delayed_reply_delivery_failed",
+            delivery,
+            level="INFO" if delivery["sent"] else "ERROR",
+        )
+        return delivery
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        delivery = {
+            "sent": False,
+            "reason": "wechaty_outbound_request_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        runtime.trace_recorder.record(trace_id, "delayed_reply_delivery_failed", delivery, level="ERROR")
+        return delivery
+
+
+def handle_due_pending_input_batch(batch: PendingInputBatch, trace_id: str) -> None:
+    """Scheduler callback: re-evaluate a quiet batch and deliver its final reply."""
+
+    runtime = get_runtime()
+    route_result = dispatch_pending_input_batch(
+        runtime,
+        batch,
+        trace_id=trace_id,
+        quiet_period_elapsed=True,
+        trigger="quiet_period_elapsed",
+        audit={
+            "channel": batch.source_channel or "unknown",
+            "conversation_id": batch.conversation_id,
+            "sender_id": batch.sender_id,
+        },
+    )
+    delivery = deliver_delayed_wechaty_reply(runtime, batch, route_result, trace_id=trace_id)
+    runtime.trace_recorder.record(
+        trace_id,
+        "delayed_input_batch_completed",
+        {"route_result": route_result, "delivery": delivery},
+    )
 
 
 def conversation_id_from_trace(runtime: AgentRuntime, trace_id: str) -> str:
@@ -1797,6 +2254,9 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                         item.to_dict() for item in runtime.store.conversation_checkpoints.values()
                     ],
                     "conversation_versions": dict(runtime.store.conversation_versions),
+                    "pending_input_batches": [
+                        item.to_dict() for item in runtime.store.pending_input_batches.values()
+                    ],
                     "customers": [item.to_dict() for item in runtime.store.customers.values()],
                     "runtime_config": runtime_config(runtime),
                 }
@@ -1869,8 +2329,49 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                     sender_id=message.sender_id,
                     sender_name=message.sender_name,
                     text=message.text,
+                    message_id=f"api_{os.urandom(8).hex()}",
                     quoted_message=message.quoted_message,
+                    metadata=message.metadata,
                 )
+            aggregate_fragments = bool(payload.get("aggregate_fragments")) or input_aggregation_enabled("api")
+            if aggregate_fragments:
+                trace_id = str(payload.get("trace_id") or f"trace_api_{os.urandom(6).hex()}")
+                route_result = route_user_message_with_aggregation(
+                    runtime,
+                    message,
+                    trace_id=trace_id,
+                    channel="api",
+                    audit={
+                        "channel": "api",
+                        "conversation_id": message.conversation_id,
+                        "sender_id": message.sender_id,
+                    },
+                )
+                agent_result = route_result.get("agent_result")
+                if isinstance(agent_result, dict):
+                    self._json(
+                        {
+                            **agent_result,
+                            "input_status": route_result.get("input_status"),
+                            "waiting_for_more_input": bool(route_result.get("waiting_for_more_input")),
+                            "input_batch": route_result.get("input_batch"),
+                        }
+                    )
+                else:
+                    self._json(
+                        {
+                            "trace_id": trace_id,
+                            "conversation_id": message.conversation_id,
+                            "final_reply": "",
+                            "actions": [],
+                            "tool_results": [],
+                            "state_transitions": [],
+                            "input_status": route_result.get("input_status"),
+                            "waiting_for_more_input": bool(route_result.get("waiting_for_more_input")),
+                            "input_batch": route_result.get("input_batch"),
+                        }
+                    )
+                return
             result = runtime.handle_user_message(message, trace_id=payload.get("trace_id"))
             self._json(result.to_dict())
             return
@@ -2000,6 +2501,13 @@ def runtime_config(runtime: AgentRuntime) -> dict:
         or getattr(getattr(runtime.llm_client, "config", None), "model", None),
         "wechaty_input_gate_fail_open": env_bool("MAHJONG_WECHATY_INPUT_GATE_FAIL_OPEN", False),
         "wechaty_input_gate_prompt": str(WECHATY_INPUT_GATE_PROMPT_PATH),
+        "input_aggregation": {
+            "wechaty_enabled": input_aggregation_enabled("wechaty"),
+            "api_enabled_by_default": input_aggregation_enabled("api"),
+            "quiet_period_seconds": input_quiet_period_seconds(),
+            "scheduler_poll_seconds": env_float("MAHJONG_INPUT_SCHEDULER_POLL_SECONDS", 0.5),
+            "batch_scope": "conversation_id + sender_id",
+        },
         "wechaty_casual_chat_reply_enabled": env_bool("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", True),
         "wechaty_casual_chat_reply_prompt": str(WECHATY_CASUAL_CHAT_PROMPT_PATH),
         "trace_log": str(TRACE_PATH),
@@ -2108,7 +2616,8 @@ async function sendMessage(){
     conversation_id: conversationId.value,
     sender_id: senderId.value,
     sender_name: senderName.value,
-    text: text.value
+    text: text.value,
+    aggregate_fragments: true
   };
   const res = await fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const body = await res.json();
@@ -2293,6 +2802,16 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main() -> None:
+    global INPUT_SCHEDULER
+    runtime = get_runtime()
+    INPUT_SCHEDULER = PendingInputScheduler(
+        store=runtime.store,
+        handler=handle_due_pending_input_batch,
+        trace_recorder=runtime.trace_recorder,
+        poll_interval_seconds=env_float("MAHJONG_INPUT_SCHEDULER_POLL_SECONDS", 0.5),
+        batch_limit=env_int("MAHJONG_INPUT_SCHEDULER_BATCH_LIMIT", 50),
+    )
+    INPUT_SCHEDULER.start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), AgentRuntimeHandler)
     print(f"Mahjong Agent Runtime listening on http://127.0.0.1:{PORT}")
     print(f"Trace log: {TRACE_PATH}")
@@ -2301,6 +2820,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if INPUT_SCHEDULER is not None:
+            INPUT_SCHEDULER.stop()
         server.server_close()
         print("Mahjong Agent Runtime stopped.")
 

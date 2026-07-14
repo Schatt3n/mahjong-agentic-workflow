@@ -17,6 +17,7 @@
 
 - 本地 Web 控制台：用于输入消息、查看结果、刷新状态、清空状态、标记 badcase。
 - 微信灰度通道：通过 WeChaty 接收好友/群聊原始消息，支持白名单路由、闲聊分流、业务消息进入主 Agent、外发开关和人工审批。
+- 碎片化输入聚合：按 `conversation_id + sender_id` 聚合连续消息，由模型结合画像、最近对话和静默状态判断立即处理、继续等待、闲聊或忽略；30 秒无新消息后由持久化调度器重新触发判断。
 - 多轮上下文：保留当前消息、最近对话、会话 checkpoint、客户画像、关系画像、当前任务记忆、局池、草稿和工具结果。
 - 目标驱动主循环：模型每轮输出结构化 `AgentAction`，可以继续调用工具，也可以等待用户、完成回复或转人工。
 - 受控工具网关：模型不能直接改数据库，只能通过工具合同请求动作。
@@ -96,7 +97,9 @@ PYTHONPATH=src python scripts/validate_real_owner_chat_golden.py
 ```mermaid
 flowchart LR
   channel["输入通道<br/>Web / WeChaty / Hermes / AstrBot"] --> app["本地服务<br/>scripts/agent_runtime_app.py"]
-  app --> runtime["AgentRuntime<br/>入口、锁、幂等、版本"]
+  app --> buffer["PendingInputBuffer<br/>按会话+发送者聚合、静默计时"]
+  buffer --> boundary["Input Boundary Model<br/>处理 / 等待 / 闲聊 / 忽略"]
+  boundary --> runtime["AgentRuntime<br/>入口、锁、幂等、版本"]
   runtime --> loop["AgentLoop<br/>build context -> LLM -> tools -> results"]
   loop --> ctx["ContextLifecycleManager<br/>上下文构建、预算预检、摘要"]
   loop --> proc["ActionProcessor<br/>合同解析、回复/工具分支"]
@@ -109,6 +112,19 @@ flowchart LR
 详细架构解析见 [docs/runtime_loop_design.md](docs/runtime_loop_design.md)。
 
 ## 主循环
+
+通道消息进入主 Agent 前先经过输入边界层：
+
+```text
+message fragment
+  -> persist pending batch
+  -> model decides process / wait / casual / ignore
+  -> wait: return no customer-visible reply and keep collecting
+  -> quiet timeout: scheduler reloads the batch and asks the model again
+  -> process: claim exact batch version and enter AgentRuntime
+```
+
+后端不按“老板”“帮我组局”等关键词写等待规则。是否已经表达完整由模型判断；后端只保证持久化、定时触发、消息幂等、版本 CAS 和旧执行结果失效。
 
 主 Agent loop 保持简单：
 
@@ -136,7 +152,7 @@ handle_user_message
 
 每次调用主模型时，`AgentContextBuilder` 会组装：
 
-- `current_message`：当前用户消息，包含安全过滤后的通道元数据和引用消息。
+- `current_message`：当前用户消息，包含安全过滤后的通道元数据和引用消息。碎片聚合后还包含 `input_window`，其中有原始片段、是否已经静默超时、批次版本和触发原因。
 - `recent_conversation`：预算内最近对话。
 - `conversation_checkpoint`：长对话压缩后的关键摘要。
 - `sender_profile`：当前发送者画像，隐藏私有备注等不可见字段。
@@ -206,9 +222,19 @@ data/agent_runtime.sqlite3
 - `runtime_message_references`：引用消息与业务对象关联。
 - `runtime_task_memories`：当前任务短期记忆。
 - `runtime_pending_memory_candidates`：待确认长期画像候选。
+- `runtime_pending_input_batches`：尚未形成完整输入边界的消息片段、静默截止时间、模型决策和批次版本。
 - `runtime_badcases`：badcase 归档。
 
 Redis 当前不是主状态存储。系统默认以 SQLite 承担本地生产试运行的状态持久化，适合单店、几百客户规模的 MacBook 本地部署。
+
+输入聚合相关配置：
+
+```bash
+# WeChaty 默认开启；Web API 可通过请求 aggregate_fragments=true 单次开启
+MAHJONG_INPUT_AGGREGATION_WECHATY_ENABLED=true
+MAHJONG_INPUT_AGGREGATION_API_ENABLED=false
+MAHJONG_INPUT_QUIET_PERIOD_SECONDS=30
+```
 
 ## 日志和可观测
 

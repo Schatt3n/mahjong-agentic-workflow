@@ -5,6 +5,7 @@ from __future__ import annotations
 from .budget import TokenBudget
 from .context import AgentContextBuilder, ContextPackingPolicy
 from .hooks import HookEvent, HookManager
+from .input_aggregation import InputBatchDispatch, PendingInputScheduler, aggregate_pending_input_batch
 from .lifecycle import ContextLifecycleManager
 from .llm import AgentLLMConfig, OpenAICompatibleAgentClient, StaticAgentClient
 from .loop import AgentLoop
@@ -19,6 +20,8 @@ from .models import (
     MessageReference,
     OutboundMessageDraft,
     Party,
+    PendingInputBatch,
+    PendingInputBatchStatus,
     PendingMemoryCandidate,
     QuotedMessageRef,
     TaskMemory,
@@ -56,6 +59,7 @@ __all__ = [
     "Game",
     "HookEvent",
     "HookManager",
+    "InputBatchDispatch",
     "InMemoryAgentStore",
     "InMemoryTraceRecorder",
     "InviteDraft",
@@ -64,6 +68,9 @@ __all__ = [
     "OpenAICompatibleAgentClient",
     "OutboundMessageDraft",
     "Party",
+    "PendingInputBatch",
+    "PendingInputBatchStatus",
+    "PendingInputScheduler",
     "PendingMemoryCandidate",
     "QuotedMessageRef",
     "SQLiteAgentStore",
@@ -77,5 +84,6 @@ __all__ = [
     "ModelActionStep",
     "TurnBudgets",
     "UserMessage",
+    "aggregate_pending_input_batch",
     "validate_trace",
 ]

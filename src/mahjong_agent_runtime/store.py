@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 import threading
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from .models import (
     OutboundDraftStatus,
     OutboundMessageDraft,
     Party,
+    PendingInputBatch,
+    PendingInputBatchStatus,
     PendingMemoryCandidate,
     StateTransition,
     TaskMemory,
@@ -59,6 +62,12 @@ CONFIRMED_CANDIDATE_STATUSES = {"accepted", "confirmed", "arrived"}
 UNCONFIRMED_CANDIDATE_STATUSES = {"declined", "negotiating", "no_reply"}
 
 
+def pending_input_batch_key(conversation_id: str, sender_id: str) -> str:
+    """Stable scope key; group members never share unfinished fragments."""
+
+    return f"{conversation_id or 'default'}\x1f{sender_id or 'unknown'}"
+
+
 @dataclass(slots=True)
 class InMemoryAgentStore:
     customers: dict[str, CustomerProfile] = field(default_factory=dict)
@@ -75,6 +84,7 @@ class InMemoryAgentStore:
     message_references: dict[str, MessageReference] = field(default_factory=dict)
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
     pending_memory_candidates: dict[str, PendingMemoryCandidate] = field(default_factory=dict)
+    pending_input_batches: dict[str, PendingInputBatch] = field(default_factory=dict)
     badcases: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -466,6 +476,158 @@ class InMemoryAgentStore:
         with self._lock:
             self.message_results.setdefault(message_id, result)
 
+    def upsert_pending_input_fragment(
+        self,
+        message,
+        *,
+        trace_id: str,
+        quiet_deadline: datetime,
+    ) -> tuple[PendingInputBatch, StateTransition | None, bool]:
+        """Append one raw fragment and atomically move the batch deadline.
+
+        Repeated platform message ids are ignored. A fragment arriving while a
+        delayed worker is evaluating the old version advances ``version`` and
+        returns the batch to ``pending``, making the old worker stale.
+        """
+
+        key = pending_input_batch_key(message.conversation_id, message.sender_id)
+        fragment = message.to_dict()
+        with self._lock:
+            existing = self.pending_input_batches.get(key)
+            message_id = str(fragment.get("message_id") or "")
+            if existing is not None and message_id and any(
+                str(item.get("message_id") or "") == message_id for item in existing.fragments
+            ):
+                return copy.deepcopy(existing), None, False
+            if existing is None or existing.status in {
+                PendingInputBatchStatus.COMPLETED,
+                PendingInputBatchStatus.IGNORED,
+                PendingInputBatchStatus.FAILED,
+            }:
+                batch = PendingInputBatch(
+                    batch_id=new_id("input_batch"),
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                    sender_name=message.sender_name,
+                    fragments=[fragment],
+                    quiet_deadline=quiet_deadline,
+                    source_channel=str(message.metadata.get("channel") or ""),
+                )
+                previous_status = "absent"
+            else:
+                batch = existing
+                previous_status = batch.status.value
+                batch.fragments.append(fragment)
+                batch.sender_name = message.sender_name or batch.sender_name
+                batch.version += 1
+                batch.status = PendingInputBatchStatus.PENDING
+                batch.quiet_deadline = quiet_deadline
+                batch.updated_at = now()
+                batch.decision = {}
+                if message.metadata.get("channel"):
+                    batch.source_channel = str(message.metadata["channel"])
+            self.pending_input_batches[key] = batch
+            transition = StateTransition(
+                entity_type="pending_input_batch",
+                entity_id=batch.batch_id,
+                from_status=previous_status,
+                to_status=batch.status.value,
+                reason="input_fragment_buffered",
+                trace_id=trace_id,
+            )
+            self.transitions.append(transition)
+            return copy.deepcopy(batch), transition, True
+
+    def pending_input_batch(self, conversation_id: str, sender_id: str) -> PendingInputBatch | None:
+        with self._lock:
+            batch = self.pending_input_batches.get(pending_input_batch_key(conversation_id, sender_id))
+            return copy.deepcopy(batch) if batch is not None else None
+
+    def due_pending_input_batches(self, *, at: datetime, limit: int = 100) -> list[PendingInputBatch]:
+        with self._lock:
+            due = [
+                item
+                for item in self.pending_input_batches.values()
+                if item.status == PendingInputBatchStatus.PENDING and item.quiet_deadline <= at
+            ]
+            return copy.deepcopy(sorted(due, key=lambda item: item.quiet_deadline)[: max(1, int(limit))])
+
+    def claim_pending_input_batch(
+        self,
+        *,
+        batch_id: str,
+        expected_version: int,
+        trace_id: str,
+    ) -> tuple[PendingInputBatch | None, StateTransition | None]:
+        """Claim the exact batch version; stale model decisions cannot dispatch."""
+
+        with self._lock:
+            batch = next((item for item in self.pending_input_batches.values() if item.batch_id == batch_id), None)
+            if (
+                batch is None
+                or batch.version != int(expected_version)
+                or batch.status != PendingInputBatchStatus.PENDING
+            ):
+                return None, None
+            old = batch.status.value
+            batch.status = PendingInputBatchStatus.PROCESSING
+            batch.updated_at = now()
+            transition = StateTransition(
+                "pending_input_batch",
+                batch.batch_id,
+                old,
+                batch.status.value,
+                "input_batch_claimed",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return copy.deepcopy(batch), transition
+
+    def record_pending_input_decision(
+        self,
+        *,
+        batch_id: str,
+        expected_version: int,
+        decision: dict[str, Any],
+    ) -> PendingInputBatch | None:
+        """Attach the model boundary decision without changing batch status."""
+
+        with self._lock:
+            batch = next((item for item in self.pending_input_batches.values() if item.batch_id == batch_id), None)
+            if batch is None or batch.version != int(expected_version):
+                return None
+            batch.decision = dict(decision)
+            batch.updated_at = now()
+            return copy.deepcopy(batch)
+
+    def finish_pending_input_batch(
+        self,
+        *,
+        batch_id: str,
+        expected_version: int,
+        status: PendingInputBatchStatus,
+        trace_id: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[PendingInputBatch | None, StateTransition | None]:
+        with self._lock:
+            batch = next((item for item in self.pending_input_batches.values() if item.batch_id == batch_id), None)
+            if batch is None or batch.version != int(expected_version):
+                return None, None
+            old = batch.status.value
+            batch.status = status
+            batch.decision = dict(decision or {})
+            batch.updated_at = now()
+            transition = StateTransition(
+                "pending_input_batch",
+                batch.batch_id,
+                old,
+                status.value,
+                "input_batch_finished",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return copy.deepcopy(batch), transition
+
     def register_message_reference(self, reference: MessageReference) -> None:
         if not reference.message_id:
             return
@@ -578,6 +740,7 @@ class InMemoryAgentStore:
                 "message_references": len(self.message_references),
                 "task_memories": len(self.task_memories),
                 "pending_memory_candidates": len(self.pending_memory_candidates),
+                "pending_input_batches": len(self.pending_input_batches),
                 "customers": len(self.customers) if include_customers else 0,
                 "customer_relationships": len(self.customer_relationships) if include_customers else 0,
                 "badcases": len(self.badcases) if include_badcases else 0,
@@ -594,6 +757,7 @@ class InMemoryAgentStore:
             self.message_references.clear()
             self.task_memories.clear()
             self.pending_memory_candidates.clear()
+            self.pending_input_batches.clear()
             if include_customers:
                 self.customers.clear()
                 self.customer_relationships.clear()

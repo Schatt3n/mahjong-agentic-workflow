@@ -26,6 +26,27 @@ from .visibility import (
 )
 
 
+def input_batch_run_is_stale(store: Any, message: UserMessage) -> bool:
+    """Compare a running aggregate with the latest durable fragment batch.
+
+    The check is generic concurrency control: a newly arrived fragment advances
+    the batch version, so an older run may still read but cannot write or send.
+    Messages that did not come through the aggregation layer are unaffected.
+    """
+
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    window = metadata.get("input_window") if isinstance(metadata.get("input_window"), dict) else {}
+    batch_id = str(window.get("batch_id") or "")
+    try:
+        batch_version = int(window.get("batch_version"))
+    except (TypeError, ValueError):
+        return False
+    if not batch_id:
+        return False
+    current = store.pending_input_batch(message.conversation_id, message.sender_id)
+    return current is None or current.batch_id != batch_id or current.version != batch_version
+
+
 @dataclass(slots=True)
 class ToolExecutionService:
     """Execute model-proposed tool calls behind production boundaries."""
@@ -91,7 +112,7 @@ class ToolExecutionService:
 
             stale_result = self.stale_write_tool_result(
                 call_name=call.name,
-                conversation_id=message.conversation_id,
+                message=message,
                 run_id=run_id,
                 run_version=run_version,
             )
@@ -177,17 +198,18 @@ class ToolExecutionService:
         self,
         *,
         call_name: str,
-        conversation_id: str,
+        message: UserMessage,
         run_id: str,
         run_version: int,
     ) -> ToolResult | None:
-        """Reject state-writing tools from stale runs."""
+        """Reject writes from a superseded conversation or input-batch version."""
 
         definition = self.tool_gateway.tools.get(call_name) if self.tool_gateway else None
         if definition is None or definition.execution_mode not in {"state_write", "draft_write"}:
             return None
-        current_version = self.store.conversation_version(conversation_id)
-        if current_version == int(run_version):
+        current_version = self.store.conversation_version(message.conversation_id)
+        stale_input_batch = input_batch_run_is_stale(self.store, message)
+        if current_version == int(run_version) and not stale_input_batch:
             return None
         return ToolResult(
             name=call_name,
@@ -197,12 +219,13 @@ class ToolExecutionService:
                 "run_id": run_id,
                 "run_version": run_version,
                 "current_version": current_version,
+                "stale_input_batch": stale_input_batch,
                 "instruction": (
-                    "This run is stale because a newer user message advanced the conversation version. "
+                    "This run is stale because a newer user fragment or conversation turn arrived. "
                     "Do not write state or create drafts from the old version; rebuild context from the latest user input."
                 ),
             },
-            error="stale run: conversation version changed before a state-writing tool could execute",
+            error="stale run: input batch or conversation version changed before a state-writing tool could execute",
         )
 
     def _emit(self, event_name: str, *, trace_id: str, payload: dict[str, Any]) -> None:
@@ -550,7 +573,7 @@ class ActionProcessor:
                     continue_loop=True,
                 )
 
-        if self.run_is_stale(message.conversation_id, run_version):
+        if self.run_is_stale(message, run_version):
             final_reply = ""
             self.trace_recorder.record(
                 trace_id,
@@ -622,8 +645,11 @@ class ActionProcessor:
             if isinstance(item, dict)
         }
 
-    def run_is_stale(self, conversation_id: str, run_version: int) -> bool:
-        return self.store.conversation_version(conversation_id) != int(run_version)
+    def run_is_stale(self, message: UserMessage, run_version: int) -> bool:
+        return (
+            self.store.conversation_version(message.conversation_id) != int(run_version)
+            or input_batch_run_is_stale(self.store, message)
+        )
 
     def append_pending_assistant_turn(
         self,
@@ -661,4 +687,3 @@ class ActionProcessor:
     def _emit(self, event_name: str, *, trace_id: str, payload: dict[str, Any]) -> None:
         if self.hook_manager is not None:
             self.hook_manager.emit(event_name, trace_id=trace_id, payload=payload)
-

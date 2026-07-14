@@ -8,6 +8,7 @@
 - `regression/agent_runtime_regression.jsonl`：当前主链路专项回归集，验证“模型负责目标理解和工具规划，后端负责 schema、权限、状态、幂等和审计”。
 - `golden/real_owner_chat_golden.jsonl`：真实老板聊天转写出的长对话 golden dataset，用于验证闲聊和业务组局穿插时上下文仍能接回。
 - `golden/real_owner_chat_transcript_20260704.md`：真实聊天截图的可读转写。
+- `golden/fragmented_input_golden.jsonl`：碎片化输入边界样本，验证等待、超时重触发、发送者隔离和聚合后一次处理。
 - `few_shot_examples.jsonl`：老板认可的话术样例，用于改善后续回复风格。
 
 ## 写入规则
@@ -16,6 +17,7 @@
 - 修复 badcase 后，必须补 `regression_refs`，指向 `agent_runtime_regression`、`real_owner_chat_golden`、`live_eval` 或具体 `pytest` 用例。
 - 老板确认某句回复“像我会说的话”，写入 `few_shot_examples.jsonl`。
 - 真实长对话样本优先沉淀到 `real_owner_chat_golden.jsonl`，用于验证上下文、闲聊分流和多轮恢复。
+- 用户把一句需求拆成多条发送时，写入 `fragmented_input_golden.jsonl`；不能靠新增麻将关键词 `if-else` 修复，应由输入边界模型和通用并发合同解决。
 
 ## 运行评估
 
