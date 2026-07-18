@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -13,6 +15,7 @@ from mahjong_agent_runtime import (
     UserMessage,
 )
 from mahjong_agent_runtime.coordination import FileCoordinationManager
+from mahjong_agent_runtime.coordination import default_coordination_manager
 
 
 def _create_game(store, *, conversation_id: str = "conversation_a", organizer_id: str = "customer_a", seats: int = 1):
@@ -149,6 +152,40 @@ def test_same_customer_cannot_have_two_open_invitations_for_one_game(kind: str, 
         )
 
     drafts = [item for item in store.invite_drafts.values() if item.game_id == game.game_id]
+    assert len(drafts) == 1
+
+
+def test_sqlite_concurrent_invite_creation_keeps_one_open_draft(tmp_path) -> None:
+    path = tmp_path / "concurrent_invites.sqlite3"
+    setup_store = SQLiteAgentStore(path)
+    game, _ = _create_game(setup_store)
+    stores = [SQLiteAgentStore(path) for _ in range(8)]
+
+    def create(index: int) -> str:
+        try:
+            stores[index % len(stores)].create_invite_drafts(
+                game_id=game.game_id,
+                invitations=[
+                    {
+                        "customer_id": "candidate_a",
+                        "display_name": "候选人A",
+                        "message_text": "七点打吗？",
+                    }
+                ],
+                trace_id=f"trace_concurrent_invite_{index}",
+            )
+            return "created"
+        except ValueError as exc:
+            assert "already has an open invitation" in str(exc)
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(create, range(20)))
+
+    assert outcomes.count("created") == 1
+    assert outcomes.count("rejected") == 19
+    persisted = SQLiteAgentStore(path)
+    drafts = [item for item in persisted.invite_drafts.values() if item.game_id == game.game_id]
     assert len(drafts) == 1
 
 
@@ -312,6 +349,33 @@ def test_file_coordination_serializes_same_scope(tmp_path) -> None:
         list(pool.map(critical, range(20)))
 
     assert state["max_inside"] == 1
+
+
+def test_file_coordination_separates_different_database_namespaces(tmp_path) -> None:
+    managers = [
+        default_coordination_manager(SQLiteAgentStore(tmp_path / "tenant_a.sqlite3")),
+        default_coordination_manager(SQLiteAgentStore(tmp_path / "tenant_b.sqlite3")),
+    ]
+    barrier = threading.Barrier(2)
+    state = {"inside": 0, "max_inside": 0}
+    guard = threading.Lock()
+
+    def critical(index: int) -> None:
+        barrier.wait()
+        with managers[index].lock("conversation:same"):
+            with guard:
+                state["inside"] += 1
+                state["max_inside"] = max(state["max_inside"], state["inside"])
+            import time
+
+            time.sleep(0.02)
+            with guard:
+                state["inside"] -= 1
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(critical, range(2)))
+
+    assert state["max_inside"] == 2
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])

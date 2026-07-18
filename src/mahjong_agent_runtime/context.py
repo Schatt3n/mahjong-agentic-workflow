@@ -184,6 +184,46 @@ class AgentContextBuilder:
             quoted_message_reference_status = "resolved" if quoted_message_context is not None else "unresolved"
             if quoted_message_context is None and quoted_message_has_provided_business_ref:
                 quoted_message_reference_status = "provided_business_ref"
+        message_reference_contract = {
+            "primary_binding": "quoted_message" if quoted_message_present else "current_message",
+            "quoted_message_present": quoted_message_present,
+            "business_reference_status": quoted_message_reference_status,
+            "business_reference_resolved": bool(
+                quoted_message_context is not None or quoted_message_has_provided_business_ref
+            ),
+            "interpretation_instruction": (
+                "Interpret the current reply against current_message.quoted_message before recent_conversation or active_games."
+                if quoted_message_present
+                else "Interpret the current reply from current_message, then use recent context only to resolve omissions."
+            ),
+            "state_write_instruction": (
+                "The quote has no authoritative business reference. Do not infer a state-changing acceptance, rejection, "
+                "arrival, cancellation, or participant update solely from this short reply plus a nearby active game. "
+                "Resolve the business object with a read tool or ask the user before a write."
+                if quoted_message_present
+                and quoted_message_context is None
+                and not quoted_message_has_provided_business_ref
+                else "Any state write must still be supported by the current message and authoritative business state."
+            ),
+        }
+        sender_active_game_memberships = []
+        for game in active_games:
+            for participant in game.participants:
+                if participant.customer_id != message.sender_id:
+                    continue
+                sender_active_game_memberships.append(
+                    {
+                        "game_id": game.game_id,
+                        "participant_status": participant.status,
+                        "seat_count": participant.seat_count,
+                        "participation_already_recorded": participant.status
+                        in {"joined", "confirmed", "accepted", "arrived"},
+                        "write_instruction": (
+                            "Do not call record_candidate_reply with the same participation meaning unless the current "
+                            "message explicitly changes status or seat_count."
+                        ),
+                    }
+                )
         audit = {
             **audit,
             "conversation_checkpoint_present": checkpoint is not None,
@@ -217,6 +257,7 @@ class AgentContextBuilder:
                 ),
             },
             "current_message": current_message,
+            "message_reference_contract": message_reference_contract,
             "quoted_message_context": quoted_message_context,
             "recent_conversation": recent_conversation,
             "conversation_checkpoint": checkpoint.to_dict() if checkpoint else None,
@@ -227,6 +268,7 @@ class AgentContextBuilder:
             "pending_memory_candidates": pending_memory_candidates,
             "active_games": active_game_contexts,
             "active_game_visible_summaries": active_game_visible_summaries,
+            "sender_active_game_memberships": sender_active_game_memberships,
             "active_parties": [
                 {
                     "game_id": game_context["game_id"],

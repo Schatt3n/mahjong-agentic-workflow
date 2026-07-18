@@ -5,7 +5,7 @@ from __future__ import annotations
 设计理念：
 - 主 agent 可以提出回复和邀约草稿，但凡是客户可能看到的文本，都必须走统一处理链路。
 - 话术生成负责把结构化、僵硬的文本改得更像老板说话。
-- 内容审查只负责信息泄露和未验证动作风险，不做业务规划，不决定工具调用。
+- 内容审查负责信息泄露、未验证动作和语义一致性风险，不做业务规划，不决定工具调用。
 - 这一层是生产安全边界，不应该散落在主 loop 或具体工具里。
 """
 
@@ -424,7 +424,7 @@ def build_reply_self_review_payload(
     """构建审查模型专用上下文。
 
     审查模型不需要完整主 agent 上下文，只需要当前消息、关系、现有局摘要、最近对话尾部、
-    待审文本和审查合同。这样既省 token，也避免审查模型越权做规划。
+    权威工具结果、改写前后文本和审查合同。这样既省 token，也避免审查模型越权做规划。
     """
 
     return {
@@ -444,7 +444,26 @@ def build_reply_self_review_payload(
         },
         "review_scope": review_scope,
         "review_items": review_items,
-        "review_goal": "一次性审查 review_items 中的客户可见文本是否泄露系统信息、后台流程、其他用户信息或未发生动作；不做业务规划，不决定工具调用，不负责润色文风。",
+        "review_goal": (
+            "一次性审查 review_items 中的客户可见文本是否泄露系统信息、后台流程、其他用户信息、"
+            "未发生动作，或与权威工具结果/客户可见局摘要/改写前文本发生语义矛盾或关键事实丢失；"
+            "不做业务规划，不决定工具调用，不负责润色文风。"
+        ),
+        "semantic_fidelity_contract": {
+            "source_order": [
+                "成功的 previous_tool_results 是本轮工具事实的最高优先级来源",
+                "active_game_visible_summaries 是可对当前客户披露的局况事实来源",
+                "review_items[].source_text 是话术改写前的语义基线",
+                "review_items[].text 是待发送文本，不得反向覆盖上述事实",
+            ],
+            "rules": [
+                "待审文本不得反转存在/不存在、成功/失败、已确认/未确认、已发送/未发送等事实极性",
+                "待审文本不得修改人数、缺口、时间、档位、烟况、时长、玩法或下一步决策问题",
+                "如果 source_text 或客户可见摘要把多个字段组成一个可识别选项，待审文本必须保留完整决策锚点",
+                "成功查询返回非空 matches 时，待审文本不得声称没有匹配结果",
+                "审查发现语义不保真时 approved=false，并在 violations 标注 semantic_contradiction 或 semantic_fact_loss",
+            ],
+        },
         "review_contract": {
             "format": "json_object",
             "required_keys": ["approved", "needs_human", "reasoning_summary", "violations", "item_reviews"],
@@ -459,7 +478,7 @@ def build_reply_self_review_payload(
                 "item_reviews[].suggested_safe_text": "string; same as original text when approved=true, safe rewrite when approved=false",
             },
             "invariants": [
-                "approved=true means every review item has no information leakage or unverified external action",
+                "approved=true means every review item has no information leakage, unverified external action, semantic contradiction, or required fact loss",
                 "approved=true requires every item_reviews[].approved=true and suggested_safe_text equals the original text",
                 "approved=false and needs_human=false means at least one item_reviews entry contains a safe rewrite",
                 "needs_human=true means the main agent should use a short human-handoff reply or stop the unsafe tool action",

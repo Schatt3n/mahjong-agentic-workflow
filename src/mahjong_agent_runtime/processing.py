@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .action_contract import parse_action
+from .action_contract import parse_action_with_repairs
 from .budget import TokenBudget
 from .copywriting import DEFAULT_CUSTOMER_VISIBLE_TEXT_PROMPT_PATH, action_with_customer_visible_rewrites
 from .hooks import HookManager
@@ -332,7 +332,14 @@ class ActionProcessor:
             trace_id=trace_id,
             payload={"step_index": step_index, "elapsed_ms": elapsed_ms, "raw_response": raw_response},
         )
-        action, errors = parse_action(raw_response)
+        action, errors, repairs = parse_action_with_repairs(raw_response)
+        if repairs:
+            self.trace_recorder.record(
+                trace_id,
+                "action_contract_repaired",
+                {"repairs": repairs, "step_index": step_index},
+                level="WARN",
+            )
         return ModelActionStep(action=action, raw_response=raw_response, errors=errors)
 
     def record_action_contract_feedback(
@@ -450,6 +457,10 @@ class ActionProcessor:
         processor = self.customer_visible_processor()
         collected_results: list[ToolResult] = []
         review_items = customer_visible_items_for_action(action)
+        original_text_by_item_id = {
+            str(item.get("item_id") or ""): str(item.get("text") or "")
+            for item in review_items
+        }
         text_generation_result = processor.run_text_generation(
             message=message,
             trace_id=trace_id,
@@ -463,6 +474,16 @@ class ActionProcessor:
             collected_results.append(text_generation_result)
             action = self.apply_customer_visible_rewrites(action, text_generation_result, trace_id=trace_id)
             review_items = customer_visible_items_for_action(action)
+        review_items = [
+            {
+                **item,
+                "source_text": original_text_by_item_id.get(
+                    str(item.get("item_id") or ""),
+                    str(item.get("text") or ""),
+                ),
+            }
+            for item in review_items
+        ]
 
         review_result = processor.run_content_review(
             message=message,
@@ -569,6 +590,7 @@ class ActionProcessor:
             "recipient_id": message.sender_id,
             "recipient_name": message.sender_name,
             "text": proposed_reply,
+            "source_text": proposed_reply,
         }
         text_generation_result = processor.run_text_generation(
             message=message,

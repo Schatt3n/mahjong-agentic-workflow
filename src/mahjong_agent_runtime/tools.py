@@ -73,10 +73,27 @@ def current_game_search_reply_contract(requirement: dict[str, Any], matches: lis
         for item in matches
     ]
     match_summaries = [item for item in match_summaries if item]
+    has_matches = bool(matches)
     return {
         "source_tool": "search_current_games",
         "matched_query_requirement": requirement,
         "matched_result_summaries": match_summaries,
+        "search_result_semantics": {
+            "status": "actionable_matches" if has_matches else "no_actionable_match",
+            "backend_retrieval_policy_applied": True,
+            "actionable_match_count": len(matches),
+            "instruction": (
+                "The non-empty matches list is the backend-selected actionable candidate set. It may contain a nearby "
+                "or otherwise decision-worthy alternative under the domain retrieval policy, not only raw-field exact "
+                "matches. Do not recompute eligibility from raw fields, reject the returned candidates, claim that no "
+                "game exists, or repeat the same semantic search merely because a returned time or other field differs. "
+                "Offer the matched_result_summaries and disclose only differences the customer must decide."
+                if has_matches
+                else
+                "The backend found no actionable current game under the executed requirement. Do not repeat the same "
+                "semantic search unless the user changes a constraint, system state becomes stale, or the tool reports an error."
+            ),
+        },
         "reply_shape": "Use one matched_result_summary plus a short confirmation question.",
         "customer_visible_rule": (
             "When a matched current game satisfies the user's request, the customer-visible reply should prioritize "
@@ -87,7 +104,11 @@ def current_game_search_reply_contract(requirement: dict[str, Any], matches: lis
             "from what the user requested and must be disclosed for decision-making."
         ),
         "good_reply_examples": ["七点三缺一，可以不", "七点三缺一，可以吗"],
-        "bad_reply_examples": ["七点三缺一，0.5无烟杭麻，打吗", "已按你的画像找到七点三缺一"],
+        "bad_reply_examples": [
+            "七点三缺一，0.5无烟杭麻，打吗",
+            "已按你的画像找到七点三缺一",
+            "六点半没有，七点有个三缺一，0.5无烟，可以不",
+        ],
     }
 
 

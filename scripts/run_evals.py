@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REAL_OWNER_LIVE_EVAL_REPORT = ROOT / "runtime_data" / "real_owner_chat_live_eval_report.json"
+DETERMINISTIC_CONCURRENCY_REPORT = ROOT / "runtime_data" / "concurrency_eval_deterministic_report.json"
+LIVE_CONCURRENCY_REPORT = ROOT / "runtime_data" / "concurrency_eval_live_report.json"
 
 
 def run_command(args: list[str]) -> None:
@@ -28,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="also run real owner chat live LLM eval; requires MAHJONG_LLM_MODEL and an API key",
     )
+    parser.add_argument(
+        "--live-concurrency",
+        action="store_true",
+        help="also run the real-DeepSeek concurrent eval; requires MAHJONG_LLM_MODEL and an API key",
+    )
     return parser.parse_args()
 
 
@@ -38,6 +45,21 @@ def main() -> int:
     run_command([sys.executable, "scripts/check_badcase_regression_coverage.py"])
     run_command([sys.executable, "scripts/validate_real_owner_chat_golden.py"])
     run_command([sys.executable, "scripts/run_agent_runtime_eval.py"])
+    run_command(
+        [
+            sys.executable,
+            "scripts/run_concurrency_eval.py",
+            "--mode",
+            "deterministic",
+            "--operations",
+            "40",
+            "--workers",
+            "8",
+            "--strict",
+            "--report-path",
+            str(DETERMINISTIC_CONCURRENCY_REPORT),
+        ]
+    )
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_real_owner_chat_golden.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_context_summary.py"])
@@ -54,6 +76,22 @@ def main() -> int:
                 "--strict",
                 "--report-path",
                 str(REAL_OWNER_LIVE_EVAL_REPORT),
+            ]
+        )
+    if args.live_concurrency:
+        run_command(
+            [
+                sys.executable,
+                "scripts/run_concurrency_eval.py",
+                "--mode",
+                "live",
+                "--live-workers",
+                "4",
+                "--live-repeats",
+                "2",
+                "--strict",
+                "--report-path",
+                str(LIVE_CONCURRENCY_REPORT),
             ]
         )
     return 0

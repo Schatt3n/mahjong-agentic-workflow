@@ -76,5 +76,11 @@ def default_coordination_manager(store: Any) -> CoordinationManager:
         return RedisCoordinationManager(redis_url)
     path = getattr(store, "path", None)
     if path:
-        return FileCoordinationManager(Path(path).parent / ".runtime-locks")
+        database_path = Path(path)
+        # Separate databases may legitimately reuse the same conversation
+        # identifiers.  Include the database identity in the lock namespace
+        # while keeping every process that opens the same database coordinated.
+        return FileCoordinationManager(
+            database_path.parent / f".{database_path.name}.runtime-locks"
+        )
     return InProcessCoordinationManager()

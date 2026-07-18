@@ -35,6 +35,7 @@ class AgentLLMConfig:
     retry_base_delay_seconds: float = 0.5
     retry_max_delay_seconds: float = 4.0
     max_estimated_tokens_per_day: int = 0
+    max_concurrency: int = 3
 
     @classmethod
     def from_env(cls) -> "AgentLLMConfig | None":
@@ -59,6 +60,7 @@ class AgentLLMConfig:
             retry_base_delay_seconds=max(0.0, env_float("MAHJONG_LLM_RETRY_BASE_DELAY_SECONDS", 0.5)),
             retry_max_delay_seconds=max(0.0, env_float("MAHJONG_LLM_RETRY_MAX_DELAY_SECONDS", 4.0)),
             max_estimated_tokens_per_day=max(0, env_int("MAHJONG_LLM_MAX_ESTIMATED_TOKENS_PER_DAY", 0)),
+            max_concurrency=max(1, env_int("MAHJONG_LLM_MAX_CONCURRENCY", 3)),
         )
 
 
@@ -95,6 +97,16 @@ class OpenAICompatibleAgentClient:
     sleep_fn: Any = time.sleep
     monotonic_fn: Any = time.monotonic
     random_fn: Any = random.random
+    _concurrency_gate: threading.BoundedSemaphore = field(init=False, repr=False)
+    _concurrency_metrics_lock: threading.Lock = field(init=False, repr=False)
+    _active_provider_requests: int = field(init=False, default=0, repr=False)
+    _waiting_provider_requests: int = field(init=False, default=0, repr=False)
+    _max_active_provider_requests: int = field(init=False, default=0, repr=False)
+    _max_waiting_provider_requests: int = field(init=False, default=0, repr=False)
+
+    def __post_init__(self) -> None:
+        self._concurrency_gate = threading.BoundedSemaphore(max(1, int(self.config.max_concurrency)))
+        self._concurrency_metrics_lock = threading.Lock()
 
     @classmethod
     def from_env(cls) -> "OpenAICompatibleAgentClient | None":
@@ -111,17 +123,81 @@ class OpenAICompatibleAgentClient:
             estimated,
             self.config.max_estimated_tokens_per_day,
         )
+        deadline = self.monotonic_fn() + max(0.1, timeout_seconds)
         try:
-            return self._complete_with_retry(messages, trace_id=trace_id, timeout_seconds=timeout_seconds)
+            return self._complete_primary_with_concurrency_limit(
+                messages,
+                trace_id=trace_id,
+                deadline=deadline,
+            )
         except Exception as primary_error:
             if self.fallback_client is None:
                 raise
+            remaining = deadline - self.monotonic_fn()
+            if remaining <= 0:
+                raise primary_error
             try:
-                return self.fallback_client.complete(messages, trace_id=trace_id, timeout_seconds=timeout_seconds)
+                return self.fallback_client.complete(messages, trace_id=trace_id, timeout_seconds=remaining)
             except Exception as fallback_error:
                 raise RuntimeError(
                     f"primary and fallback LLM calls failed; primary={primary_error}; fallback={fallback_error}"
                 ) from fallback_error
+
+    def _complete_primary_with_concurrency_limit(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        trace_id: str,
+        deadline: float,
+    ) -> str:
+        """Apply provider backpressure before starting the retry loop.
+
+        Queue waiting consumes the same end-to-end timeout as the HTTP request. This prevents a burst of main-agent,
+        copywriter and reviewer calls from overwhelming one provider while also preventing an unbounded local queue.
+        """
+
+        with self._concurrency_metrics_lock:
+            self._waiting_provider_requests += 1
+            self._max_waiting_provider_requests = max(
+                self._max_waiting_provider_requests,
+                self._waiting_provider_requests,
+            )
+        remaining = deadline - self.monotonic_fn()
+        acquired = False
+        try:
+            if remaining > 0:
+                acquired = self._concurrency_gate.acquire(timeout=remaining)
+        finally:
+            with self._concurrency_metrics_lock:
+                self._waiting_provider_requests -= 1
+        if not acquired:
+            raise RuntimeError("LLM concurrency queue timed out before a provider slot became available")
+
+        try:
+            with self._concurrency_metrics_lock:
+                self._active_provider_requests += 1
+                self._max_active_provider_requests = max(
+                    self._max_active_provider_requests,
+                    self._active_provider_requests,
+                )
+            remaining = deadline - self.monotonic_fn()
+            if remaining <= 0:
+                raise RuntimeError("LLM request timed out while waiting for a provider slot")
+            return self._complete_with_retry(messages, trace_id=trace_id, timeout_seconds=remaining)
+        finally:
+            with self._concurrency_metrics_lock:
+                self._active_provider_requests -= 1
+            self._concurrency_gate.release()
+
+    def concurrency_metrics(self) -> dict[str, int]:
+        with self._concurrency_metrics_lock:
+            return {
+                "configured_max_concurrency": max(1, int(self.config.max_concurrency)),
+                "active_provider_requests": self._active_provider_requests,
+                "waiting_provider_requests": self._waiting_provider_requests,
+                "max_active_provider_requests": self._max_active_provider_requests,
+                "max_waiting_provider_requests": self._max_waiting_provider_requests,
+            }
 
     def _complete_with_retry(
         self,
@@ -246,6 +322,7 @@ def fallback_client_from_env() -> "OpenAICompatibleAgentClient | None":
             0,
             env_int("MAHJONG_LLM_FALLBACK_MAX_ESTIMATED_TOKENS_PER_DAY", 0),
         ),
+        max_concurrency=max(1, env_int("MAHJONG_LLM_FALLBACK_MAX_CONCURRENCY", 2)),
     )
     return OpenAICompatibleAgentClient(config=config)
 

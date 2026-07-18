@@ -302,6 +302,18 @@ def test_runtime_context_includes_quoted_message_anchor() -> None:
     prompt_payload = json.loads(built.messages[1]["content"])
     assert prompt_payload["current_message"]["quoted_message"]["business_ref_id"] == "draft_001"
     assert prompt_payload["current_message"]["quoted_message"]["text"] == "14:00，0.5无烟，打吗？"
+    assert prompt_payload["message_reference_contract"] == {
+        "primary_binding": "quoted_message",
+        "quoted_message_present": True,
+        "business_reference_status": "provided_business_ref",
+        "business_reference_resolved": True,
+        "interpretation_instruction": (
+            "Interpret the current reply against current_message.quoted_message before recent_conversation or active_games."
+        ),
+        "state_write_instruction": (
+            "Any state write must still be supported by the current message and authoritative business state."
+        ),
+    }
     assert "not-for-model" not in built.messages[1]["content"]
     assert "老板备注不该进上下文" not in built.messages[1]["content"]
 
@@ -588,6 +600,11 @@ def test_runtime_context_audit_marks_unresolved_quoted_message_reference() -> No
     assert built.payload["context_budget"]["quoted_message_id"] == "missing_message_reference"
     assert built.payload["context_budget"]["quoted_message_reference_resolved"] is False
     assert built.payload["context_budget"]["quoted_message_reference_status"] == "unresolved"
+    assert built.payload["message_reference_contract"]["primary_binding"] == "quoted_message"
+    assert built.payload["message_reference_contract"]["business_reference_resolved"] is False
+    assert "Do not infer a state-changing acceptance" in built.payload["message_reference_contract"][
+        "state_write_instruction"
+    ]
 
 
 def test_runtime_context_includes_active_game_visible_summaries() -> None:
@@ -635,6 +652,52 @@ def test_runtime_context_includes_active_game_visible_summaries() -> None:
     assert summaries[0]["seat_summary"]["remaining_seats"] == 2
     assert summaries[0]["public_requirement"]["start_time"] == "18:30"
     assert summaries[0]["public_requirement"]["needed_seats"] == 2
+
+
+def test_runtime_context_projects_sender_membership_as_authoritative_state() -> None:
+    store = InMemoryAgentStore()
+    game, _ = store.create_game(
+        conversation_id="membership_projection",
+        organizer_id="customer_1",
+        organizer_name="客户",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "start_time_kind": "scheduled",
+            "start_time": "19:00",
+            "planned_start_at": (now() + timedelta(hours=2)).isoformat(),
+            "needed_seats": 3,
+        },
+        known_players=[
+            {"customer_id": "customer_1", "display_name": "客户", "status": "confirmed"},
+        ],
+        trace_id="trace_membership_projection_seed",
+    )
+    builder = AgentContextBuilder(store=store, tool_gateway=ToolGateway(store=store))
+
+    built = builder.build(
+        UserMessage(
+            conversation_id="membership_projection",
+            sender_id="customer_1",
+            sender_name="客户",
+            text="七点可以，我最多打四小时",
+            message_id="msg_membership_projection",
+        ),
+        trace_id="trace_membership_projection",
+    )
+
+    assert built.payload["sender_active_game_memberships"] == [
+        {
+            "game_id": game.game_id,
+            "participant_status": "joined",
+            "seat_count": 1,
+            "participation_already_recorded": True,
+            "write_instruction": (
+                "Do not call record_candidate_reply with the same participation meaning unless the current "
+                "message explicitly changes status or seat_count."
+            ),
+        }
+    ]
 
 
 def test_sqlite_store_persists_message_references(tmp_path: Path) -> None:
@@ -1915,6 +1978,131 @@ def test_runtime_reply_self_review_rewrites_leaking_customer_reply() -> None:
     assert steps.count("customer_visible_content_review_result") == 2
 
 
+def test_runtime_review_rejects_reply_that_contradicts_successful_search_result() -> None:
+    store = seeded_store()
+    store.create_game(
+        conversation_id="semantic_review_other_conversation",
+        organizer_id="ran",
+        organizer_name="冉姐",
+        requirement={
+            "game_type": "hangzhou_mahjong",
+            "stake": "0.5",
+            "smoke_preference": "no_smoke",
+            "start_time_kind": "asap_when_full",
+            "known_player_count": 3,
+            "needed_seats": 1,
+            "user_visible_summary": "七点三缺一",
+        },
+        known_players=[
+            {"customer_id": "ran", "display_name": "冉姐", "status": "joined", "seat_count": 3}
+        ],
+        trace_id="trace_semantic_review_seed",
+    )
+    trace = InMemoryTraceRecorder()
+    main_client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="needs_tool",
+                reasoning_summary="先查询匹配局。",
+                tool_calls=[
+                    {
+                        "name": "search_current_games",
+                        "arguments": {
+                            "requirement": {
+                                "game_type": "hangzhou_mahjong",
+                                "stake": "0.5",
+                                "smoke_preference": "no_smoke",
+                                "start_time_kind": "asap_when_full",
+                                "needed_seats": 1,
+                            }
+                        },
+                        "reason": "查附近现成局。",
+                    }
+                ],
+            ),
+            action_json(
+                objective_status="waiting_user",
+                reasoning_summary="错误地忽略了非空查询结果。",
+                reply_to_user="现在没有现成的，要组一个吗？",
+            ),
+            action_json(
+                objective_status="waiting_user",
+                reasoning_summary="根据语义一致性审查和查询结果纠正回复。",
+                reply_to_user="七点三缺一，可以不？",
+            ),
+        ]
+    )
+    review_client = StaticAgentClient(
+        [
+            json.dumps(
+                {
+                    "approved": False,
+                    "needs_human": False,
+                    "reasoning_summary": "查询结果非空，待发文本却声称没有现成局。",
+                    "violations": ["semantic_contradiction"],
+                    "item_reviews": [
+                        {
+                            "item_id": "reply_to_user",
+                            "approved": False,
+                            "suggested_safe_text": "七点三缺一，可以不？",
+                            "reasoning_summary": "应忠于成功查询结果。",
+                            "violations": ["semantic_contradiction"],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "approved": True,
+                    "needs_human": False,
+                    "reasoning_summary": "回复与查询结果一致。",
+                    "violations": [],
+                    "item_reviews": [
+                        {
+                            "item_id": "reply_to_user",
+                            "approved": True,
+                            "suggested_safe_text": "七点三缺一，可以不？",
+                            "reasoning_summary": "语义一致。",
+                            "violations": [],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+    runtime = AgentRuntime(
+        llm_client=main_client,
+        store=store,
+        trace_recorder=trace,
+        reply_self_review_enabled=True,
+        reply_self_review_client=review_client,
+    )
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="semantic_review_request",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="0.5无烟有人吗",
+            message_id="msg_semantic_review_request",
+        ),
+        trace_id="trace_semantic_review_request",
+    )
+
+    assert result.final_reply == "七点三缺一，可以不？"
+    first_review_payload = json.loads(review_client.calls[0]["messages"][1]["content"])
+    search_results = [
+        item for item in first_review_payload["previous_tool_results"] if item["name"] == "search_current_games"
+    ]
+    assert search_results
+    assert search_results[-1]["result"]["matches"]
+    assert first_review_payload["review_items"][0]["source_text"] == "现在没有现成的，要组一个吗？"
+    retry_payload = json.loads(main_client.calls[2]["messages"][1]["content"])
+    assert retry_payload["previous_tool_results"][-1]["result"]["violations"] == ["semantic_contradiction"]
+
+
 def test_runtime_customer_visible_text_generation_rewrites_reply_before_review() -> None:
     store = seeded_store()
     trace = InMemoryTraceRecorder()
@@ -2023,6 +2211,9 @@ def test_runtime_customer_visible_text_generation_rewrites_reply_before_review()
     assert "public nickname/group nickname" in generation_payload["style_quality_contract"]["must_preserve_if_present"]
     review_payload = json.loads(review_client.calls[0]["messages"][1]["content"])
     assert review_payload["review_items"][0]["text"] == "有个1块有烟、人齐开、4小时左右的局，打吗？"
+    assert review_payload["review_items"][0]["source_text"] == original_reply
+    assert "previous_tool_results" in review_payload
+    assert "成功查询返回非空 matches 时" in " ".join(review_payload["semantic_fidelity_contract"]["rules"])
     assert result.actions[-1].reply_to_user == "有个1块有烟、人齐开、4小时左右的局，打吗？"
     steps = trace_steps(trace.get_trace("trace_copywriting_reply"))
     assert "customer_visible_text_generation_prompt" in steps
@@ -2181,6 +2372,7 @@ def test_runtime_customer_visible_text_generation_rewrites_invite_text_before_re
     ]
     first_review_payload = json.loads(review_client.calls[0]["messages"][1]["content"])
     assert first_review_payload["review_items"][0]["text"] == "人齐开，1块，烟都可以，打吗？"
+    assert first_review_payload["review_items"][0]["source_text"] == "冉姐，asap_when_full，1，烟都可，打吗？"
     steps = trace_steps(trace.get_trace("trace_copywriting_invite"))
     assert steps.count("customer_visible_text_generation_result") == 2
     assert steps.count("customer_visible_content_review_result") == 2
@@ -2820,6 +3012,54 @@ def test_runtime_action_contract_error_is_fed_back_to_model_for_repair() -> None
     assert "action_contract_error" in steps
     assert "contract_error_feedback" in steps
     assert steps[-1] == "final_output"
+
+
+def test_runtime_repairs_unambiguous_terminal_status_without_another_model_call() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    client = StaticAgentClient(
+        [
+            json.dumps(
+                {
+                    "goal": "确认已经记录用户约束",
+                    "objective_status": "needs_tool",
+                    "reasoning_summary": "约束已经写入，本轮应短句确认。",
+                    "reply_to_user": "好的",
+                    "tool_calls": [],
+                    "needs_human": False,
+                    "stop_reason": {
+                        "can_stop": True,
+                        "why": "本轮没有剩余工具工作。",
+                        "pending_work": [],
+                        "depends_on_tool_results": True,
+                    },
+                    "badcase": None,
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    runtime = AgentRuntime(llm_client=client, store=store, trace_recorder=trace)
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_contract_normalization",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="我只能打四个小时",
+            message_id="msg_contract_normalization",
+        ),
+        trace_id="trace_contract_normalization",
+    )
+
+    assert result.final_reply == "好的"
+    assert len(client.calls) == 1
+    steps = trace_steps(trace.get_trace("trace_contract_normalization"))
+    assert "action_contract_repaired" in steps
+    assert "action_contract_error" not in steps
+    repair = next(event for event in trace.get_trace("trace_contract_normalization") if event.step == "action_contract_repaired")
+    assert repair.content["repairs"][0]["field"] == "objective_status"
+    assert repair.content["repairs"][0]["to"] == "completed"
 
 
 def test_runtime_schema_rejects_empty_invite_draft_list_without_state_change() -> None:
@@ -4413,11 +4653,16 @@ def test_runtime_search_current_games_tool_result_carries_customer_reply_contrac
     search_result = result.tool_results[0].result
     contract = search_result["customer_reply_contract"]
     assert contract["matched_result_summaries"] == ["七点三缺一"]
+    assert contract["search_result_semantics"]["status"] == "actionable_matches"
+    assert contract["search_result_semantics"]["backend_retrieval_policy_applied"] is True
+    assert contract["search_result_semantics"]["actionable_match_count"] == 1
+    assert "Do not recompute eligibility" in contract["search_result_semantics"]["instruction"]
     assert "Do not expand matched query" in contract["customer_visible_rule"]
     assert "七点三缺一，可以不" in contract["good_reply_examples"]
     second_prompt = json.loads(client.calls[1]["messages"][1]["content"])
     previous_contract = second_prompt["previous_tool_results"][0]["result"]["customer_reply_contract"]
     assert previous_contract["matched_result_summaries"] == ["七点三缺一"]
+    assert previous_contract["search_result_semantics"]["status"] == "actionable_matches"
     assert result.final_reply == "七点三缺一，可以不"
 
 

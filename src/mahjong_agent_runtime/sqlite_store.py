@@ -1434,7 +1434,11 @@ class SQLiteAgentStore:
         trace_id: str,
     ) -> tuple[list[InviteDraft], list[StateTransition]]:
         self._expire_stale_games(trace_id=trace_id)
-        with self._lock, self._connection:
+        # The open-invite check and draft inserts form one invariant.  A
+        # deferred SQLite transaction lets multiple processes all observe
+        # "no open invite" before any of them writes, so reserve the writer
+        # slot before reading mutable state.
+        with self._write_transaction():
             from .models import new_id, now
 
             game = self.require_game(game_id)

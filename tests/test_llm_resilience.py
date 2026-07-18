@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -96,3 +99,70 @@ def test_llm_uses_fallback_after_primary_exhausted() -> None:
     )
     assert client.complete([{"role": "user", "content": "test"}], trace_id="trace_3", timeout_seconds=2) == '{"fallback":true}'
     assert len(fallback.calls) == 1
+
+
+def test_llm_limits_concurrent_provider_requests() -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def urlopen(*args: object, **kwargs: object) -> FakeResponse:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return FakeResponse('{"ok":true}')
+        finally:
+            with lock:
+                active -= 1
+
+    client = OpenAICompatibleAgentClient(config=config(max_concurrency=2), urlopen=urlopen)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [
+            pool.submit(
+                client.complete,
+                [{"role": "user", "content": "test"}],
+                trace_id=f"trace_concurrency_{index}",
+                timeout_seconds=2,
+            )
+            for index in range(6)
+        ]
+        assert [future.result() for future in futures] == ['{"ok":true}'] * 6
+
+    metrics = client.concurrency_metrics()
+    assert max_active == 2
+    assert metrics["configured_max_concurrency"] == 2
+    assert metrics["max_active_provider_requests"] == 2
+    assert metrics["max_waiting_provider_requests"] >= 2
+    assert metrics["active_provider_requests"] == 0
+    assert metrics["waiting_provider_requests"] == 0
+
+
+def test_llm_concurrency_queue_respects_end_to_end_timeout() -> None:
+    first_request_started = threading.Event()
+    release_first_request = threading.Event()
+
+    def urlopen(*args: object, **kwargs: object) -> FakeResponse:
+        first_request_started.set()
+        release_first_request.wait(timeout=2)
+        return FakeResponse('{"ok":true}')
+
+    client = OpenAICompatibleAgentClient(config=config(max_concurrency=1), urlopen=urlopen)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            client.complete,
+            [{"role": "user", "content": "first"}],
+            trace_id="trace_first",
+            timeout_seconds=2,
+        )
+        assert first_request_started.wait(timeout=1)
+        with pytest.raises(RuntimeError, match="concurrency queue timed out"):
+            client.complete(
+                [{"role": "user", "content": "second"}],
+                trace_id="trace_second",
+                timeout_seconds=0.05,
+            )
+        release_first_request.set()
+        assert first.result() == '{"ok":true}'

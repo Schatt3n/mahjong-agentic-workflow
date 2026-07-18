@@ -712,7 +712,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 "create_game",
                 "create_invite_drafts",
             ],
-            required_reply_any=[["ok", "好的", "好", "行", "收到", "记下", "知道了"]],
+            required_reply_any=[["ok", "好的", "好", "行", "收到", "记下", "知道了", "没问题"]],
             forbidden_reply_contains=[
                 "要组",
                 "打多大",
@@ -1279,6 +1279,31 @@ def scenario_db_path(base_path: pathlib.Path, scenario_id: str) -> pathlib.Path:
     return base_path.with_name(f"{base_path.stem}_{scenario_id}{base_path.suffix}")
 
 
+def decision_trace_snapshots(trace_events: list[Any]) -> list[dict[str, Any]]:
+    """Keep the model/tool decision boundary in eval reports without copying full prompts."""
+
+    high_signal_steps = {
+        "action_contract_error",
+        "llm_error",
+        "customer_visible_text_generation_error",
+        "customer_visible_content_review_error",
+        "action_proposed",
+        "customer_visible_text_generation_result",
+        "action_after_customer_visible_text_generation",
+        "customer_visible_content_review_result",
+        "final_output",
+    }
+    return [
+        {
+            "step": event.step,
+            "level": event.level,
+            "content": event.content,
+        }
+        for event in trace_events
+        if event.step in high_signal_steps
+    ]
+
+
 def run_scenario(client: OpenAICompatibleAgentClient, args: argparse.Namespace, scenario: LiveEvalScenario) -> dict[str, Any]:
     db_path = scenario_db_path(args.db_path, scenario.scenario_id)
     store = build_empty_store(db_path)
@@ -1303,6 +1328,7 @@ def run_scenario(client: OpenAICompatibleAgentClient, args: argparse.Namespace, 
         "checks": validation["checks"],
         "db_path": str(db_path),
         "trace_steps": trace_steps,
+        "decision_trace": decision_trace_snapshots(trace_events),
     }
 
 

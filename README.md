@@ -209,6 +209,9 @@ MAHJONG_LLM_MODEL=<your-model-name>
 MAHJONG_LLM_API_KEY=<your-api-key>
 MAHJONG_LLM_BASE_URL=https://api.deepseek.com
 
+# 供应商侧并发背压。业务会话可以并行，但同时在途的模型 HTTP 请求最多 3 个
+MAHJONG_LLM_MAX_CONCURRENCY=3
+
 # 推荐为写入 API 配置鉴权；不要提交真实 token
 MAHJONG_AGENT_API_TOKEN=<local-api-token>
 
@@ -327,6 +330,56 @@ PYTHONPATH=src python -m pytest -q
 PYTHONPATH=src python scripts/run_evals.py
 ```
 
+### 并发测试
+
+并发测试不能只用 `ab` 或 `wrk` 同时打 HTTP 接口，因为那只能证明服务能收请求，不能证明业务状态正确。本项目将并发验证拆为两层。
+
+第一层是确定性竞争测试，不调用模型，用大量线程在同一时刻制造真正的状态竞争：
+
+```bash
+PYTHONPATH=src python scripts/run_concurrency_eval.py \
+  --mode deterministic \
+  --operations 40 \
+  --workers 8 \
+  --strict \
+  --report-path runtime_data/concurrency_eval_deterministic_report.json
+```
+
+它验证七类生产不变量：
+
+| 场景 | 必须成立的不变量 |
+| --- | --- |
+| 同一消息重复投递 | 40 次请求只调用一次模型、只落一份结果 |
+| 不同会话并行 | 上下文、版本和回复不串，模型调用确实重叠 |
+| 多人抢最后一个座位 | 只能一人确认，局不能超过 4 个座位 |
+| 多个局抢同一房间 | 同一时间段只能一条预留成功 |
+| 同一需求并发建局 | 只能生成一个有效局 |
+| 同一候选人并发邀约 | 只能生成一条开放邀约草稿 |
+| 会话版本并发递增 | 版本必须连续、无重复、无丢失 |
+
+第二层是真实模型并发测试。它创建彼此隔离的会话和数据库实例，用线程池同时驱动完整 Agent Loop，并真实调用 DeepSeek；主模型、话术生成和内容审查都计算在模型调用与时延指标内。它模拟的是“多个客户在同一时间与系统交互”，不是把同一会话无序并行：同一 `conversation_id` 仍由协调锁保证顺序，不同会话才允许并行执行。
+
+```bash
+PYTHONPATH=src python scripts/run_concurrency_eval.py \
+  --mode live \
+  --live-workers 4 \
+  --live-repeats 2 \
+  --strict \
+  --report-path runtime_data/concurrency_eval_live_report.json
+```
+
+真实并发主要观察：场景通过率、模型失败数、业务会话并发度、供应商请求峰值、排队数、模型调用 `P95/P99`、端到端场景 `P95/P99`、工具调用与最终话术是否符合 golden 预期。业务并发和供应商并发是两个不同概念：多个客户会话可以同时运行，但 `MAHJONG_LLM_MAX_CONCURRENCY` 会限制瞬时 HTTP 请求，避免主模型、话术和审查同时突发导致供应商超时。等待信号量的时间计入端到端超时，因此不会无限排队。
+
+也可以通过统一入口执行：
+
+```bash
+# 默认包含确定性并发回归
+PYTHONPATH=src python scripts/run_evals.py
+
+# 额外执行真实 DeepSeek 并发评测
+PYTHONPATH=src python scripts/run_evals.py --live-concurrency
+```
+
 显式调用真实模型的老板对话评测：
 
 ```bash
@@ -335,10 +388,14 @@ PYTHONPATH=src python scripts/run_real_owner_chat_live_eval.py
 
 最近一次完整验证结果：
 
-- 自动化测试：`237 passed, 1 skipped`
+- 自动化测试：`248 passed, 1 skipped`
 - Agent 确定性回归：`138/138`
 - 真实 DeepSeek 老板对话场景：`10/10`
-- badcase 回归覆盖：`fixed=14, open=0`
+- 确定性并发竞争场景：`7/7`，每类 `40` 次并发操作
+- 真实 DeepSeek 并发场景：`20/20`，`74` 次模型调用，模型调用失败 `0`
+- 真实并发模型调用延迟：`P95 7.58s`；端到端场景延迟：`P95 24.44s`
+- 供应商请求并发：配置上限 `3`，实测峰值 `3`，最大等待 `1`
+- badcase 回归覆盖：`fixed=22, open=0`
 
 质量资产位于 `eval/`：
 
@@ -382,10 +439,17 @@ tests/                                    # 单元、边界和生产不变量测
 当前系统已经具备生产化 Agent 所需的核心运行时能力，但仍需区分“代码能力”和“外部依赖能力”：
 
 - SQLite 适合单店、几百名客户和本地 MacBook 部署；多节点部署需要统一数据库、Redis 锁和正式迁移方案。
+- 本机文件锁只能协调同一台 Mac 上的多进程；它不能协调多台机器。真正横向扩容时，需要 Redis 等共享协调器、共享数据库和按 `conversation_id` 分区的消息队列，不能把本地 SQLite 文件复制到多节点使用。
 - WeChaty 已验证消息桥接链路，但个人微信协议稳定性和账号风控无法由本项目保证。
 - 自动外发应在真实数据持续回归、误发率达标和业务方确认后逐步放开。
 - 资金、优惠、纠纷和隐私敏感操作不应授权给模型自动执行。
 - 模型输出无法做到绝对确定，关键状态始终以工具结果和数据库为准。
+
+## 框架选型
+
+当前运行时没有迁移到 LangGraph、DeepAgents 等通用框架。现阶段暴露的问题主要来自数据库原子性、跨进程锁命名空间、工具结果语义、供应商并发背压和引用消息绑定，这些都属于领域状态与执行边界，迁移框架不会自动解决。当前主循环已经具备上下文、工具调用、checkpoint、人工审核、进展检测和评测闭环，此时整体迁移会增加状态兼容和回归风险。
+
+当系统需要多节点持久化编排、可视化工作流、跨任务人工队列或大量可复用子图时，再用独立 PoC 对比 LangGraph/DeepAgents 的恢复语义、状态模型、可观测性和迁移成本；框架替换不能绕过现有 Tool Gateway、业务状态机和并发不变量。
 
 ## 开发准则
 

@@ -21,16 +21,66 @@ def parse_action(raw_response: str) -> tuple[AgentAction, list[str]]:
     这样主 loop 可以统一处理，不需要在每个调用点写异常分支。
     """
 
+    action, errors, _ = parse_action_with_repairs(raw_response)
+    return action, errors
+
+
+def parse_action_with_repairs(raw_response: str) -> tuple[AgentAction, list[str], list[dict[str, Any]]]:
+    """Parse an action and apply only unambiguous, domain-neutral contract repairs.
+
+    A model can occasionally reason that a turn should stop while accidentally leaving `objective_status=needs_tool`.
+    When every other structural signal agrees that the action is terminal, normalizing that one discriminator is safer
+    and cheaper than another model call. Repairs never invent tool arguments, business facts or customer-visible text.
+    """
+
     try:
         payload = json.loads(raw_response)
     except json.JSONDecodeError as exc:
-        return contract_error_action(), [f"response is not valid JSON: {exc.msg}"]
+        return contract_error_action(), [f"response is not valid JSON: {exc.msg}"], []
     if not isinstance(payload, dict):
-        return contract_error_action(), ["response JSON root must be object"]
+        return contract_error_action(), ["response JSON root must be object"], []
+    payload, repairs = normalize_action_contract(payload)
     errors = validate_action_contract(payload)
     if errors:
-        return contract_error_action(), errors
-    return AgentAction.from_payload(payload), []
+        return contract_error_action(), errors, repairs
+    return AgentAction.from_payload(payload), [], repairs
+
+
+def normalize_action_contract(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Repair a single contradictory status only when all terminal invariants agree.
+
+    This is deliberately narrower than semantic fallback logic. It does not inspect Mahjong terms or infer intent; it
+    only reconciles the enum discriminator with existing `tool_calls`, `reply_to_user`, `needs_human` and `stop_reason`.
+    """
+
+    normalized = dict(payload)
+    repairs: list[dict[str, Any]] = []
+    stop_reason = normalized.get("stop_reason")
+    tool_calls = normalized.get("tool_calls")
+    reply = normalized.get("reply_to_user")
+    structurally_terminal = (
+        normalized.get("objective_status") == "needs_tool"
+        and isinstance(tool_calls, list)
+        and not tool_calls
+        and isinstance(reply, str)
+        and bool(reply.strip())
+        and normalized.get("needs_human") is False
+        and isinstance(stop_reason, dict)
+        and stop_reason.get("can_stop") is True
+        and isinstance(stop_reason.get("pending_work"), list)
+        and not stop_reason.get("pending_work")
+    )
+    if structurally_terminal:
+        normalized["objective_status"] = "completed"
+        repairs.append(
+            {
+                "field": "objective_status",
+                "from": "needs_tool",
+                "to": "completed",
+                "reason": "all other contract fields describe a terminal reply with no tool work",
+            }
+        )
+    return normalized, repairs
 
 
 def validate_action_contract(payload: dict[str, Any]) -> list[str]:
