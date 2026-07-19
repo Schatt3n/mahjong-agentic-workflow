@@ -121,6 +121,94 @@ def test_build_wechaty_user_message_preserves_quoted_message(monkeypatch) -> Non
     assert audit["quoted_message"]["message_id"] == "msg_invite"
 
 
+def test_observe_only_room_bypasses_self_only_scope_without_entering_main_agent(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "observe_only_rooms.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "room_ids": ["@@room_observe"],
+                "topic_keywords": ["麻神理工"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "self_only")
+    monkeypatch.setenv("MAHJONG_WECHATY_OBSERVE_ONLY_ROOMS_PATH", str(config_path))
+    monkeypatch.delenv("MAHJONG_WECHATY_INPUT_GATE_LLM_MODEL", raising=False)
+    store = InMemoryAgentStore()
+    runtime = AgentRuntime(
+        llm_client=StaticAgentClient(
+            outputs=[
+                json.dumps(
+                    {
+                        "action": "process_business",
+                        "should_route": True,
+                        "category": "operational",
+                        "confidence": 0.97,
+                        "reasoning_summary": "群友发布了明确的三缺一组局信息。",
+                        "evidence": ["371", "0.5", "无烟"],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        ),
+        store=store,
+        tool_gateway=ToolGateway(store=store),
+    )
+    monkeypatch.setattr(app, "get_runtime", lambda: runtime)
+    payload = {
+        "conversation_id": "wechaty:room:@@room_observe",
+        "sender_id": "@room_member",
+        "sender_name": "群友",
+        "message_id": "msg_observe_001",
+        "text": "今晚七点 0.5 无烟 371",
+        "self_message": False,
+        "is_room": True,
+        "room": {"id": "@@room_observe", "topic": "麻神理工🀄️（可去任何一家）"},
+        "payload": {"roomId": "@@room_observe", "talkerId": "@room_member"},
+    }
+
+    result = app.route_wechaty_raw_to_agent(payload, trace_id="trace_observe_001")
+
+    assert result["observe_only"] is True
+    assert result["routed_to_agent"] is False
+    assert result["agent_result"] is None
+    assert result["observation"]["business_message_detected"] is True
+    assert result["observation"]["state_mutation_allowed"] is False
+    assert result["observation"]["outbound_allowed"] is False
+    assert runtime.store.recent_turns("wechaty:room:@@room_observe", 10) == []
+    assert runtime.store.active_games("wechaty:room:@@room_observe") == []
+
+
+def test_non_observed_room_remains_blocked_in_self_only_scope(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "observe_only_rooms.json"
+    config_path.write_text(
+        json.dumps({"room_ids": [], "topic_keywords": ["麻神理工"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "self_only")
+    monkeypatch.setenv("MAHJONG_WECHATY_OBSERVE_ONLY_ROOMS_PATH", str(config_path))
+
+    message, audit = app.build_wechaty_user_message(
+        {
+            "conversation_id": "wechaty:room:@@other_room",
+            "sender_id": "@other_member",
+            "sender_name": "其他群友",
+            "message_id": "msg_other_room",
+            "text": "晚上吃什么",
+            "self_message": False,
+            "is_room": True,
+            "room": {"id": "@@other_room", "topic": "其他闲聊群"},
+            "payload": {"roomId": "@@other_room", "talkerId": "@other_member"},
+        }
+    )
+
+    assert message is None
+    assert audit["observe_only_room"] is False
+    assert audit["reason"] == "non_self_message_in_self_only_scope"
+
+
 def test_build_wechaty_user_message_sanitizes_quoted_message_metadata(monkeypatch) -> None:
     monkeypatch.setenv("MAHJONG_WECHATY_ROUTE_SCOPE", "all")
     message, audit = app.build_wechaty_user_message(

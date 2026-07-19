@@ -998,6 +998,58 @@ def configured_wechaty_whitelist() -> set[str]:
     return values
 
 
+def configured_wechaty_observe_only_rooms() -> dict[str, set[str]]:
+    """Load room identities that may be analyzed but must never enter execution.
+
+    Room IDs are exact identifiers. Topic keywords intentionally support substring
+    matching because WeChat group owners often append store names or notices to a
+    stable business name. The local file stays outside source control.
+    """
+
+    room_ids = set(split_env_list(os.getenv("MAHJONG_WECHATY_OBSERVE_ONLY_ROOM_IDS", "")))
+    topic_keywords = set(split_env_list(os.getenv("MAHJONG_WECHATY_OBSERVE_ONLY_ROOM_TOPICS", "")))
+    path = Path(
+        os.getenv("MAHJONG_WECHATY_OBSERVE_ONLY_ROOMS_PATH")
+        or ROOT / "data" / "wechaty_observe_only_rooms.local.json"
+    )
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                room_ids.update(str(item).strip() for item in payload.get("room_ids", []) if str(item).strip())
+                topic_keywords.update(
+                    str(item).strip() for item in payload.get("topic_keywords", []) if str(item).strip()
+                )
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    return {"room_ids": room_ids, "topic_keywords": topic_keywords}
+
+
+def wechaty_observe_only_room_hits(payload: dict) -> list[str]:
+    """Return the configured IDs/topics matching one incoming group message."""
+
+    if not bool(payload.get("is_room")):
+        return []
+    room = payload.get("room") if isinstance(payload.get("room"), dict) else {}
+    raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    room_id = str(
+        room.get("id")
+        or _wechaty_nested_text(room, "payload", "id")
+        or raw_payload.get("roomId")
+        or ""
+    ).strip()
+    topic = str(room.get("topic") or _wechaty_nested_text(room, "payload", "topic") or "").strip()
+    configured = configured_wechaty_observe_only_rooms()
+    hits: list[str] = []
+    if room_id and room_id in configured["room_ids"]:
+        hits.append(room_id)
+    topic_folded = topic.casefold()
+    for keyword in sorted(configured["topic_keywords"]):
+        if keyword and keyword.casefold() in topic_folded:
+            hits.append(keyword)
+    return hits
+
+
 def build_wechaty_input_gate_client() -> OpenAICompatibleAgentClient | None:
     model = os.getenv("MAHJONG_WECHATY_INPUT_GATE_LLM_MODEL")
     if not model:
@@ -1589,6 +1641,8 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         route_scope = "self_only"
     whitelist_hits = wechaty_agent_whitelist_hits(payload)
     whitelisted = bool(whitelist_hits)
+    observe_only_room_hits = wechaty_observe_only_room_hits(payload)
+    observe_only_room = bool(observe_only_room_hits)
     audit = {
         "channel": "wechaty",
         "routed_to_agent": False,
@@ -1607,6 +1661,8 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         "route_scope": route_scope,
         "agent_whitelisted": whitelisted,
         "agent_whitelist_hits": whitelist_hits,
+        "observe_only_room": observe_only_room,
+        "observe_only_room_hits": observe_only_room_hits,
     }
     if not env_bool("MAHJONG_WECHATY_AUTO_ROUTE_TO_AGENT", True):
         audit["reason"] = "auto_route_disabled"
@@ -1615,7 +1671,7 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         audit["reason"] = "non_text_without_transcript_or_ocr" if message_metadata.get("modalities") else "empty_text"
         audit["metadata"] = message_metadata
         return None, audit
-    if route_scope == "self_only" and not self_message and not whitelisted:
+    if route_scope == "self_only" and not self_message and not whitelisted and not observe_only_room:
         audit["reason"] = "non_self_message_in_self_only_scope"
         return None, audit
     if route_scope == "incoming_only" and self_message:
@@ -1658,6 +1714,13 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         quoted_message=parse_quoted_message_ref(payload) or display_quoted_message,
         metadata=message_metadata,
     )
+    if observe_only_room:
+        message.metadata.update(
+            {
+                "observe_only_room": True,
+                "observe_only_room_hits": observe_only_room_hits,
+            }
+        )
     audit.update(
         {
             "routed_to_agent": True,
@@ -1930,6 +1993,32 @@ def route_wechaty_raw_to_agent(payload: dict, *, trace_id: str) -> dict:
         trace_recorder.record(trace_id, "wechaty_raw_message_not_routed", audit)
         return {"routed_to_agent": False, "audit": audit, "agent_result": None}
     runtime = get_runtime()
+    if bool(audit.get("observe_only_room")):
+        decision = run_wechaty_input_gate(message, trace_id=trace_id, runtime=runtime)
+        observation = {
+            "mode": "observe_only",
+            "room_matches": list(audit.get("observe_only_room_hits") or []),
+            "message": message.to_dict(),
+            "semantic_decision": decision,
+            "business_message_detected": str(decision.get("action") or "") == "process_business",
+            "state_mutation_allowed": False,
+            "outbound_allowed": False,
+        }
+        audit.update(
+            {
+                "routed_to_agent": False,
+                "reason": "observe_only_room_analyzed",
+                "input_gate": decision,
+            }
+        )
+        runtime.trace_recorder.record(trace_id, "wechaty_observe_only_message_analyzed", observation)
+        return {
+            "routed_to_agent": False,
+            "observe_only": True,
+            "audit": audit,
+            "observation": observation,
+            "agent_result": None,
+        }
     if input_aggregation_enabled("wechaty"):
         return route_user_message_with_aggregation(
             runtime,
@@ -2733,6 +2822,11 @@ def runtime_config(runtime: AgentRuntime) -> dict:
         else None,
         "wechaty_route_scope": os.getenv("MAHJONG_WECHATY_ROUTE_SCOPE", "self_only"),
         "wechaty_agent_whitelist_count": len(configured_wechaty_whitelist()),
+        "wechaty_observe_only_rooms": {
+            "room_id_count": len(configured_wechaty_observe_only_rooms()["room_ids"]),
+            "topic_keyword_count": len(configured_wechaty_observe_only_rooms()["topic_keywords"]),
+            "execution_policy": "semantic_analysis_and_trace_only",
+        },
         "wechaty_input_gate_enabled": env_bool("MAHJONG_WECHATY_INPUT_GATE_ENABLED", True),
         "wechaty_input_gate_model": os.getenv("MAHJONG_WECHATY_INPUT_GATE_LLM_MODEL")
         or getattr(getattr(runtime.llm_client, "config", None), "model", None),
