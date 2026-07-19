@@ -470,7 +470,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         "properties": {
             "customer_id": non_empty_string,
             "display_name": non_empty_string,
-            "status": {"type": "string"},
+            "status": {"type": "string", "enum": ["joined", "confirmed"]},
             "source": {"type": "string"},
             "seat_count": {"type": "integer", "minimum": 1, "maximum": 4},
             "known_member_ids": {"type": "array", "items": {"type": "string"}},
@@ -603,8 +603,26 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
                 **availability,
                 "instruction": (
                     "Only state that a room is available when configured=true and available_count>0. "
-                    "This read does not reserve or promise a room."
+                    "This read does not reserve or promise a room. When configured=false, availability is unknown: "
+                    "a forming game may still be created with room confirmation pending, but room availability must not be promised."
                 ),
+                "next_step_policy": {
+                    "query_completed": True,
+                    "repeat_same_query": False,
+                    "may_create_forming_game_with_room_pending": not availability["configured"],
+                    "may_state_room_available": bool(
+                        availability["configured"] and availability["available_count"] > 0
+                    ),
+                    "must_report_unavailable": bool(
+                        availability["configured"] and availability["available_count"] <= 0
+                    ),
+                    "instruction": (
+                        "Do not repeat check_room_availability with the same interval. Mark the room-check plan step done. "
+                        "If inventory is unconfigured, continue the requested business flow with room confirmation "
+                        "pending and do not claim that a room exists. If configured and available_count is zero, do not "
+                        "create or promise a fixed-time game for this interval; offer another time."
+                    ),
+                },
             },
         )
 
@@ -654,11 +672,23 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             known_players=known_players,
             trace_id=trace_id,
         )
+        scheduled_task = store.scheduled_task_for_game(game.game_id)
         return ToolResult(
             name=call.name,
             called=True,
             allowed=True,
-            result={"game": game_for_model_context(game, store.customers)},
+            result={
+                "game": game_for_model_context(game, store.customers),
+                "recruitment_policy": {
+                    "status": game.recruitment_status.value,
+                    "opens_at": game.recruitment_opens_at.isoformat() if game.recruitment_opens_at else None,
+                    "scheduled_task": scheduled_task.to_dict() if scheduled_task else None,
+                    "instruction": (
+                        "When status=scheduled, keep the game visible but do not search private candidates or create "
+                        "invite drafts. A durable system task will re-enter the main Agent when the window opens."
+                    ),
+                },
+            },
             state_transitions=[transition],
         )
 
@@ -888,7 +918,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         ),
         "create_game": ToolDefinition(
             "create_game",
-            "创建待组局记录。只落库，不发消息、不确认房间。模型必须显式提供 organizer_id 和 organizer_name，后端不从当前消息脑补组织者。",
+            "创建待组局记录。只落库，不发消息、不确认房间。固定时间且距离开局超过招募提前量时，后端会持久化定时任务；局立即进入列表，但暂不私聊候选人。模型必须显式提供 organizer_id 和 organizer_name，后端不从当前消息脑补组织者。",
             "medium",
             "state_write",
             {
@@ -907,7 +937,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
         ),
         "create_invite_drafts": ToolDefinition(
             "create_invite_drafts",
-            "创建待审批邀约草稿。只生成草稿，不代表已发送。",
+            "创建待审批邀约草稿。只生成草稿，不代表已发送。未来局在 recruitment_opens_at 之前会被统一时间策略拒绝；不要通过改写话术绕过。",
             "medium",
             "draft_write",
             {

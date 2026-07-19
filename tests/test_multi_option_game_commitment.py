@@ -282,7 +282,10 @@ def test_sqlite_concurrent_final_confirmations_choose_exactly_one_overlapping_wi
 
 def test_tool_result_reports_cross_game_commitment_back_to_agent() -> None:
     store = InMemoryAgentStore()
-    start = now() + timedelta(days=1)
+    # This case exercises commitment projection, so keep it inside the private
+    # recruitment window. Future reservations are covered separately and must
+    # not create private invite drafts before T-2h.
+    start = now() + timedelta(hours=1)
     losing = _create_two_person_option(
         store,
         conversation_id="conversation_a",

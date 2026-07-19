@@ -55,6 +55,48 @@ def normalize_action_contract(payload: dict[str, Any]) -> tuple[dict[str, Any], 
 
     normalized = dict(payload)
     repairs: list[dict[str, Any]] = []
+    raw_plan = normalized.get("objective_plan")
+    if isinstance(raw_plan, list):
+        normalized_plan: list[Any] = []
+        for index, raw_step in enumerate(raw_plan, start=1):
+            if not isinstance(raw_step, dict):
+                normalized_plan.append(raw_step)
+                continue
+            step = dict(raw_step)
+            step_id = step.get("step_id")
+            if not isinstance(step_id, str) or not step_id.strip():
+                step["step_id"] = str(index)
+                repairs.append(
+                    {
+                        "field": f"objective_plan[{index}].step_id",
+                        "from": step_id,
+                        "to": str(index),
+                        "reason": "plan step identifiers are structural metadata and can be assigned deterministically",
+                    }
+                )
+            depends_on = step.get("depends_on")
+            if depends_on is None:
+                step["depends_on"] = []
+                repairs.append(
+                    {
+                        "field": f"objective_plan[{index}].depends_on",
+                        "from": None,
+                        "to": [],
+                        "reason": "an absent plan dependency is structurally equivalent to an empty dependency list",
+                    }
+                )
+            elif isinstance(depends_on, str):
+                step["depends_on"] = [depends_on] if depends_on.strip() else []
+                repairs.append(
+                    {
+                        "field": f"objective_plan[{index}].depends_on",
+                        "from": depends_on,
+                        "to": list(step["depends_on"]),
+                        "reason": "a single dependency identifier can be wrapped as the required array without changing meaning",
+                    }
+                )
+            normalized_plan.append(step)
+        normalized["objective_plan"] = normalized_plan
     stop_reason = normalized.get("stop_reason")
     tool_calls = normalized.get("tool_calls")
     reply = normalized.get("reply_to_user")

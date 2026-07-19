@@ -32,7 +32,10 @@ from .models import (
     PendingInputBatch,
     PendingInputBatchStatus,
     PendingMemoryCandidate,
+    RecruitmentStatus,
     RoomReservation,
+    ScheduledAgentTask,
+    ScheduledTaskStatus,
     StateTransition,
     TaskMemory,
     ToolCall,
@@ -59,6 +62,7 @@ from .store import (
     pending_input_batch_key,
     parse_datetime_value,
     PENDING_INPUT_PROCESSING_LEASE_SECONDS,
+    SCHEDULED_TASK_PROCESSING_LEASE_SECONDS,
     PROTECTED_REQUIREMENT_PATCH_FIELDS,
     IDEMPOTENCY_CLAIM_LEASE_SECONDS,
     tool_result_is_in_progress,
@@ -70,11 +74,16 @@ from .store import (
     game_for_model_context,
     seat_count_from_payload,
     apply_game_lifecycle,
+    apply_game_recruitment_policy,
     expire_game_if_stale,
     resolve_full_game_commitments,
     active_game_participant_ids,
     customer_option_load,
     ready_commitment_conflicts,
+    requirement_overlaps_game,
+    game_recruitment_task_id,
+    game_schedule_sort_key,
+    GAME_RECRUITMENT_TASK_TYPE,
 )
 
 
@@ -93,6 +102,7 @@ class SQLiteAgentStore:
         with self._lock:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
+            self._connection.execute("PRAGMA busy_timeout=5000")
             self._migrate()
 
     @contextmanager
@@ -209,6 +219,15 @@ class SQLiteAgentStore:
             rows = self._connection.execute("SELECT batch_key, payload FROM runtime_pending_input_batches").fetchall()
             return {
                 str(row["batch_key"]): _pending_input_batch_from_payload(_loads(row["payload"]))
+                for row in rows
+            }
+
+    @property
+    def scheduled_tasks(self) -> dict[str, ScheduledAgentTask]:
+        with self._lock:
+            rows = self._connection.execute("SELECT task_id, payload FROM runtime_scheduled_agent_tasks").fetchall()
+            return {
+                str(row["task_id"]): _scheduled_agent_task_from_payload(_loads(row["payload"]))
                 for row in rows
             }
 
@@ -947,9 +966,292 @@ class SQLiteAgentStore:
             for item in self.games.values()
             if item.status.value in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}
         ]
+        for game in games:
+            apply_game_recruitment_policy(game)
         if conversation_id:
-            return [item for item in games if item.conversation_id == conversation_id]
-        return games
+            games = [item for item in games if item.conversation_id == conversation_id]
+        return sorted(games, key=game_schedule_sort_key)
+
+    def scheduled_task_for_game(self, game_id: str) -> ScheduledAgentTask | None:
+        task_id = game_recruitment_task_id(game_id)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_scheduled_agent_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return _scheduled_agent_task_from_payload(_loads(row["payload"])) if row else None
+
+    def ensure_game_recruitment_task(
+        self,
+        game_id: str,
+        *,
+        trace_id: str,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_games WHERE game_id = ?",
+                (game_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"game not found: {game_id}")
+            game = _game_from_payload(_loads(row["payload"]))
+            task, transition = self._sync_game_recruitment_task_in_transaction(game, trace_id=trace_id)
+            self._save_game(game)
+            if transition is not None:
+                self._append_transition(transition)
+            return task, transition
+
+    def _sync_game_recruitment_task_in_transaction(
+        self,
+        game: Game,
+        *,
+        trace_id: str,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        apply_game_recruitment_policy(game)
+        task_id = game_recruitment_task_id(game.game_id)
+        row = self._connection.execute(
+            "SELECT payload FROM runtime_scheduled_agent_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        existing = _scheduled_agent_task_from_payload(_loads(row["payload"])) if row else None
+        if game.recruitment_status != RecruitmentStatus.SCHEDULED or game.recruitment_opens_at is None:
+            if existing is None or existing.status in {
+                ScheduledTaskStatus.COMPLETED,
+                ScheduledTaskStatus.CANCELLED,
+                ScheduledTaskStatus.FAILED,
+            }:
+                return existing, None
+            old = existing.status.value
+            existing.status = ScheduledTaskStatus.CANCELLED
+            existing.completed_at = now()
+            existing.lease_until = None
+            existing.updated_at = now()
+            self._save_scheduled_agent_task(existing)
+            return existing, StateTransition(
+                "scheduled_agent_task",
+                existing.task_id,
+                old,
+                existing.status.value,
+                "recruitment_no_longer_scheduled",
+                trace_id,
+            )
+
+        payload = {
+            "event_type": "game_recruitment_window_opened",
+            "game_id": game.game_id,
+            "planned_start_at": game.planned_start_at.isoformat() if game.planned_start_at else None,
+            "recruitment_opens_at": game.recruitment_opens_at.isoformat(),
+        }
+        idempotency_key = f"{GAME_RECRUITMENT_TASK_TYPE}:{game.game_id}:{game.recruitment_opens_at.isoformat()}"
+        if existing is None:
+            task = ScheduledAgentTask(
+                task_id=task_id,
+                task_type=GAME_RECRUITMENT_TASK_TYPE,
+                aggregate_type="game",
+                aggregate_id=game.game_id,
+                conversation_id=game.conversation_id,
+                subject_id=game.organizer_id,
+                subject_name=game.organizer_name,
+                due_at=game.recruitment_opens_at,
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+            self._save_scheduled_agent_task(task)
+            return task, StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                None,
+                task.status.value,
+                "future_game_created",
+                trace_id,
+            )
+
+        old = existing.status.value
+        existing.due_at = game.recruitment_opens_at
+        existing.idempotency_key = idempotency_key
+        existing.payload = payload
+        existing.status = ScheduledTaskStatus.PENDING
+        existing.lease_until = None
+        existing.completed_at = None
+        existing.last_error = ""
+        existing.updated_at = now()
+        self._save_scheduled_agent_task(existing)
+        return existing, StateTransition(
+            "scheduled_agent_task",
+            existing.task_id,
+            old,
+            existing.status.value,
+            "future_game_schedule_updated",
+            trace_id,
+        )
+
+    def due_scheduled_tasks(self, *, at: datetime, limit: int = 100) -> list[ScheduledAgentTask]:
+        at = at if at.tzinfo is not None else at.replace(tzinfo=DEFAULT_TZ)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload FROM runtime_scheduled_agent_tasks
+                WHERE (status = ? AND due_at <= ?)
+                   OR (status = ? AND lease_until IS NOT NULL AND lease_until <= ?)
+                ORDER BY due_at, task_id
+                LIMIT ?
+                """,
+                (
+                    ScheduledTaskStatus.PENDING.value,
+                    at.isoformat(),
+                    ScheduledTaskStatus.PROCESSING.value,
+                    at.isoformat(),
+                    int(limit),
+                ),
+            ).fetchall()
+            return [_scheduled_agent_task_from_payload(_loads(row["payload"])) for row in rows]
+
+    def open_game_recruitment(
+        self,
+        game_id: str,
+        *,
+        trace_id: str,
+        at: datetime | None = None,
+    ) -> tuple[Game, StateTransition | None]:
+        stamp = at or now()
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_games WHERE game_id = ?",
+                (game_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"game not found: {game_id}")
+            game = _game_from_payload(_loads(row["payload"]))
+            old = game.recruitment_status.value
+            apply_game_recruitment_policy(game, at=stamp)
+            if game.recruitment_status == RecruitmentStatus.SCHEDULED:
+                raise ValueError(
+                    "recruitment window is not open: "
+                    f"recruitment_opens_at={game.recruitment_opens_at.isoformat() if game.recruitment_opens_at else None}"
+                )
+            if old == game.recruitment_status.value:
+                self._save_game(game)
+                return game, None
+            game.updated_at = stamp
+            self._save_game(game)
+            transition = StateTransition(
+                "game_recruitment",
+                game.game_id,
+                old,
+                game.recruitment_status.value,
+                "scheduled_recruitment_window_opened",
+                trace_id,
+            )
+            self._append_transition(transition)
+            return game, transition
+
+    def claim_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        at: datetime,
+        lease_seconds: int = SCHEDULED_TASK_PROCESSING_LEASE_SECONDS,
+    ) -> ScheduledAgentTask | None:
+        at = at if at.tzinfo is not None else at.replace(tzinfo=DEFAULT_TZ)
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_scheduled_agent_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            task = _scheduled_agent_task_from_payload(_loads(row["payload"]))
+            if task.due_at > at:
+                return None
+            recoverable = (
+                task.status == ScheduledTaskStatus.PROCESSING
+                and task.lease_until is not None
+                and task.lease_until <= at
+            )
+            if task.status != ScheduledTaskStatus.PENDING and not recoverable:
+                return None
+            task.status = ScheduledTaskStatus.PROCESSING
+            task.attempts += 1
+            task.lease_until = at + timedelta(seconds=max(1, int(lease_seconds)))
+            task.updated_at = at
+            self._save_scheduled_agent_task(task)
+            return task
+
+    def complete_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        trace_id: str,
+        at: datetime | None = None,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        stamp = at or now()
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_scheduled_agent_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None, None
+            task = _scheduled_agent_task_from_payload(_loads(row["payload"]))
+            if task.status == ScheduledTaskStatus.COMPLETED:
+                return task, None
+            old = task.status.value
+            task.status = ScheduledTaskStatus.COMPLETED
+            task.completed_at = stamp
+            task.lease_until = None
+            task.updated_at = stamp
+            self._save_scheduled_agent_task(task)
+            transition = StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                old,
+                task.status.value,
+                "scheduled_agent_task_completed",
+                trace_id,
+            )
+            self._append_transition(transition)
+            return task, transition
+
+    def fail_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        trace_id: str,
+        error: str,
+        max_attempts: int = 3,
+        retry_delay_seconds: int = 60,
+        at: datetime | None = None,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        stamp = at or now()
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_scheduled_agent_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None, None
+            task = _scheduled_agent_task_from_payload(_loads(row["payload"]))
+            old = task.status.value
+            task.last_error = str(error or "scheduled agent task failed")
+            task.lease_until = None
+            if task.attempts >= max(1, int(max_attempts)):
+                task.status = ScheduledTaskStatus.FAILED
+                task.completed_at = stamp
+            else:
+                task.status = ScheduledTaskStatus.PENDING
+                task.due_at = stamp + timedelta(seconds=max(1, int(retry_delay_seconds)))
+            task.updated_at = stamp
+            self._save_scheduled_agent_task(task)
+            transition = StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                old,
+                task.status.value,
+                "scheduled_agent_task_failed",
+                trace_id,
+            )
+            self._append_transition(transition)
+            return task, transition
 
     def idempotent_result(self, key: str | None) -> ToolResult | None:
         if not key:
@@ -1386,6 +1688,7 @@ class SQLiteAgentStore:
             ("task_memories", "runtime_task_memories"),
             ("pending_memory_candidates", "runtime_pending_memory_candidates"),
             ("pending_input_batches", "runtime_pending_input_batches"),
+            ("scheduled_tasks", "runtime_scheduled_agent_tasks"),
         ]
         if include_customers:
             tables.append(("customers", "runtime_customers"))
@@ -1513,6 +1816,7 @@ class SQLiteAgentStore:
         with self._write_transaction():
             from .models import new_id
 
+            normalized_requirement = normalize_requirement(requirement)
             duplicate = next(
                 (
                     item
@@ -1520,12 +1824,12 @@ class SQLiteAgentStore:
                     if item.conversation_id == conversation_id
                     and item.organizer_id == organizer_id
                     and item.status in {GameStatus.FORMING, GameStatus.INVITING, GameStatus.READY}
+                    and requirement_overlaps_game(normalized_requirement, item)
                 ),
                 None,
             )
             if duplicate is not None:
                 raise ValueError(f"active game already exists: {duplicate.game_id}")
-            normalized_requirement = normalize_requirement(requirement)
             default_requester_seat_count = seat_count_from_payload(normalized_requirement, default=1)
             participants = normalize_game_participants(
                 organizer_id=organizer_id,
@@ -1565,6 +1869,10 @@ class SQLiteAgentStore:
             transition = StateTransition("game", game.game_id, None, game.status.value, "create_game", trace_id)
             self._save_game(game)
             self._append_transition(transition)
+            _, recruitment_transition = self._sync_game_recruitment_task_in_transaction(game, trace_id=trace_id)
+            self._save_game(game)
+            if recruitment_transition is not None:
+                self._append_transition(recruitment_transition)
             return game, transition
 
     def _expire_stale_games(self, *, trace_id: str) -> list[StateTransition]:
@@ -1578,6 +1886,14 @@ class SQLiteAgentStore:
                 transitions.append(transition)
                 self._save_game(game)
                 self._append_transition(transition)
+                _, recruitment_transition = self._sync_game_recruitment_task_in_transaction(
+                    game,
+                    trace_id=trace_id,
+                )
+                self._save_game(game)
+                if recruitment_transition is not None:
+                    transitions.append(recruitment_transition)
+                    self._append_transition(recruitment_transition)
                 released = self._release_room_reservations_for_game(
                     game.game_id,
                     trace_id=trace_id,
@@ -1609,6 +1925,9 @@ class SQLiteAgentStore:
                 "lifecycle_expires_at",
                 "lifecycle_ttl_hours",
                 "latest_start_at",
+                "recruitment_opens_at",
+                "recruitment_status",
+                "recruitment_lead_hours",
             }
             base_requirement = {
                 key: value for key, value in game.requirement.items() if key not in lifecycle_fields
@@ -1633,6 +1952,8 @@ class SQLiteAgentStore:
             game.planned_start_at = prospective.planned_start_at
             game.planned_end_at = prospective.planned_end_at
             game.expires_at = prospective.expires_at
+            game.recruitment_opens_at = prospective.recruitment_opens_at
+            game.recruitment_status = prospective.recruitment_status
             game.updated_at = datetime.now(DEFAULT_TZ)
             transition = StateTransition(
                 "game_requirement",
@@ -1644,6 +1965,10 @@ class SQLiteAgentStore:
             )
             self._save_game(game)
             self._append_transition(transition)
+            _, recruitment_transition = self._sync_game_recruitment_task_in_transaction(game, trace_id=trace_id)
+            self._save_game(game)
+            if recruitment_transition is not None:
+                self._append_transition(recruitment_transition)
             return game, transition
 
     def _release_room_reservations_for_game(
@@ -1710,6 +2035,13 @@ class SQLiteAgentStore:
             game = self.require_game(game_id)
             if game.status not in {GameStatus.FORMING, GameStatus.INVITING}:
                 raise ValueError(f"game does not accept invitations in status={game.status.value}: {game_id}")
+            apply_game_recruitment_policy(game)
+            if game.recruitment_status == RecruitmentStatus.SCHEDULED:
+                opens_at = game.recruitment_opens_at.isoformat() if game.recruitment_opens_at else "unknown"
+                raise ValueError(
+                    "private candidate outreach is not open yet: "
+                    f"recruitment_opens_at={opens_at}; keep the future game listed and wait for the scheduled task"
+                )
             requested_customer_ids = [
                 str(item.get("customer_id") or "").strip()
                 for item in invitations
@@ -1733,7 +2065,21 @@ class SQLiteAgentStore:
                 game.status = GameStatus.INVITING
                 game.updated_at = now()
                 transitions.append(StateTransition("game", game.game_id, old, game.status.value, "create_invite_drafts", trace_id))
-                self._save_game(game)
+            if game.recruitment_status != RecruitmentStatus.ACTIVE:
+                old_recruitment = game.recruitment_status.value
+                game.recruitment_status = RecruitmentStatus.ACTIVE
+                game.updated_at = now()
+                transitions.append(
+                    StateTransition(
+                        "game_recruitment",
+                        game.game_id,
+                        old_recruitment,
+                        game.recruitment_status.value,
+                        "create_invite_drafts",
+                        trace_id,
+                    )
+                )
+            self._save_game(game)
             drafts: list[InviteDraft] = []
             for raw in invitations:
                 if not isinstance(raw, dict):
@@ -1986,6 +2332,7 @@ class SQLiteAgentStore:
             game.status = target
             if target in {GameStatus.CANCELLED, GameStatus.FINISHED}:
                 game.closed_reason = reason or target.value
+            apply_game_recruitment_policy(game)
             game.updated_at = datetime.now(DEFAULT_TZ)
             transition = StateTransition("game", game.game_id, old, target.value, reason or "update_game_status", trace_id)
             self._save_game(game)
@@ -1996,6 +2343,13 @@ class SQLiteAgentStore:
                     trace_id=trace_id,
                     reason="game_status_closed",
                 )
+                _, recruitment_transition = self._sync_game_recruitment_task_in_transaction(
+                    game,
+                    trace_id=trace_id,
+                )
+                self._save_game(game)
+                if recruitment_transition is not None:
+                    self._append_transition(recruitment_transition)
             return game, transition
 
     def record_badcase(self, payload: dict[str, Any], *, trace_id: str, conversation_id: str) -> dict[str, Any]:
@@ -2031,6 +2385,38 @@ class SQLiteAgentStore:
                 updated_at=excluded.updated_at
             """,
             (game.game_id, game.conversation_id, game.status.value, _dumps(game.to_dict()), game.updated_at.isoformat()),
+        )
+
+    def _save_scheduled_agent_task(self, task: ScheduledAgentTask) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO runtime_scheduled_agent_tasks(
+                task_id, task_type, aggregate_id, conversation_id, status,
+                due_at, lease_until, idempotency_key, payload, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                task_type=excluded.task_type,
+                aggregate_id=excluded.aggregate_id,
+                conversation_id=excluded.conversation_id,
+                status=excluded.status,
+                due_at=excluded.due_at,
+                lease_until=excluded.lease_until,
+                idempotency_key=excluded.idempotency_key,
+                payload=excluded.payload,
+                updated_at=excluded.updated_at
+            """,
+            (
+                task.task_id,
+                task.task_type,
+                task.aggregate_id,
+                task.conversation_id,
+                task.status.value,
+                task.due_at.isoformat(),
+                task.lease_until.isoformat() if task.lease_until else None,
+                task.idempotency_key,
+                _dumps(task.to_dict()),
+                task.updated_at.isoformat(),
+            ),
         )
 
     def _save_invite(self, draft: InviteDraft) -> None:
@@ -2380,6 +2766,18 @@ class SQLiteAgentStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS runtime_scheduled_agent_tasks(
+                task_id TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                lease_until TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS runtime_badcases(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 badcase_id TEXT NOT NULL,
@@ -2405,6 +2803,8 @@ class SQLiteAgentStore:
             CREATE INDEX IF NOT EXISTS idx_runtime_pending_memory_candidates_customer ON runtime_pending_memory_candidates(customer_id, target_customer_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_pending_input_due ON runtime_pending_input_batches(status, quiet_deadline);
             CREATE INDEX IF NOT EXISTS idx_runtime_pending_input_conversation ON runtime_pending_input_batches(conversation_id, sender_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_scheduled_agent_due ON runtime_scheduled_agent_tasks(status, due_at, lease_until);
+            CREATE INDEX IF NOT EXISTS idx_runtime_scheduled_agent_aggregate ON runtime_scheduled_agent_tasks(task_type, aggregate_id);
             """
         )
         self._connection.commit()
@@ -2515,6 +2915,28 @@ def _pending_input_batch_from_payload(payload: dict[str, Any]) -> PendingInputBa
     )
 
 
+def _scheduled_agent_task_from_payload(payload: dict[str, Any]) -> ScheduledAgentTask:
+    return ScheduledAgentTask(
+        task_id=str(payload.get("task_id") or ""),
+        task_type=str(payload.get("task_type") or ""),
+        aggregate_type=str(payload.get("aggregate_type") or ""),
+        aggregate_id=str(payload.get("aggregate_id") or ""),
+        conversation_id=str(payload.get("conversation_id") or ""),
+        subject_id=str(payload.get("subject_id") or ""),
+        subject_name=str(payload.get("subject_name") or ""),
+        due_at=_datetime_from_payload(payload.get("due_at")),
+        idempotency_key=str(payload.get("idempotency_key") or ""),
+        payload=dict(payload.get("payload") or {}) if isinstance(payload.get("payload"), dict) else {},
+        status=ScheduledTaskStatus(str(payload.get("status") or ScheduledTaskStatus.PENDING.value)),
+        attempts=int(payload.get("attempts") or 0),
+        lease_until=_optional_datetime_from_payload(payload.get("lease_until")),
+        last_error=str(payload.get("last_error") or ""),
+        created_at=_datetime_from_payload(payload.get("created_at")),
+        updated_at=_datetime_from_payload(payload.get("updated_at")),
+        completed_at=_optional_datetime_from_payload(payload.get("completed_at")),
+    )
+
+
 def _turn_from_payload(payload: dict[str, Any]) -> ConversationTurn:
     return ConversationTurn(
         role=ConversationRole(str(payload.get("role") or ConversationRole.USER.value)),
@@ -2572,6 +2994,10 @@ def _game_from_payload(payload: dict[str, Any]) -> Game:
         planned_start_at=_optional_datetime_from_payload(payload.get("planned_start_at")),
         planned_end_at=_optional_datetime_from_payload(payload.get("planned_end_at")),
         expires_at=_optional_datetime_from_payload(payload.get("expires_at") or payload.get("lifecycle_expires_at")),
+        recruitment_opens_at=_optional_datetime_from_payload(payload.get("recruitment_opens_at")),
+        recruitment_status=RecruitmentStatus(
+            str(payload.get("recruitment_status") or RecruitmentStatus.OPEN.value)
+        ),
         closed_reason=str(payload.get("closed_reason") or ""),
         created_at=_datetime_from_payload(payload.get("created_at")),
         updated_at=_datetime_from_payload(payload.get("updated_at")),

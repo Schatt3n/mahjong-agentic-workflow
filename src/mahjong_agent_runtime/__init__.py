@@ -30,6 +30,9 @@ from .models import (
     PendingInputBatchStatus,
     PendingMemoryCandidate,
     QuotedMessageRef,
+    RecruitmentStatus,
+    ScheduledAgentTask,
+    ScheduledTaskStatus,
     TaskMemory,
     ToolCall,
     ToolResult,
@@ -38,6 +41,7 @@ from .models import (
 from .processing import ActionProcessor, ToolExecutionService
 from .progress import ProgressDecision, ProgressMonitor, detect_tail_cycle, stable_fingerprint
 from .runtime import AgentRuntime
+from .scheduled_tasks import ScheduledAgentTaskScheduler
 from .runtime_components import ActionProcessingResult, ModelActionStep, ProgressHandlingResult, TurnBudgets
 from .sqlite_store import SQLiteAgentStore
 from .store import InMemoryAgentStore
@@ -87,6 +91,10 @@ __all__ = [
     "ProgressHandlingResult",
     "ProgressMonitor",
     "QuotedMessageRef",
+    "RecruitmentStatus",
+    "ScheduledAgentTask",
+    "ScheduledAgentTaskScheduler",
+    "ScheduledTaskStatus",
     "SQLiteAgentStore",
     "StaticAgentClient",
     "TaskMemory",

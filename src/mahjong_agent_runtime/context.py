@@ -593,6 +593,16 @@ def compact_tool_payload(payload: Any) -> dict[str, Any]:
         "requirement",
         "reference_requirement",
         "customer_reply_contract",
+        # Room availability is a read-tool decision fact. Dropping these
+        # fields makes the next Agent step unable to distinguish an available,
+        # unavailable, or unconfigured inventory result and can cause a loop.
+        "configured",
+        "start_at",
+        "end_at",
+        "room_count",
+        "available_room_ids",
+        "occupied_room_ids",
+        "available_count",
         "recorded_status",
         "next_step_policy",
         "approved",
@@ -804,7 +814,12 @@ def output_contract() -> dict[str, Any]:
         },
         "objective_state_contract": {
             "current_phase": "recommended string: understand_intent | query_existing_games | collect_missing_info | create_game | search_customers | draft_invites | record_feedback | answer_user | wait_user | human_review",
-            "known_facts": "recommended object; facts already safe to use for this objective",
+            "known_facts": (
+                "recommended JSON object mapping stable keys to values; facts already safe to use for this objective. "
+                "Every object member must use key:value syntax, for example "
+                "{\"requested_game\": \"hangzhou_mahjong\", \"known_player_count\": 2}. "
+                "Never write set-like JSON such as {\"fact A\", \"fact B\"}; use an array when no keys are needed."
+            ),
             "missing_facts": "recommended array of strings; facts still needed before state writes or drafts",
             "active_game_id": "optional string|null",
             "blockers": "recommended array of strings",

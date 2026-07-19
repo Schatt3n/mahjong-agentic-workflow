@@ -551,6 +551,78 @@ def test_runtime_context_deduplicates_current_loop_tool_turn() -> None:
     assert built.audit["deduplicated_current_trace_tool_turn_count"] == 1
 
 
+def test_runtime_context_preserves_room_availability_decision_facts() -> None:
+    store = InMemoryAgentStore()
+    result = ToolResult(
+        name="check_room_availability",
+        called=True,
+        allowed=True,
+        result={
+            "configured": False,
+            "start_at": "2026-07-20T13:00:00+08:00",
+            "end_at": "2026-07-20T17:00:00+08:00",
+            "room_count": 0,
+            "available_room_ids": [],
+            "occupied_room_ids": [],
+            "available_count": 0,
+            "next_step_policy": {
+                "query_completed": True,
+                "repeat_same_query": False,
+                "may_create_forming_game_with_room_pending": True,
+            },
+        },
+    )
+
+    built = AgentContextBuilder(store=store, tool_gateway=ToolGateway(store=store)).build(
+        UserMessage(
+            conversation_id="room_availability_context",
+            sender_id="customer_1",
+            sender_name="客户",
+            text="帮我约明天下午一点的局",
+            message_id="msg_room_availability_context",
+        ),
+        trace_id="trace_room_availability_context",
+        previous_tool_results=[result],
+    )
+
+    previous_result = built.payload["previous_tool_results"][0]["result"]
+    assert previous_result["configured"] is False
+    assert previous_result["start_at"] == "2026-07-20T13:00:00+08:00"
+    assert previous_result["end_at"] == "2026-07-20T17:00:00+08:00"
+    assert previous_result["available_count"] == 0
+    assert previous_result["next_step_policy"]["query_completed"] is True
+    assert previous_result["next_step_policy"]["repeat_same_query"] is False
+
+
+def test_action_contract_feedback_explains_valid_json_object_and_array_shapes() -> None:
+    store = InMemoryAgentStore()
+    runtime = AgentRuntime(
+        llm_client=StaticAgentClient([]),
+        store=store,
+        tool_gateway=ToolGateway(store=store),
+        trace_recorder=InMemoryTraceRecorder(),
+    )
+
+    feedback = runtime.action_processor.record_action_contract_feedback(
+        UserMessage(
+            conversation_id="invalid_json_feedback",
+            sender_id="customer_1",
+            sender_name="客户",
+            text="他为什么不和我打？",
+            message_id="msg_invalid_json_feedback",
+        ),
+        trace_id="trace_invalid_json_feedback",
+        raw_response='{"objective_state":{"known_facts":{"fact A","fact B"}}}',
+        errors=["response is not valid JSON: Expecting ':' delimiter"],
+        step_index=1,
+    )[0]
+
+    instruction = feedback.result["instruction"]
+    assert "Regenerate one complete AgentAction JSON object from scratch" in instruction
+    assert "objective_state.known_facts must be an object" in instruction
+    assert "objective_plan[].depends_on" in instruction
+
+
 def test_runtime_context_tool_game_projection_removes_duplicate_party_structures() -> None:
     result = ToolResult(
         name="record_candidate_reply",

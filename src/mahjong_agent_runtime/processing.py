@@ -371,8 +371,12 @@ class ActionProcessor:
                 "errors": list(errors),
                 "raw_response": raw_response,
                 "instruction": (
-                    "Fix the AgentAction JSON contract. If waiting for user, use objective_status=waiting_user "
-                    "with non-empty reply_to_user. If tools are needed, use objective_status=needs_tool with at least one tool_call."
+                    "Regenerate one complete AgentAction JSON object from scratch; do not copy malformed fragments. "
+                    "Every JSON object member must be key:value. objective_state.known_facts must be an object such as "
+                    "{\"fact_name\": \"fact value\"}; never use set-like {\"fact A\", \"fact B\"}. "
+                    "All list fields, including objective_plan[].depends_on, must use arrays. "
+                    "If waiting for user, use objective_status=waiting_user with non-empty reply_to_user. "
+                    "If tools are needed, use objective_status=needs_tool with at least one tool_call."
                 ),
             },
             error="AgentAction contract invalid: " + "; ".join(errors),
@@ -588,6 +592,36 @@ class ActionProcessor:
         proposed_reply = action.reply_to_user.strip()
         if action.needs_human and not proposed_reply:
             proposed_reply = "这个我先转人工确认一下。"
+
+        if bool(message.metadata.get("internal_event")):
+            internal_summary = proposed_reply or "内部定时任务已完成。"
+            self.store.append_assistant_turn(
+                message.conversation_id,
+                internal_summary,
+                trace_id,
+                metadata={
+                    "internal_event": True,
+                    "delivery_mode": "internal_only",
+                    "run_id": run_id,
+                    "run_version": run_version,
+                },
+            )
+            self.trace_recorder.record(
+                trace_id,
+                "final_output",
+                {
+                    "reply": internal_summary,
+                    "delivery_mode": "internal_only",
+                    "run_id": run_id,
+                    "run_version": run_version,
+                },
+            )
+            return ActionProcessingResult(
+                action=action,
+                tool_results=collected_results,
+                final_reply=internal_summary,
+                stop_loop=True,
+            )
 
         review_item = {
             "item_id": "reply_to_user",

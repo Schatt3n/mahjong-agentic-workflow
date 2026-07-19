@@ -29,7 +29,10 @@ from .models import (
     PendingInputBatch,
     PendingInputBatchStatus,
     PendingMemoryCandidate,
+    RecruitmentStatus,
     RoomReservation,
+    ScheduledAgentTask,
+    ScheduledTaskStatus,
     StateTransition,
     TaskMemory,
     ToolResult,
@@ -45,7 +48,10 @@ START_KIND_SCHEDULED = "scheduled"
 START_KIND_ASAP_WHEN_FULL = "asap_" "when_full"
 DURATION_KIND_OVERNIGHT = "overnight"
 PENDING_INPUT_PROCESSING_LEASE_SECONDS = 120
+SCHEDULED_TASK_PROCESSING_LEASE_SECONDS = 120
 IDEMPOTENCY_CLAIM_LEASE_SECONDS = 120
+DEFAULT_RECRUITMENT_LEAD_HOURS = 2
+GAME_RECRUITMENT_TASK_TYPE = "activate_game_recruitment"
 
 ALLOWED_GAME_TRANSITIONS = {
     GameStatus.FORMING.value: {
@@ -86,6 +92,9 @@ PROTECTED_REQUIREMENT_PATCH_FIELDS = {
     "lifecycle_expires_at",
     "lifecycle_ttl_hours",
     "latest_start_at",
+    "recruitment_opens_at",
+    "recruitment_status",
+    "recruitment_lead_hours",
 }
 
 
@@ -389,6 +398,7 @@ class InMemoryAgentStore:
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
     pending_memory_candidates: dict[str, PendingMemoryCandidate] = field(default_factory=dict)
     pending_input_batches: dict[str, PendingInputBatch] = field(default_factory=dict)
+    scheduled_tasks: dict[str, ScheduledAgentTask] = field(default_factory=dict)
     badcases: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -973,9 +983,258 @@ class InMemoryAgentStore:
                 for item in self.games.values()
                 if item.status.value in {GameStatus.FORMING.value, GameStatus.INVITING.value, GameStatus.READY.value}
             ]
+            for game in games:
+                apply_game_recruitment_policy(game)
             if conversation_id:
-                return [item for item in games if item.conversation_id == conversation_id]
-            return games
+                games = [item for item in games if item.conversation_id == conversation_id]
+            return sorted(games, key=game_schedule_sort_key)
+
+    def scheduled_task_for_game(self, game_id: str) -> ScheduledAgentTask | None:
+        """Return the durable recruitment trigger associated with one game."""
+
+        task_id = game_recruitment_task_id(game_id)
+        with self._lock:
+            return self.scheduled_tasks.get(task_id)
+
+    def ensure_game_recruitment_task(
+        self,
+        game_id: str,
+        *,
+        trace_id: str,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        """Synchronize one future recruitment task with the game's current start time."""
+
+        with self._lock:
+            game = self.require_game(game_id)
+            return self._sync_game_recruitment_task_locked(game, trace_id=trace_id)
+
+    def _sync_game_recruitment_task_locked(
+        self,
+        game: Game,
+        *,
+        trace_id: str,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        apply_game_recruitment_policy(game)
+        task_id = game_recruitment_task_id(game.game_id)
+        existing = self.scheduled_tasks.get(task_id)
+        if game.recruitment_status != RecruitmentStatus.SCHEDULED or game.recruitment_opens_at is None:
+            if existing is None or existing.status in {
+                ScheduledTaskStatus.COMPLETED,
+                ScheduledTaskStatus.CANCELLED,
+                ScheduledTaskStatus.FAILED,
+            }:
+                return existing, None
+            old = existing.status.value
+            existing.status = ScheduledTaskStatus.CANCELLED
+            existing.completed_at = now()
+            existing.lease_until = None
+            existing.updated_at = now()
+            transition = StateTransition(
+                "scheduled_agent_task",
+                existing.task_id,
+                old,
+                existing.status.value,
+                "recruitment_no_longer_scheduled",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return existing, transition
+
+        payload = {
+            "event_type": "game_recruitment_window_opened",
+            "game_id": game.game_id,
+            "planned_start_at": game.planned_start_at.isoformat() if game.planned_start_at else None,
+            "recruitment_opens_at": game.recruitment_opens_at.isoformat(),
+        }
+        if existing is None:
+            task = ScheduledAgentTask(
+                task_id=task_id,
+                task_type=GAME_RECRUITMENT_TASK_TYPE,
+                aggregate_type="game",
+                aggregate_id=game.game_id,
+                conversation_id=game.conversation_id,
+                subject_id=game.organizer_id,
+                subject_name=game.organizer_name,
+                due_at=game.recruitment_opens_at,
+                idempotency_key=f"{GAME_RECRUITMENT_TASK_TYPE}:{game.game_id}:{game.recruitment_opens_at.isoformat()}",
+                payload=payload,
+            )
+            self.scheduled_tasks[task.task_id] = task
+            transition = StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                None,
+                task.status.value,
+                "future_game_created",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return task, transition
+
+        old = existing.status.value
+        existing.due_at = game.recruitment_opens_at
+        existing.idempotency_key = (
+            f"{GAME_RECRUITMENT_TASK_TYPE}:{game.game_id}:{game.recruitment_opens_at.isoformat()}"
+        )
+        existing.payload = payload
+        existing.status = ScheduledTaskStatus.PENDING
+        existing.lease_until = None
+        existing.completed_at = None
+        existing.last_error = ""
+        existing.updated_at = now()
+        transition = StateTransition(
+            "scheduled_agent_task",
+            existing.task_id,
+            old,
+            existing.status.value,
+            "future_game_schedule_updated",
+            trace_id,
+        )
+        self.transitions.append(transition)
+        return existing, transition
+
+    def due_scheduled_tasks(self, *, at: datetime, limit: int = 100) -> list[ScheduledAgentTask]:
+        """List due work; an expired processing lease is eligible for recovery."""
+
+        at = normalize_datetime(at)
+        with self._lock:
+            due = [
+                item
+                for item in self.scheduled_tasks.values()
+                if (
+                    item.status == ScheduledTaskStatus.PENDING and item.due_at <= at
+                )
+                or (
+                    item.status == ScheduledTaskStatus.PROCESSING
+                    and item.lease_until is not None
+                    and item.lease_until <= at
+                )
+            ]
+            return sorted(due, key=lambda item: (item.due_at, item.task_id))[: int(limit)]
+
+    def open_game_recruitment(
+        self,
+        game_id: str,
+        *,
+        trace_id: str,
+        at: datetime | None = None,
+    ) -> tuple[Game, StateTransition | None]:
+        """Persist the transition from scheduled visibility to active recruitment."""
+
+        stamp = normalize_datetime(at or now())
+        with self._lock:
+            game = self.require_game(game_id)
+            old = game.recruitment_status.value
+            apply_game_recruitment_policy(game, at=stamp)
+            if game.recruitment_status == RecruitmentStatus.SCHEDULED:
+                raise ValueError(
+                    "recruitment window is not open: "
+                    f"recruitment_opens_at={game.recruitment_opens_at.isoformat() if game.recruitment_opens_at else None}"
+                )
+            if old == game.recruitment_status.value:
+                return game, None
+            game.updated_at = stamp
+            transition = StateTransition(
+                "game_recruitment",
+                game.game_id,
+                old,
+                game.recruitment_status.value,
+                "scheduled_recruitment_window_opened",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return game, transition
+
+    def claim_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        at: datetime,
+        lease_seconds: int = SCHEDULED_TASK_PROCESSING_LEASE_SECONDS,
+    ) -> ScheduledAgentTask | None:
+        """Atomically claim a due task so only one local worker executes it."""
+
+        at = normalize_datetime(at)
+        with self._lock:
+            task = self.scheduled_tasks.get(task_id)
+            if task is None or task.due_at > at:
+                return None
+            recoverable = (
+                task.status == ScheduledTaskStatus.PROCESSING
+                and task.lease_until is not None
+                and task.lease_until <= at
+            )
+            if task.status != ScheduledTaskStatus.PENDING and not recoverable:
+                return None
+            task.status = ScheduledTaskStatus.PROCESSING
+            task.attempts += 1
+            task.lease_until = at + timedelta(seconds=max(1, int(lease_seconds)))
+            task.updated_at = at
+            return task
+
+    def complete_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        trace_id: str,
+        at: datetime | None = None,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        stamp = normalize_datetime(at or now())
+        with self._lock:
+            task = self.scheduled_tasks.get(task_id)
+            if task is None or task.status == ScheduledTaskStatus.COMPLETED:
+                return task, None
+            old = task.status.value
+            task.status = ScheduledTaskStatus.COMPLETED
+            task.completed_at = stamp
+            task.lease_until = None
+            task.updated_at = stamp
+            transition = StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                old,
+                task.status.value,
+                "scheduled_agent_task_completed",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return task, transition
+
+    def fail_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        trace_id: str,
+        error: str,
+        max_attempts: int = 3,
+        retry_delay_seconds: int = 60,
+        at: datetime | None = None,
+    ) -> tuple[ScheduledAgentTask | None, StateTransition | None]:
+        stamp = normalize_datetime(at or now())
+        with self._lock:
+            task = self.scheduled_tasks.get(task_id)
+            if task is None:
+                return None, None
+            old = task.status.value
+            task.last_error = str(error or "scheduled agent task failed")
+            task.lease_until = None
+            if task.attempts >= max(1, int(max_attempts)):
+                task.status = ScheduledTaskStatus.FAILED
+                task.completed_at = stamp
+            else:
+                task.status = ScheduledTaskStatus.PENDING
+                task.due_at = stamp + timedelta(seconds=max(1, int(retry_delay_seconds)))
+            task.updated_at = stamp
+            transition = StateTransition(
+                "scheduled_agent_task",
+                task.task_id,
+                old,
+                task.status.value,
+                "scheduled_agent_task_failed",
+                trace_id,
+            )
+            self.transitions.append(transition)
+            return task, transition
 
     def idempotent_result(self, key: str | None) -> ToolResult | None:
         with self._lock:
@@ -1303,6 +1562,7 @@ class InMemoryAgentStore:
                 "task_memories": len(self.task_memories),
                 "pending_memory_candidates": len(self.pending_memory_candidates),
                 "pending_input_batches": len(self.pending_input_batches),
+                "scheduled_tasks": len(self.scheduled_tasks),
                 "customers": len(self.customers) if include_customers else 0,
                 "customer_relationships": len(self.customer_relationships) if include_customers else 0,
                 "badcases": len(self.badcases) if include_badcases else 0,
@@ -1323,6 +1583,7 @@ class InMemoryAgentStore:
             self.task_memories.clear()
             self.pending_memory_candidates.clear()
             self.pending_input_batches.clear()
+            self.scheduled_tasks.clear()
             if include_customers:
                 self.customers.clear()
                 self.customer_relationships.clear()
@@ -1434,6 +1695,7 @@ class InMemoryAgentStore:
         trace_id: str,
     ) -> tuple[Game, StateTransition]:
         with self._lock:
+            normalized_requirement = normalize_requirement(requirement)
             duplicate = next(
                 (
                     item
@@ -1441,12 +1703,12 @@ class InMemoryAgentStore:
                     if item.conversation_id == conversation_id
                     and item.organizer_id == organizer_id
                     and item.status in {GameStatus.FORMING, GameStatus.INVITING, GameStatus.READY}
+                    and requirement_overlaps_game(normalized_requirement, item)
                 ),
                 None,
             )
             if duplicate is not None:
                 raise ValueError(f"active game already exists: {duplicate.game_id}")
-            normalized_requirement = normalize_requirement(requirement)
             default_requester_seat_count = seat_count_from_payload(normalized_requirement, default=1)
             participants = normalize_game_participants(
                 organizer_id=organizer_id,
@@ -1492,6 +1754,7 @@ class InMemoryAgentStore:
                 trace_id=trace_id,
             )
             self.transitions.append(transition)
+            self._sync_game_recruitment_task_locked(game, trace_id=trace_id)
             return game, transition
 
     def _expire_stale_games_locked(self, *, trace_id: str) -> list[StateTransition]:
@@ -1501,6 +1764,9 @@ class InMemoryAgentStore:
             transition = expire_game_if_stale(game, at=stamp, trace_id=trace_id)
             if transition is not None:
                 transitions.append(transition)
+                _, recruitment_transition = self._sync_game_recruitment_task_locked(game, trace_id=trace_id)
+                if recruitment_transition is not None:
+                    transitions.append(recruitment_transition)
                 transitions.extend(
                     self._release_room_reservations_for_game_locked(
                         game.game_id,
@@ -1509,7 +1775,8 @@ class InMemoryAgentStore:
                     )
                 )
         if transitions:
-            self.transitions.extend(transitions)
+            known_transition_ids = {id(item) for item in self.transitions}
+            self.transitions.extend(item for item in transitions if id(item) not in known_transition_ids)
         return transitions
 
     def update_game_requirement(
@@ -1535,6 +1802,9 @@ class InMemoryAgentStore:
                 "lifecycle_expires_at",
                 "lifecycle_ttl_hours",
                 "latest_start_at",
+                "recruitment_opens_at",
+                "recruitment_status",
+                "recruitment_lead_hours",
             }
             base_requirement = {
                 key: value for key, value in game.requirement.items() if key not in lifecycle_fields
@@ -1559,6 +1829,8 @@ class InMemoryAgentStore:
             game.planned_start_at = prospective.planned_start_at
             game.planned_end_at = prospective.planned_end_at
             game.expires_at = prospective.expires_at
+            game.recruitment_opens_at = prospective.recruitment_opens_at
+            game.recruitment_status = prospective.recruitment_status
             game.updated_at = now()
             transition = StateTransition(
                 "game_requirement",
@@ -1569,6 +1841,7 @@ class InMemoryAgentStore:
                 trace_id,
             )
             self.transitions.append(transition)
+            self._sync_game_recruitment_task_locked(game, trace_id=trace_id)
             return game, transition
 
     def _release_room_reservations_for_game_locked(
@@ -1609,6 +1882,13 @@ class InMemoryAgentStore:
             game = self.require_game(game_id)
             if game.status not in {GameStatus.FORMING, GameStatus.INVITING}:
                 raise ValueError(f"game does not accept invitations in status={game.status.value}: {game_id}")
+            apply_game_recruitment_policy(game)
+            if game.recruitment_status == RecruitmentStatus.SCHEDULED:
+                opens_at = game.recruitment_opens_at.isoformat() if game.recruitment_opens_at else "unknown"
+                raise ValueError(
+                    "private candidate outreach is not open yet: "
+                    f"recruitment_opens_at={opens_at}; keep the future game listed and wait for the scheduled task"
+                )
             requested_customer_ids = [
                 str(item.get("customer_id") or "").strip()
                 for item in invitations
@@ -1633,6 +1913,20 @@ class InMemoryAgentStore:
                 game.updated_at = now()
                 transitions.append(
                     StateTransition("game", game.game_id, old, game.status.value, "create_invite_drafts", trace_id)
+                )
+            if game.recruitment_status != RecruitmentStatus.ACTIVE:
+                old_recruitment = game.recruitment_status.value
+                game.recruitment_status = RecruitmentStatus.ACTIVE
+                game.updated_at = now()
+                transitions.append(
+                    StateTransition(
+                        "game_recruitment",
+                        game.game_id,
+                        old_recruitment,
+                        game.recruitment_status.value,
+                        "create_invite_drafts",
+                        trace_id,
+                    )
                 )
             drafts: list[InviteDraft] = []
             for raw in invitations:
@@ -1872,6 +2166,7 @@ class InMemoryAgentStore:
             game.status = target
             if target in {GameStatus.CANCELLED, GameStatus.FINISHED}:
                 game.closed_reason = reason or target.value
+            apply_game_recruitment_policy(game)
             game.updated_at = now()
             transition = StateTransition("game", game.game_id, old, target.value, reason or "update_game_status", trace_id)
             self.transitions.append(transition)
@@ -1883,6 +2178,7 @@ class InMemoryAgentStore:
                         reason="game_status_closed",
                     )
                 )
+                self._sync_game_recruitment_task_locked(game, trace_id=trace_id)
             return game, transition
 
     def record_badcase(self, payload: dict[str, Any], *, trace_id: str, conversation_id: str) -> dict[str, Any]:
@@ -1998,6 +2294,63 @@ def apply_game_lifecycle(game: Game) -> None:
         **dict(game.requirement),
         **lifecycle["requirement_patch"],
     }
+    apply_game_recruitment_policy(game)
+
+
+def game_recruitment_task_id(game_id: str) -> str:
+    """Use a deterministic task id so schedule updates cannot create duplicates."""
+
+    return f"scheduled_recruitment_{game_id}"
+
+
+def recruitment_open_time(game: Game) -> datetime | None:
+    if game.planned_start_at is None:
+        return None
+    return normalize_datetime(game.planned_start_at) - timedelta(hours=DEFAULT_RECRUITMENT_LEAD_HOURS)
+
+
+def apply_game_recruitment_policy(game: Game, *, at: datetime | None = None) -> None:
+    """Derive the proactive private-outreach boundary from business time.
+
+    This is a temporal invariant, not semantic interpretation: every caller and
+    every model is subject to the same T-2h rule. Public game-list visibility is
+    unaffected; only candidate outreach is delayed.
+    """
+
+    stamp = normalize_datetime(at or now())
+    opens_at = recruitment_open_time(game)
+    game.recruitment_opens_at = opens_at
+    if game.status == GameStatus.CANCELLED:
+        status = RecruitmentStatus.CANCELLED
+    elif game.status == GameStatus.FINISHED or game.status == GameStatus.READY:
+        status = RecruitmentStatus.COMPLETED
+    elif opens_at is not None and stamp < opens_at:
+        status = RecruitmentStatus.SCHEDULED
+    elif game.status == GameStatus.INVITING:
+        status = RecruitmentStatus.ACTIVE
+    else:
+        status = RecruitmentStatus.OPEN
+    game.recruitment_status = status
+    patch = {
+        "recruitment_status": status.value,
+        "recruitment_lead_hours": DEFAULT_RECRUITMENT_LEAD_HOURS,
+    }
+    if opens_at is not None:
+        patch["recruitment_opens_at"] = opens_at.isoformat()
+    else:
+        game.requirement.pop("recruitment_opens_at", None)
+    game.requirement = {**dict(game.requirement), **patch}
+
+
+def game_schedule_sort_key(game: Game) -> tuple[datetime, datetime, str]:
+    """Put fixed-time games first in chronological order, then flexible games."""
+
+    distant_future = datetime.max.replace(tzinfo=DEFAULT_TZ)
+    return (
+        normalize_datetime(game.planned_start_at) if game.planned_start_at else distant_future,
+        normalize_datetime(game.created_at),
+        game.game_id,
+    )
 
 
 def expire_game_if_stale(game: Game, *, at: datetime, trace_id: str) -> StateTransition | None:
@@ -2014,6 +2367,7 @@ def expire_game_if_stale(game: Game, *, at: datetime, trace_id: str) -> StateTra
     else:
         game.status = GameStatus.CANCELLED
         game.closed_reason = "expired_without_full_table"
+    apply_game_recruitment_policy(game, at=at)
     game.updated_at = at
     return StateTransition("game", game.game_id, old, game.status.value, game.closed_reason, trace_id)
 
@@ -2028,6 +2382,7 @@ def derive_game_lifecycle(requirement: dict[str, Any], *, created_at: datetime) 
         "start_at",
         "start_datetime",
         "start_time_at",
+        "start_time",
     )
     if planned_start_at is None and start_kind == START_KIND_SCHEDULED:
         planned_start_at = parse_start_time_on_created_date(requirement.get("start_time"), created_at=created_at)
@@ -2486,7 +2841,7 @@ def normalize_game_participants(
             GameParticipant(
                 customer_id=requester_id,
                 display_name=str(organizer_name or requester_id),
-                status=str(requester_payload.get("status") or "joined"),
+                status=canonical_game_participant_status(requester_payload.get("status")),
                 source="requester",
                 seat_count=requester_seat_count,
                 party_id=party_id_for_contact(requester_id),
@@ -2512,7 +2867,7 @@ def normalize_game_participants(
             GameParticipant(
                 customer_id=customer_id,
                 display_name=str(item.get("display_name") or customer_id),
-                status=str(item.get("status") or "joined"),
+                status=canonical_game_participant_status(item.get("status")),
                 source=str(item.get("source") or "participant"),
                 seat_count=seat_count,
                 party_id=party_id_for_contact(customer_id),
@@ -2526,6 +2881,19 @@ def normalize_game_participants(
         )
         seen.add(customer_id)
     return participants
+
+
+def canonical_game_participant_status(value: Any) -> str:
+    """Keep role labels out of the participant state machine.
+
+    Role labels such as ``organizer`` belong in ``source`` or party metadata;
+    accepting them as participant states would make occupied seats disappear
+    from the aggregate. Other persisted states such as ``declined`` and
+    ``superseded`` must survive SQLite deserialization unchanged.
+    """
+
+    status = str(value or "").strip().lower()
+    return "joined" if not status or status == "organizer" else status
 
 
 def normalize_game_parties(participants: list[GameParticipant]) -> list[Party]:

@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+"""Durable scheduling for future work that re-enters the main Agent.
+
+The scheduler is intentionally domain-light. Persistence decides which tasks are
+due and atomically leases one task; the injected handler decides how a specific
+event should be interpreted. This keeps timers and distributed recovery outside
+the Agent loop while preserving model-driven planning after the wake-up.
+"""
+
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable
+
+from .models import ScheduledAgentTask, now
+
+
+@dataclass(slots=True)
+class ScheduledAgentTaskScheduler:
+    store: Any
+    handler: Callable[[ScheduledAgentTask, str], None]
+    trace_recorder: Any
+    poll_interval_seconds: float = 1.0
+    batch_limit: int = 50
+    max_attempts: int = 3
+    retry_delay_seconds: int = 60
+    _stop_event: threading.Event = field(init=False, repr=False)
+    _thread: threading.Thread | None = field(init=False, default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.poll_interval_seconds = max(0.05, float(self.poll_interval_seconds))
+        self.batch_limit = max(1, int(self.batch_limit))
+        self.max_attempts = max(1, int(self.max_attempts))
+        self.retry_delay_seconds = max(1, int(self.retry_delay_seconds))
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="scheduled-agent-task-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout_seconds: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.0, float(timeout_seconds)))
+
+    def run_due_once(self, *, at: datetime | None = None) -> int:
+        stamp = at or now()
+        due = self.store.due_scheduled_tasks(at=stamp, limit=self.batch_limit)
+        claimed_count = 0
+        for candidate in due:
+            claimed = self.store.claim_scheduled_task(candidate.task_id, at=stamp)
+            if claimed is None:
+                continue
+            claimed_count += 1
+            trace_id = f"trace_scheduled_{uuid.uuid4().hex[:12]}"
+            self.trace_recorder.record(
+                trace_id,
+                "scheduled_agent_task_claimed",
+                {"task": claimed.to_dict()},
+            )
+            try:
+                self.handler(claimed, trace_id)
+            except Exception as exc:
+                task, transition = self.store.fail_scheduled_task(
+                    claimed.task_id,
+                    trace_id=trace_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    max_attempts=self.max_attempts,
+                    retry_delay_seconds=self.retry_delay_seconds,
+                    at=stamp,
+                )
+                self.trace_recorder.record(
+                    trace_id,
+                    "scheduled_agent_task_failed",
+                    {
+                        "task": task.to_dict() if task else None,
+                        "transition": transition.to_dict() if transition else None,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    level="ERROR",
+                )
+                continue
+            task, transition = self.store.complete_scheduled_task(
+                claimed.task_id,
+                trace_id=trace_id,
+                at=stamp,
+            )
+            self.trace_recorder.record(
+                trace_id,
+                "scheduled_agent_task_completed",
+                {
+                    "task": task.to_dict() if task else None,
+                    "transition": transition.to_dict() if transition else None,
+                },
+            )
+        return claimed_count
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self.run_due_once()
+            self._stop_event.wait(self.poll_interval_seconds)

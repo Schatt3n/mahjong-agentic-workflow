@@ -56,6 +56,8 @@ from mahjong_agent_runtime import (  # noqa: E402
     PendingInputBatchStatus,
     PendingInputScheduler,
     QuotedMessageRef,
+    ScheduledAgentTask,
+    ScheduledAgentTaskScheduler,
     SQLiteAgentStore,
     TokenBudget,
     ToolCall,
@@ -155,6 +157,7 @@ def runtime_api_token() -> str:
 
 RUNTIME: AgentRuntime | None = None
 INPUT_SCHEDULER: PendingInputScheduler | None = None
+SCHEDULED_TASK_SCHEDULER: ScheduledAgentTaskScheduler | None = None
 
 
 def build_runtime() -> AgentRuntime:
@@ -2132,6 +2135,61 @@ def handle_due_pending_input_batch(batch: PendingInputBatch, trace_id: str) -> N
     )
 
 
+def handle_due_scheduled_agent_task(task: ScheduledAgentTask, trace_id: str) -> None:
+    """Open a due recruitment window and let the main Agent replan from current facts."""
+
+    runtime = get_runtime()
+    if task.task_type != "activate_game_recruitment" or task.aggregate_type != "game":
+        raise ValueError(f"unsupported scheduled task: {task.task_type}/{task.aggregate_type}")
+    game = runtime.store.require_game(task.aggregate_id)
+    if game.status.value not in {"forming", "inviting"} or game.remaining_seats() <= 0:
+        runtime.trace_recorder.record(
+            trace_id,
+            "scheduled_recruitment_skipped",
+            {
+                "task_id": task.task_id,
+                "game_id": game.game_id,
+                "game_status": game.status.value,
+                "remaining_seats": game.remaining_seats(),
+            },
+        )
+        return
+    opened_game, transition = runtime.store.open_game_recruitment(game.game_id, trace_id=trace_id)
+    event_message = UserMessage(
+        conversation_id=opened_game.conversation_id,
+        sender_id=opened_game.organizer_id,
+        sender_name=opened_game.organizer_name,
+        text="该预约局已进入招募窗口，请根据当前事实继续完成找人目标。",
+        message_id=task.idempotency_key,
+        metadata={
+            "internal_event": True,
+            "delivery_mode": "internal_only",
+            "event_type": "game_recruitment_window_opened",
+            "scheduled_task": task.to_dict(),
+            "game_id": opened_game.game_id,
+        },
+    )
+    result = runtime.handle_system_event(event_message, trace_id=trace_id)
+    if not result.actions:
+        raise RuntimeError("scheduled recruitment returned no agent action")
+    last_action = result.actions[-1]
+    if last_action.needs_human or last_action.objective_status in {"needs_human", "unknown"}:
+        raise RuntimeError(
+            "scheduled recruitment did not reach a recoverable autonomous state: "
+            f"objective_status={last_action.objective_status}"
+        )
+    runtime.trace_recorder.record(
+        trace_id,
+        "scheduled_recruitment_agent_result",
+        {
+            "task_id": task.task_id,
+            "game_id": opened_game.game_id,
+            "recruitment_transition": transition.to_dict() if transition else None,
+            "result": result.to_dict(),
+        },
+    )
+
+
 def conversation_id_from_trace(runtime: AgentRuntime, trace_id: str) -> str:
     if not trace_id:
         return ""
@@ -2331,6 +2389,7 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
             self._json(
                 {
                     "games": [item.to_dict() for item in runtime.store.games.values()],
+                    "active_game_schedule": [item.to_dict() for item in runtime.store.active_games()],
                     "invite_drafts": [item.to_dict() for item in runtime.store.invite_drafts.values()],
                     "outbound_message_drafts": [item.to_dict() for item in runtime.store.outbound_message_drafts.values()],
                     "conversation_checkpoints": [
@@ -2339,6 +2398,9 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                     "conversation_versions": dict(runtime.store.conversation_versions),
                     "pending_input_batches": [
                         item.to_dict() for item in runtime.store.pending_input_batches.values()
+                    ],
+                    "scheduled_agent_tasks": [
+                        item.to_dict() for item in runtime.store.scheduled_tasks.values()
                     ],
                     "customers": [item.to_dict() for item in runtime.store.customers.values()],
                     "runtime_config": runtime_config(runtime),
@@ -2682,6 +2744,12 @@ def runtime_config(runtime: AgentRuntime) -> dict:
             "scheduler_poll_seconds": env_float("MAHJONG_INPUT_SCHEDULER_POLL_SECONDS", 0.5),
             "batch_scope": "conversation_id + sender_id",
         },
+        "scheduled_agent_tasks": {
+            "enabled": True,
+            "poll_seconds": env_float("MAHJONG_SCHEDULED_TASK_POLL_SECONDS", 1.0),
+            "recruitment_lead_hours": 2,
+            "delivery_mode": "internal_event_reenters_main_agent",
+        },
         "wechaty_casual_chat_reply_enabled": env_bool("MAHJONG_WECHATY_CASUAL_CHAT_REPLY_ENABLED", True),
         "wechaty_casual_chat_reply_prompt": str(WECHATY_CASUAL_CHAT_PROMPT_PATH),
         "trace_log": str(TRACE_PATH),
@@ -2882,6 +2950,9 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
 .draft-item{background:white;border:1px solid #d6ded8;border-radius:8px;padding:12px}
 .draft-meta{font-size:13px;color:#5d6c62;margin-bottom:8px}
 .draft-text{white-space:pre-wrap;margin-bottom:10px}
+.schedule{display:grid;gap:14px;margin:12px 0}.schedule-day{border-top:1px solid #d6ded8;padding-top:10px}
+.schedule-day h3{font-size:16px;margin:0 0 8px}.schedule-line{padding:7px 0;border-bottom:1px solid #edf1ee}
+.schedule-line:last-child{border-bottom:0}.schedule-status{color:#5d6c62;font-size:13px;margin-left:8px}
 </style>
 <main>
   <h1>Mahjong Agent Runtime</h1>
@@ -2921,6 +2992,8 @@ pre{white-space:pre-wrap;background:white;border:1px solid #d6ded8;border-radius
   <pre id="output"></pre>
   <h2>待审批邀约</h2>
   <div id="inviteDrafts" class="draft-list"></div>
+  <h2>当前局列表</h2>
+  <div id="gameSchedule" class="schedule"></div>
   <h2>微信手动发送</h2>
   <p><input id="wechatTarget" value="xml31323" placeholder="微信号、备注名、昵称或联系人ID"></p>
   <p><textarea id="wechatText" placeholder="默认会填入上一轮建议回复"></textarea></p>
@@ -2997,6 +3070,62 @@ async function loadState(){
   const data = await res.json();
   state.textContent = JSON.stringify(data, null, 2);
   renderInviteDrafts(data.invite_drafts || []);
+  renderGameSchedule(data.active_game_schedule || []);
+}
+function localDateKey(date){
+  const y=date.getFullYear(); const m=String(date.getMonth()+1).padStart(2,'0'); const d=String(date.getDate()).padStart(2,'0');
+  return `${y}-${m}-${d}`;
+}
+function scheduleDateLabel(key){
+  const today=new Date(); const tomorrow=new Date(today); tomorrow.setDate(today.getDate()+1);
+  if(key===localDateKey(today)) return '今天';
+  if(key===localDateKey(tomorrow)) return '明天';
+  return key;
+}
+function gameTypeLabel(requirement){
+  const variant=String(requirement.variant||'').toLowerCase();
+  if(variant.includes('caiqiao')||variant==='cq') return 'cq';
+  const type=String(requirement.game_type||'').toLowerCase();
+  if(type.includes('sichuan')) return '川麻';
+  if(type.includes('red')||type.includes('hongzhong')) return '红中';
+  if(type.includes('hangzhou')) return '杭麻';
+  return requirement.game_type||'麻将';
+}
+function smokeLabel(value){
+  const smoke=String(value||'').toLowerCase();
+  if(smoke.includes('no_smok')||smoke==='无烟') return '无烟';
+  if(smoke) return smoke.includes('allow')||smoke.includes('either') ? '烟都可' : String(value);
+  return '';
+}
+function formatGameScheduleLine(game){
+  const req=game.requirement||{}; const seats=game.seat_summary||{};
+  const claimed=Number(seats.claimed_seats??0); const remaining=Number(seats.remaining_seats??game.remaining_seats??0);
+  const code=remaining>0 ? `${claimed}7${remaining}` : '已满';
+  const start=game.planned_start_at ? new Date(game.planned_start_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}) : '人齐开';
+  const stake=req.stake_label||req.stake||req.base_stake||''; const smoke=smokeLabel(req.smoke_preference);
+  return [gameTypeLabel(req)+code,start,smoke,stake?`${stake}块`:null].filter(Boolean).join('  ');
+}
+function renderGameSchedule(games){
+  gameSchedule.replaceChildren();
+  if(!games.length){
+    const empty=document.createElement('div'); empty.className='status'; empty.textContent='暂无待组局。'; gameSchedule.appendChild(empty); return;
+  }
+  const groups=new Map();
+  for(const game of games){
+    const key=game.planned_start_at ? localDateKey(new Date(game.planned_start_at)) : localDateKey(new Date());
+    if(!groups.has(key)) groups.set(key,[]); groups.get(key).push(game);
+  }
+  for(const [key,items] of groups){
+    const section=document.createElement('section'); section.className='schedule-day';
+    const title=document.createElement('h3'); title.textContent=scheduleDateLabel(key); section.appendChild(title);
+    for(const game of items){
+      const line=document.createElement('div'); line.className='schedule-line'; line.textContent=formatGameScheduleLine(game);
+      const status=document.createElement('span'); status.className='schedule-status';
+      status.textContent=game.recruitment_status==='scheduled' ? `将在 ${new Date(game.recruitment_opens_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})} 开始找人` : '可开始找人';
+      line.appendChild(status); section.appendChild(line);
+    }
+    gameSchedule.appendChild(section);
+  }
 }
 function renderInviteDrafts(drafts){
   inviteDrafts.replaceChildren();
@@ -3201,7 +3330,7 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main() -> None:
-    global INPUT_SCHEDULER
+    global INPUT_SCHEDULER, SCHEDULED_TASK_SCHEDULER
     runtime = get_runtime()
     INPUT_SCHEDULER = PendingInputScheduler(
         store=runtime.store,
@@ -3211,6 +3340,16 @@ def main() -> None:
         batch_limit=env_int("MAHJONG_INPUT_SCHEDULER_BATCH_LIMIT", 50),
     )
     INPUT_SCHEDULER.start()
+    SCHEDULED_TASK_SCHEDULER = ScheduledAgentTaskScheduler(
+        store=runtime.store,
+        handler=handle_due_scheduled_agent_task,
+        trace_recorder=runtime.trace_recorder,
+        poll_interval_seconds=env_float("MAHJONG_SCHEDULED_TASK_POLL_SECONDS", 1.0),
+        batch_limit=env_int("MAHJONG_SCHEDULED_TASK_BATCH_LIMIT", 50),
+        max_attempts=env_int("MAHJONG_SCHEDULED_TASK_MAX_ATTEMPTS", 3),
+        retry_delay_seconds=env_int("MAHJONG_SCHEDULED_TASK_RETRY_SECONDS", 60),
+    )
+    SCHEDULED_TASK_SCHEDULER.start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), AgentRuntimeHandler)
     print(f"Mahjong Agent Runtime listening on http://127.0.0.1:{PORT}")
     print(f"Trace log: {TRACE_PATH}")
@@ -3221,6 +3360,8 @@ def main() -> None:
     finally:
         if INPUT_SCHEDULER is not None:
             INPUT_SCHEDULER.stop()
+        if SCHEDULED_TASK_SCHEDULER is not None:
+            SCHEDULED_TASK_SCHEDULER.stop()
         server.server_close()
         print("Mahjong Agent Runtime stopped.")
 

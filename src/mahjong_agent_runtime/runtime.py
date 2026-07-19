@@ -231,6 +231,71 @@ class AgentRuntime:
             )
             return result
 
+    def handle_system_event(self, message: UserMessage, *, trace_id: str | None = None) -> AgentRuntimeResult:
+        """Re-enter the same goal-driven loop for durable background work.
+
+        Unlike a new customer message, a system event does not advance the
+        conversation version and does not supersede pending customer output.
+        The event is still ordered by the conversation lock, traced and
+        idempotent. ``ActionProcessor`` keeps its terminal reply internal while
+        customer-facing invite drafts still pass normal generation and review.
+        """
+
+        assert self.coordination_manager is not None
+        metadata = dict(message.metadata or {})
+        metadata.update({"internal_event": True, "delivery_mode": "internal_only"})
+        message.metadata = metadata
+        with self.coordination_manager.lock(f"conversation:{message.conversation_id or 'default'}"):
+            actual_trace_id = trace_id or f"trace_system_{uuid.uuid4().hex[:12]}"
+            message_key = message_idempotency_key(message)
+            cached = self.store.idempotent_message_result(message_key)
+            if cached is not None:
+                self.trace_recorder.record(
+                    actual_trace_id,
+                    "system_event_deduplicated",
+                    {"message_id": message.message_id, "original_trace_id": cached.trace_id},
+                )
+                return cached
+
+            run_id = f"run_system_{uuid.uuid4().hex[:12]}"
+            run_version = self.store.conversation_version(message.conversation_id)
+            self.trace_recorder.record(
+                actual_trace_id,
+                "system_event_received",
+                {
+                    "message": message.to_dict(),
+                    "run_id": run_id,
+                    "run_version": run_version,
+                },
+            )
+            result = self.agent_loop.run(
+                message,
+                trace_id=actual_trace_id,
+                run_id=run_id,
+                run_version=run_version,
+            )
+            try:
+                summary_result = self.context_lifecycle.maybe_summarize_after_turn(
+                    conversation_id=message.conversation_id,
+                    trace_id=actual_trace_id,
+                )
+                if summary_result is not None and summary_result.transition is not None:
+                    result.state_transitions.append(summary_result.transition)
+            except Exception as exc:
+                self.trace_recorder.record(
+                    actual_trace_id,
+                    "context_summary_error",
+                    {"error_type": type(exc).__name__, "error": str(exc), "trigger": "system_event"},
+                    level="ERROR",
+                )
+            self.store.remember_message_result(message_key, result)
+            self.trace_recorder.record(
+                actual_trace_id,
+                "system_event_completed",
+                {"result": result.to_dict(), "delivery_mode": "internal_only"},
+            )
+            return result
+
     def _handle_once(self, message: UserMessage, *, trace_id: str, run_id: str, run_version: int) -> AgentRuntimeResult:
         return self.agent_loop.run(message, trace_id=trace_id, run_id=run_id, run_version=run_version)
 

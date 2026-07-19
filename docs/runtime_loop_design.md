@@ -45,10 +45,11 @@ flowchart TB
     gateway["ToolGateway<br/>schema、权限、幂等、工具执行"]
     visible["CustomerVisibleProcessor<br/>话术生成 + 内容审查"]
     hooks["HookManager<br/>生命周期扩展点"]
+    scheduler["ScheduledAgentTaskScheduler<br/>持久化唤醒、lease、重试"]
   end
 
   subgraph Storage["持久化与质量资产"]
-    sqlite["SQLiteAgentStore<br/>业务状态与记忆"]
+    sqlite["SQLiteAgentStore<br/>业务状态、记忆与定时任务"]
     trace["JsonlTraceRecorder<br/>trace 日志"]
     evals["eval/<br/>badcase / golden / regression"]
   end
@@ -72,6 +73,8 @@ flowchart TB
   gateway --> trace
   trace --> evals
   runtime --> hooks
+  sqlite --> scheduler
+  scheduler --> runtime
 ```
 
 ## 3. 入口与主文件
@@ -90,6 +93,7 @@ flowchart TB
 | `src/mahjong_agent_runtime/sqlite_store.py` | SQLite 持久化 |
 | `src/mahjong_agent_runtime/task_context.py` | 在稳定会话路由内切分独立业务任务 |
 | `src/mahjong_agent_runtime/summary.py` | 上下文摘要 checkpoint |
+| `src/mahjong_agent_runtime/scheduled_tasks.py` | 持久化定时任务的领取、重试和内部事件唤醒 |
 | `src/mahjong_agent_runtime/visibility.py` | 客户可见内容审查 |
 | `src/mahjong_agent_runtime/copywriting.py` | 客户可见话术生成 |
 | `src/mahjong_agent_runtime/prompts/` | 主模型、摘要、审查、话术、微信分流提示词 |
@@ -188,6 +192,16 @@ sequenceDiagram
 - 旧结果失效：处理过程中收到新片段，批次版本递增并回到 pending；旧版本不能写状态、创建草稿或产生最终外发。
 
 例如连续收到“老板 / 帮我组个局 / 0.5，无烟，人齐开”，前两条可以被模型判断为等待补充；第三条到达后，主 Agent 只收到一次包含三条原文的聚合消息。
+
+### 5.2 未来预约如何准时启动
+
+用户预约未来固定时间时，主 Agent 当轮就创建 `Game`。后端从 `planned_start_at` 派生 `recruitment_opens_at=planned_start_at-2h`，同时在 `runtime_scheduled_agent_tasks` 写入确定性任务。局马上可见、可排序和参与群局列表聚合，但在窗口打开前，`create_invite_drafts` 会统一拒绝主动私聊邀约。
+
+调度器轮询到期任务，并通过 SQLite `BEGIN IMMEDIATE` 原子领取 lease。领取成功后发出 `game_recruitment_window_opened` 内部事件，经 `AgentRuntime.handle_system_event` 重新进入同一主 Agent；这不是写死“找八个人”的定时回调，模型会读取唤醒时最新局况，再决定是否查候选人、生成邀约、停止或重规划。内部事件不推进客户消息版本，也不会把内部摘要发送给客户。
+
+任务持久化只解决“重启不丢”，准时执行仍依赖至少一个调度器实例处于运行状态。本地 Mac 长时间休眠时不会执行轮询；恢复或重启后，过期未完成任务会立即进入原子领取。需要严格准点时，应部署常驻进程或接入外部调度基础设施。
+
+任务状态为 `pending/running/retry_wait/completed/failed/cancelled`。进程重启后任务仍在 SQLite；领取节点宕机后 lease 可过期重领；失败任务按上限和退避时间重试；局已满、取消或结束时任务同步收口。多节点共享同一数据库时只有一个节点能领取同一任务，避免重复邀约。
 
 ## 6. 主 Agent Loop
 

@@ -70,6 +70,26 @@ class PendingInputBatchStatus(StrEnum):
     FAILED = "failed"
 
 
+class ScheduledTaskStatus(StrEnum):
+    """Lifecycle of a durable system event that will re-enter the main Agent."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class RecruitmentStatus(StrEnum):
+    """Whether a game may proactively contact private candidates."""
+
+    SCHEDULED = "scheduled"
+    OPEN = "open"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
 @dataclass(slots=True)
 class QuotedMessageRef:
     message_id: str
@@ -166,6 +186,55 @@ class PendingInputBatch:
             "decision": dict(self.decision),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass(slots=True)
+class ScheduledAgentTask:
+    """Durable, lease-based trigger for future Agent work.
+
+    The task stores *when* the main Agent should wake up and *which aggregate*
+    it should re-evaluate. It deliberately does not store a precomputed action:
+    current games, candidates and room state may all change before ``due_at``.
+    """
+
+    task_id: str
+    task_type: str
+    aggregate_type: str
+    aggregate_id: str
+    conversation_id: str
+    subject_id: str
+    subject_name: str
+    due_at: datetime
+    idempotency_key: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    status: ScheduledTaskStatus = ScheduledTaskStatus.PENDING
+    attempts: int = 0
+    lease_until: datetime | None = None
+    last_error: str = ""
+    created_at: datetime = field(default_factory=now)
+    updated_at: datetime = field(default_factory=now)
+    completed_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "aggregate_type": self.aggregate_type,
+            "aggregate_id": self.aggregate_id,
+            "conversation_id": self.conversation_id,
+            "subject_id": self.subject_id,
+            "subject_name": self.subject_name,
+            "due_at": self.due_at.isoformat(),
+            "idempotency_key": self.idempotency_key,
+            "payload": dict(self.payload),
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "lease_until": self.lease_until.isoformat() if self.lease_until else None,
+            "last_error": self.last_error,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
 
 
@@ -406,6 +475,8 @@ class Game:
     planned_start_at: datetime | None = None
     planned_end_at: datetime | None = None
     expires_at: datetime | None = None
+    recruitment_opens_at: datetime | None = None
+    recruitment_status: RecruitmentStatus = RecruitmentStatus.OPEN
     closed_reason: str = ""
     created_at: datetime = field(default_factory=now)
     updated_at: datetime = field(default_factory=now)
@@ -467,6 +538,8 @@ class Game:
             "planned_start_at": self.planned_start_at.isoformat() if self.planned_start_at else None,
             "planned_end_at": self.planned_end_at.isoformat() if self.planned_end_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "recruitment_opens_at": self.recruitment_opens_at.isoformat() if self.recruitment_opens_at else None,
+            "recruitment_status": self.recruitment_status.value,
             "closed_reason": self.closed_reason,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),

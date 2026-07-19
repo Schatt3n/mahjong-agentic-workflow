@@ -27,6 +27,7 @@
 - 查询当前局和房间库存，匹配现有局或创建新局。
 - 根据画像、近期邀约、疲劳度和客户关系推荐候选人。
 - 生成待审批邀约，记录候选人反馈并更新局内人数和状态。
+- 未来预约立即入局列表；固定时间局仅在开局前 2 小时进入主动私聊招募窗口。
 - 支持局的开始/结束时间、超时取消、房间释放、失败归档和状态回溯。
 
 ### Agent 能力
@@ -43,6 +44,7 @@
 
 - 同一会话串行、消息幂等、工具幂等、可恢复 lease 和会话版本控制。
 - SQLite 原子事务；可选 Redis 分布式协调锁。
+- 持久化定时任务、原子 lease、失败重试和重启恢复；到期事件重新进入同一个主 Agent 规划。
 - HTTP 鉴权、请求体限制、并发限制和频率限制。
 - WeChaty 接入具备白名单、外发开关、投递去重、失败暂存和重放能力。
 - 全链路记录 trace、上下文、模型输出、工具调用、状态迁移和最终结果。
@@ -68,6 +70,7 @@ flowchart LR
     Context["Context Builder<br/>检索、投影、预算、摘要"]
     Loop["Agent Loop<br/>规划 -> 工具 -> 观察 -> 重规划"]
     Progress["Progress Monitor<br/>循环与无进展检测"]
+    Scheduler["Durable Scheduler<br/>T-2h 唤醒、lease、重试"]
   end
 
   subgraph Execution["可信执行"]
@@ -77,7 +80,7 @@ flowchart LR
   end
 
   subgraph State["状态与质量资产"]
-    SQLite["SQLite<br/>局、房间、画像、记忆、草稿"]
+    SQLite["SQLite<br/>局、房间、画像、记忆、草稿、定时任务"]
     Trace["Trace / Audit"]
     Eval["Badcase / Golden / Eval"]
   end
@@ -95,6 +98,8 @@ flowchart LR
   Gateway --> Loop
   Loop --> Progress
   Loop --> Visible
+  SQLite --> Scheduler
+  Scheduler --> Runtime
   Visible --> Web
   Visible --> WeChaty
   Runtime --> Trace
@@ -192,6 +197,37 @@ handle user message
 | `record_badcase` | 有 | 归档失败样本和评测候选 |
 
 所有有副作用的工具都会经过 schema、主体权限、资源归属、状态机、幂等和并发版本校验。
+
+### 未来预约与定时招募
+
+未来预约不是把一句“明天再问”留在模型记忆里，而是立即写入业务状态和持久化任务：
+
+```text
+用户预约明天 13:00
+  -> 主 Agent 查询现有局并 create_game
+  -> Game 立即进入按 planned_start_at 排序的局列表
+  -> recruitment_status=scheduled
+  -> SQLite 写入 due_at=11:00 的 activate_game_recruitment 任务
+  -> T-2h 前禁止 search_customers 后的私聊邀约草稿
+  -> 调度器原子 claim 任务
+  -> game_recruitment_window_opened 内部事件重新进入主 Agent
+  -> 主 Agent 读取当时最新局况、画像和候选人，动态规划搜索与邀约
+```
+
+定时任务 ID 和幂等键由 `game_id + recruitment_opens_at` 确定性生成。SQLite 使用 `BEGIN IMMEDIATE` 完成领取，同一共享数据库上的多个进程只能有一个节点获得 lease；节点领取后宕机，lease 到期后任务可再次领取。任务失败按配置重试，局已满、取消或结束时任务同步取消/完成。内部唤醒产生完整 trace，但内部摘要不会作为客户消息发送。
+
+持久化能保证任务不因进程重启丢失，但准时唤醒仍要求服务进程在运行、Mac 没有长时间休眠。服务恢复后，调度器会立即领取已过期但未完成的任务；真正多机生产部署则应由常驻服务或外部调度基础设施保证可用性。
+
+默认参数：
+
+```bash
+MAHJONG_SCHEDULED_TASK_POLL_SECONDS=1
+MAHJONG_SCHEDULED_TASK_BATCH_LIMIT=50
+MAHJONG_SCHEDULED_TASK_MAX_ATTEMPTS=3
+MAHJONG_SCHEDULED_TASK_RETRY_SECONDS=60
+```
+
+Web 控制台的“当前局列表”按时间排序并区分今天/明天；尚未到招募窗口的局会显示计划开始找人的时间，但仍可被群内局列表和现有局查询读取。
 
 ### 多方案与共享参与者
 
@@ -333,7 +369,7 @@ logs/wechaty_weixin_raw.jsonl      # 微信原始消息日志
 runtime_data/                      # 本地评测报告与临时数据库
 ```
 
-SQLite 保存客户画像、客户关系、局、房间、邀约草稿、状态迁移、对话、checkpoint、任务记忆、消息结果、幂等账本和待处理输入批次。Redis 只在配置后承担跨进程协调，不是业务真相来源。
+SQLite 保存客户画像、客户关系、局、房间、邀约草稿、状态迁移、对话、checkpoint、任务记忆、消息结果、幂等账本、待处理输入批次和持久化定时任务。Redis 只在配置后承担跨进程协调，不是业务真相来源。
 
 每条链路可以通过 `trace_id` 回溯：
 
@@ -461,21 +497,21 @@ PYTHONPATH=src python scripts/run_privacy_isolation_live_eval.py \
 
 最近一次完整验证结果（2026-07-19，`deepseek-v4-flash`）：
 
-- 自动化测试：`274 passed, 1 skipped`
+- 自动化测试：`292 passed, 1 skipped`
 - Agent 确定性回归：`138/138`
-- 真实 DeepSeek 老板对话场景：`10/10`
+- 真实 DeepSeek 老板对话场景：`11/11`
 - 真实 DeepSeek 跨会话隐私场景：`10/10`，共 `30` 次模型调用，无隐私泄露、人工降级或合同错误
 - 确定性并发竞争场景：`8/8`，每类 `40` 次并发操作
-- 真实 DeepSeek 并发场景：`20/20`，`77` 次模型调用，模型调用失败 `0`
+- 真实 DeepSeek 并发场景：`22/22`，`85` 次模型调用，模型调用失败 `0`
 - 供应商请求并发：配置上限 `3`，实测峰值 `3`，最大等待 `1`
-- badcase 回归覆盖：`fixed=22, open=0`
+- badcase 回归覆盖：`fixed=24, open=0`
 
-真实并发延迟基线（`4` 个业务 worker、每场景重复 `2` 次、共 `20` 个端到端场景）：
+真实并发延迟基线（`4` 个业务 worker、每场景重复 `2` 次、共 `22` 个端到端场景）：
 
 | 指标 | P50 | P95 | P99 | 最大值 | 样本量 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 单次模型调用延迟 | `4.17s` | `9.48s` | `11.95s` | `11.95s` | `77` 次调用 |
-| 端到端场景延迟 | `19.25s` | `45.50s` | `45.50s` | `45.50s` | `20` 个场景 |
+| 单次模型调用延迟 | `4.49s` | `8.54s` | `9.91s` | `9.91s` | `85` 次调用 |
+| 端到端场景延迟 | `17.97s` | `29.53s` | `33.51s` | `33.51s` | `22` 个场景 |
 
 `P95` 表示 95% 的样本延迟不高于该值，`P99` 同理表示 99% 分位。上表是本地 MacBook 运行 Agent、通过网络调用外部 DeepSeek API 得到的小样本回归基线，用于发现迭代退化，不等同于生产容量压测结果或 SLA 承诺。当前 P95/P99 主要受外部模型网络延迟、多轮工具结果回喂、话术生成和客户可见内容审查的串行调用影响。
 
@@ -505,6 +541,7 @@ src/mahjong_agent_runtime/
   processing.py                           # AgentAction、工具和回复处理
   tools.py                                # Tool Gateway 与工具注册
   progress.py                             # 死循环和无进展检测
+  scheduled_tasks.py                      # 持久化任务轮询、lease、重试和主 Agent 唤醒
   summary.py                              # checkpoint 摘要
   copywriting.py                          # 客户可见话术生成
   visibility.py                           # 客户可见信息审查

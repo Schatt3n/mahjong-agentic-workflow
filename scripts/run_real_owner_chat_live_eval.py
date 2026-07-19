@@ -576,6 +576,49 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
             forbidden_reply_contains=["打多大", "几个人", "0.5", "无烟", "打吗", "来吗", "来不", *common_forbidden],
         ),
         LiveEvalScenario(
+            scenario_id="future_reservation_waits_for_recruitment_window",
+            name="明天预约立即入局列表，但在 T-2 小时前不私聊候选人",
+            setup=seed_default_profiles,
+            message=UserMessage(
+                conversation_id="owner_future_reservation_chat",
+                sender_id="owner_real_customer",
+                sender_name="常客",
+                text="帮我约明天下午一点的财敲，1块无烟，272",
+                message_id="msg_owner_real_live_eval_future_reservation",
+            ),
+            required_tool_names=["create_game"],
+            forbidden_tool_names=["search_customers", "create_invite_drafts"],
+            expected_tool_result_paths={
+                "create_game": {
+                    "result.recruitment_policy.status": "scheduled",
+                }
+            },
+            required_reply_any=[
+                ["好", "行", "记上", "安排"],
+            ],
+            forbidden_reply_contains=[
+                "已经问",
+                "问了",
+                "候选人",
+                "两小时",
+                "T-2",
+                "定时",
+                "调度",
+                *common_forbidden,
+            ],
+            expected_active_game_count=1,
+            expected_active_game_requirement={
+                "game_type": "hangzhou_mahjong",
+                "variant": "caiqiao",
+                "stake": "1",
+                "smoke_preference": "no_smoke",
+                "start_time_kind": "scheduled",
+                "known_player_count": 2,
+                "needed_seats": 2,
+            },
+            max_reply_chars=40,
+        ),
+        LiveEvalScenario(
             scenario_id="public_nickname_lookup",
             name="用户追问哪些人时只给公开昵称，不暴露私有备注",
             setup=setup_public_nickname_lookup,
