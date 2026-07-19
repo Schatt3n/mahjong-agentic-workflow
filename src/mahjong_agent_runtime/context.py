@@ -245,6 +245,26 @@ class AgentContextBuilder:
         payload = {
             "runtime": "mahjong_agent_runtime",
             "trace_id": trace_id,
+            "customer_visibility_contract": {
+                "conversation_isolation": (
+                    "Only the current conversation's recent turns, checkpoint, and task memories are included. "
+                    "Never claim to know, quote, summarize, or reveal another customer's private conversation."
+                ),
+                "internal_only_context": [
+                    "sender_relationships",
+                    "customer profile preferences and private-field omission markers",
+                    "candidate matching, ranking, invitation, and participation state not present in active_game_visible_summaries",
+                ],
+                "relationship_rule": (
+                    "Relationship constraints such as avoid_playing are only for matching decisions. "
+                    "Do not confirm, deny, quote, paraphrase, or hint that one customer said they refuse to play with another, "
+                    "even when the current customer asks directly. Give a neutral operational answer instead."
+                ),
+                "public_exception": (
+                    "Only public nicknames and facts explicitly present in active_game_visible_summaries may be disclosed, "
+                    "and only when they directly answer the current request."
+                ),
+            },
             "conversation_state": {
                 "conversation_id": message.conversation_id,
                 "current_version": current_version,

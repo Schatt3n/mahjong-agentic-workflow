@@ -226,8 +226,20 @@ class CustomerVisibleProcessor:
                 error="Customer-visible content review contract invalid: " + "; ".join(errors),
             )
         item_reviews = normalize_item_reviews(review, review_items)
-        approved = bool(review.get("approved")) and not bool(review.get("needs_human")) and item_reviews_approved(item_reviews, review_items)
         needs_human = bool(review.get("needs_human"))
+        top_level_violations = (
+            list(review.get("violations") or [])
+            if isinstance(review.get("violations"), list)
+            else []
+        )
+        item_level_approved = item_reviews_approved(item_reviews, review_items)
+        # Item reviews are the recipient-specific decisions and therefore the
+        # authoritative aggregate source. Models occasionally emit an
+        # inconsistent top-level approved=false while every item is approved,
+        # unchanged, and violation-free. Derive the aggregate deterministically
+        # so a redundant Boolean cannot make the loop retry until max_steps.
+        approved = item_level_approved and not needs_human and not top_level_violations
+        aggregate_repaired = approved != bool(review.get("approved"))
         instruction = (
             "Review approved all customer-visible content. You may continue with the original action."
             if approved
@@ -239,11 +251,12 @@ class CustomerVisibleProcessor:
             {
                 "approved": approved,
                 "raw_approved": bool(review.get("approved")),
+                "aggregate_repaired": aggregate_repaired,
                 "needs_human": needs_human,
                 "review_scope": review_scope,
                 "item_reviews": item_reviews,
                 "reasoning_summary": str(review.get("reasoning_summary") or ""),
-                "violations": list(review.get("violations") or []) if isinstance(review.get("violations"), list) else [],
+                "violations": top_level_violations,
             },
             level="WARN" if not approved else "INFO",
         )
@@ -254,12 +267,13 @@ class CustomerVisibleProcessor:
             result={
                 "approved": approved,
                 "raw_approved": bool(review.get("approved")),
+                "aggregate_repaired": aggregate_repaired,
                 "needs_human": needs_human,
                 "review_scope": review_scope,
                 "items": review_items,
                 "item_reviews": item_reviews,
                 "reasoning_summary": str(review.get("reasoning_summary") or ""),
-                "violations": list(review.get("violations") or []) if isinstance(review.get("violations"), list) else [],
+                "violations": top_level_violations,
                 "instruction": instruction,
             },
         )
@@ -429,6 +443,7 @@ def build_reply_self_review_payload(
 
     return {
         "current_message": message.to_dict(),
+        "customer_visibility_contract": context_payload.get("customer_visibility_contract") or {},
         "sender_profile": context_payload.get("sender_profile"),
         "sender_relationships": context_payload.get("sender_relationships") or [],
         "active_games": context_payload.get("active_games") or [],
@@ -480,6 +495,7 @@ def build_reply_self_review_payload(
             "invariants": [
                 "approved=true means every review item has no information leakage, unverified external action, semantic contradiction, or required fact loss",
                 "approved=true requires every item_reviews[].approved=true and suggested_safe_text equals the original text",
+                "the top-level approved value must equal the aggregate of item_reviews; an unchanged, violation-free, approved item must not be rejected only because it safely refuses a user's requested disclosure format",
                 "approved=false and needs_human=false means at least one item_reviews entry contains a safe rewrite",
                 "needs_human=true means the main agent should use a short human-handoff reply or stop the unsafe tool action",
                 "suggested_safe_text must not expose tool names, JSON, traceId, internal process, draft/approval state, or other customer identities/roles",

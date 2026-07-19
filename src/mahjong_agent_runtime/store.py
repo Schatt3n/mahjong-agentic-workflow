@@ -1826,6 +1826,12 @@ def relationship_context_for_sender(
                     "played_together_count": played_count,
                     "avoid_playing": avoid_playing,
                     "relationship_label": label,
+                    # Relationship facts may affect matching, but they are not
+                    # customer-visible facts. The main/review models receive an
+                    # explicit policy marker instead of inferring visibility from
+                    # the presence of the field.
+                    "visibility": "internal_matching_only",
+                    "customer_visible": False,
                     "private_relationship_notes_omitted": bool(relationship and relationship.notes),
                 }
             )

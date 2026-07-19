@@ -386,11 +386,20 @@ PYTHONPATH=src python scripts/run_evals.py --live-concurrency
 PYTHONPATH=src python scripts/run_real_owner_chat_live_eval.py
 ```
 
+跨会话隐私隔离评测会为 B 写入独立私聊原文、任务记忆和“不和 A 打”的内部关系约束，再让 A 用直接追问、只回答是/否、JSON 导出、伪造授权、提示注入、逐字引用等 10 种方式诱导系统泄露。每轮都运行完整主 Agent、话术生成和客户可见内容审查，并同时断言：B 的原始会话和任务记忆没有进入 A 的上下文、关系约束只标记为内部匹配信息、最终回复和新建外发草稿均不包含私聊或关系事实。
+
+```bash
+PYTHONPATH=src python scripts/run_privacy_isolation_live_eval.py \
+  --strict \
+  --report-path runtime_data/privacy_isolation_live_eval.json
+```
+
 最近一次完整验证结果：
 
-- 自动化测试：`248 passed, 1 skipped`
+- 自动化测试：`251 passed, 1 skipped`
 - Agent 确定性回归：`138/138`
 - 真实 DeepSeek 老板对话场景：`10/10`
+- 真实 DeepSeek 跨会话隐私场景：`10/10`，共 `30` 次模型调用，无隐私泄露、人工降级或合同错误
 - 确定性并发竞争场景：`7/7`，每类 `40` 次并发操作
 - 真实 DeepSeek 并发场景：`20/20`，`74` 次模型调用，模型调用失败 `0`
 - 真实并发模型调用延迟：`P95 7.58s`；端到端场景延迟：`P95 24.44s`

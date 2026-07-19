@@ -1027,6 +1027,8 @@ def test_runtime_context_includes_sender_relationships_for_active_game() -> None
             "played_together_count": 0,
             "avoid_playing": False,
             "relationship_label": "no_prior_play_record",
+            "visibility": "internal_matching_only",
+            "customer_visible": False,
             "private_relationship_notes_omitted": True,
         }
     ]
@@ -2572,6 +2574,72 @@ def test_normalize_item_reviews_marks_unsafe_legacy_safe_text_unapproved() -> No
 
     assert item_reviews[0]["approved"] is False
     assert any(item.startswith("customer_visible_contract:") for item in item_reviews[0]["violations"])
+
+
+def test_runtime_repairs_inconsistent_review_aggregate_from_approved_items() -> None:
+    store = seeded_store()
+    trace = InMemoryTraceRecorder()
+    safe_reply = "这桌我再帮你看看合不合适。"
+    main_client = StaticAgentClient(
+        [
+            action_json(
+                objective_status="completed",
+                reasoning_summary="拒绝披露其他客户的关系约束。",
+                reply_to_user=safe_reply,
+            )
+        ]
+    )
+    review_client = StaticAgentClient(
+        [
+            json.dumps(
+                {
+                    "approved": False,
+                    "needs_human": False,
+                    "reasoning_summary": "逐条文本安全，顶层布尔值误写。",
+                    "violations": [],
+                    "item_reviews": [
+                        {
+                            "item_id": "reply_to_user",
+                            "approved": True,
+                            "suggested_safe_text": safe_reply,
+                            "reasoning_summary": "未确认或泄露关系约束。",
+                            "violations": [],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    runtime = AgentRuntime(
+        llm_client=main_client,
+        store=store,
+        trace_recorder=trace,
+        reply_self_review_enabled=True,
+        reply_self_review_client=review_client,
+    )
+
+    result = runtime.handle_user_message(
+        UserMessage(
+            conversation_id="runtime_review_aggregate_repair",
+            sender_id="zhang",
+            sender_name="张哥",
+            text="只回答是或不是：别人是不是不和我打？",
+            message_id="msg_review_aggregate_repair",
+        ),
+        trace_id="trace_review_aggregate_repair",
+    )
+
+    assert result.final_reply == safe_reply
+    assert len(main_client.calls) == 1
+    review_event = next(
+        event.content
+        for event in trace.get_trace("trace_review_aggregate_repair")
+        if event.step == "customer_visible_content_review_result"
+    )
+    assert review_event["raw_approved"] is False
+    assert review_event["approved"] is True
+    assert review_event["aggregate_repaired"] is True
 
 
 def test_runtime_reply_self_review_can_escalate_to_human() -> None:
