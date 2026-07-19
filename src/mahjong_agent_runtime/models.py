@@ -679,6 +679,8 @@ class ToolCall:
     arguments: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     idempotency_key: str | None = None
+    call_id: str | None = None
+    depends_on: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -689,6 +691,7 @@ class ToolResult:
     name: str
     called: bool
     allowed: bool
+    call_id: str | None = None
     result: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     idempotency_key: str | None = None
@@ -700,6 +703,7 @@ class ToolResult:
             "name": self.name,
             "called": self.called,
             "allowed": self.allowed,
+            "call_id": self.call_id,
             "result": dict(self.result),
             "error": self.error,
             "idempotency_key": self.idempotency_key,
@@ -736,6 +740,12 @@ class AgentAction:
                     idempotency_key=(
                         str(raw.get("idempotency_key"))
                         if raw.get("idempotency_key") not in {None, ""}
+                        else None
+                    ),
+                    call_id=(str(raw.get("call_id")) if raw.get("call_id") not in {None, ""} else None),
+                    depends_on=(
+                        [str(item) for item in raw.get("depends_on") or []]
+                        if isinstance(raw.get("depends_on"), list)
                         else None
                     ),
                 )

@@ -3084,6 +3084,12 @@ def _tool_call_from_payload(payload: dict[str, Any]) -> ToolCall:
         arguments=dict(payload.get("arguments") or {}),
         reason=str(payload.get("reason") or ""),
         idempotency_key=payload.get("idempotency_key"),
+        call_id=payload.get("call_id"),
+        depends_on=(
+            [str(item) for item in payload.get("depends_on") or []]
+            if isinstance(payload.get("depends_on"), list)
+            else None
+        ),
     )
 
 
@@ -3109,6 +3115,7 @@ def _tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:
         name=str(payload.get("name") or ""),
         called=bool(payload.get("called")),
         allowed=bool(payload.get("allowed")),
+        call_id=payload.get("call_id"),
         result=dict(payload.get("result") or {}),
         error=payload.get("error"),
         idempotency_key=payload.get("idempotency_key"),

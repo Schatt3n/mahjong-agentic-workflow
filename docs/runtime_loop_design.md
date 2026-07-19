@@ -509,6 +509,32 @@ conversation:{conversation_id}:sender:{sender_id}:message:{source_message_id}:to
 
 这意味着同一条用户消息触发同一个工具、同一组参数时，重复执行会命中幂等账本，不会重复创建局或草稿。
 
+### 工具依赖图与并行调度
+
+`ToolCall` 可选声明：
+
+```json
+{
+  "name": "search_current_games",
+  "call_id": "games",
+  "depends_on": [],
+  "arguments": {"requirement": {}},
+  "reason": "查询可加入的局"
+}
+```
+
+一旦某个调用使用依赖元数据，本步所有调用都必须提供唯一 `call_id`。独立调用建议显式提供 `depends_on: []`；模型省略或返回 `null` 时，合同层会做领域无关的归一化，视为空依赖。`action_contract.py` 仍会拒绝缺失/重复 `call_id`、未知依赖、自依赖和环。
+
+`ToolExecutionService` 按依赖就绪的波次调度：
+
+1. 同波中只有后端 `ToolDefinition.parallel_safe=true` 且 `execution_mode=read_only` 的调用可进入线程池。
+2. 写工具无论模型如何声明都单个串行；权威并行属性来自工具注册表，不来自 LLM。
+3. 前置结果失败，不执行后续依赖工具，而是构造可审计失败结果回喂主模型。
+4. 并行任务可以任意顺序完成，但 `previous_tool_results` 始终按原始调用顺序组装。
+5. 没有完整元数据的旧输出保持串行，确保存量 fixture 和模型响应兼容。
+
+trace 中增加 `tool_batch_started` / `tool_batch_completed`，其中记录波次、执行方式、`call_id`、工具名和耗时。并发度由 `MAHJONG_AGENT_MAX_PARALLEL_READ_TOOLS` 控制，默认 `4`。
+
 ## 12. 状态模型
 
 ### 12.1 局状态

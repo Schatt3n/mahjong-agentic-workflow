@@ -842,6 +842,14 @@ def output_contract() -> dict[str, Any]:
             "depends_on_tool_results": "required boolean; true if the decision depends on previous_tool_results or system state",
         },
         "tool_call_contract": {
+            "call_id": (
+                "optional non-empty string in legacy single-call mode; required and unique for every call when an "
+                "action contains an explicit dependency graph"
+            ),
+            "depends_on": (
+                "optional array in legacy mode; array of prerequisite call_id strings in dependency graph mode. "
+                "Omitted/null is normalized to []; use [] only when the call is truly independent"
+            ),
             "name": "required non-empty string",
             "arguments": "required object, validated again by ToolGateway schema",
             "reason": "required non-empty string explaining why this tool is needed now",
@@ -857,6 +865,8 @@ def output_contract() -> dict[str, Any]:
             "objective_status=needs_tool requires stop_reason.can_stop=false and non-empty pending_work",
             "objective_status=waiting_user|completed|needs_human|unknown requires stop_reason.can_stop=true",
             "invalid contract means backend will not execute any tool",
+            "multiple independent parallel_safe read-only calls should declare unique call_id and depends_on=[]; dependent calls must list their prerequisites",
+            "missing graph metadata keeps backward-compatible sequential execution; the model cannot mark a tool parallel-safe because that permission comes from ToolGateway",
             "badcase must be null; badcase/eval writes must use record_badcase tool_call",
             "terminal reply must answer only current_message or an explicitly unresolved confirmation; do not append adjacent active-game facts, shortage, time, or calls to action that the user did not ask for",
             "casual-chat replies may use business state for continuity but must not surface that state unless current_message explicitly refers to it",

@@ -162,6 +162,7 @@ class ToolDefinition:
     execution_mode: str
     schema: dict[str, Any]
     handler: ToolHandler | None = None
+    parallel_safe: bool = False
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
@@ -169,6 +170,7 @@ class ToolDefinition:
             "description": self.description,
             "risk_level": self.risk_level,
             "execution_mode": self.execution_mode,
+            "parallel_safe": self.parallel_safe,
             "schema": self.schema,
         }
 
@@ -881,6 +883,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
                 },
             },
             check_room_availability,
+            parallel_safe=True,
         ),
         "reserve_room": ToolDefinition(
             "reserve_room",
@@ -907,6 +910,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             "read_only",
             {"type": "object", "required": ["requirement"], "properties": {"requirement": requirement_schema, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}},
             search_current_games,
+            parallel_safe=True,
         ),
         "search_customers": ToolDefinition(
             "search_customers",
@@ -915,6 +919,7 @@ def default_tool_definitions(store: InMemoryAgentStore) -> dict[str, ToolDefinit
             "read_only",
             {"type": "object", "required": ["requirement"], "properties": {"requirement": requirement_schema, "exclude_customer_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}},
             search_customers,
+            parallel_safe=True,
         ),
         "create_game": ToolDefinition(
             "create_game",

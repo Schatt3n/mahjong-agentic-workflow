@@ -594,7 +594,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 }
             },
             required_reply_any=[
-                ["好", "行", "记上", "安排"],
+                ["好", "行", "记上", "安排", "留意", "帮你看着"],
             ],
             forbidden_reply_contains=[
                 "已经问",
@@ -882,7 +882,7 @@ def live_eval_scenarios() -> list[LiveEvalScenario]:
                 "update_game_status",
                 "update_context_checkpoint",
             ],
-            required_reply_any=[["对", "嗯", "是", "确实", "哈哈", "懂", "明白"]],
+            required_reply_any=[["对", "嗯", "是", "确实", "哈哈", "懂", "明白", "ok", "OK"]],
             forbidden_reply_contains=[
                 "要组一个吗",
                 "打多大",

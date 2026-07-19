@@ -75,3 +75,185 @@ def test_parse_action_does_not_hide_ambiguous_invalid_contract() -> None:
     assert repairs == []
     assert "needs_tool requires at least one tool_call" in errors
     assert "needs_tool requires empty reply_to_user" not in errors
+
+
+def test_parse_action_accepts_valid_tool_dependency_graph() -> None:
+    payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "check_room_availability",
+                "arguments": {"start_at": "2026-07-20T14:00:00+08:00", "end_at": "2026-07-20T18:00:00+08:00"},
+                "reason": "check rooms",
+                "call_id": "rooms",
+                "depends_on": [],
+            },
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+                "depends_on": [],
+            },
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for reads",
+            "pending_work": ["check rooms", "search games"],
+            "depends_on_tool_results": True,
+        },
+    )
+
+    action, errors, _ = parse_action_with_repairs(json.dumps(payload, ensure_ascii=False))
+
+    assert errors == []
+    assert [call.call_id for call in action.tool_calls] == ["rooms", "games"]
+    assert action.tool_calls[1].depends_on == []
+
+
+def test_parse_action_repairs_omitted_dependency_but_still_requires_call_id() -> None:
+    payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+                "depends_on": [],
+            },
+            {
+                "name": "search_customers",
+                "arguments": {"requirement": {}},
+                "reason": "search customers",
+            },
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for reads",
+            "pending_work": ["search"],
+            "depends_on_tool_results": True,
+        },
+    )
+
+    _, errors, repairs = parse_action_with_repairs(json.dumps(payload, ensure_ascii=False))
+
+    assert "tool_calls[2].call_id is required in dependency graph mode" in errors
+    assert "tool_calls[2].depends_on is required in dependency graph mode" not in errors
+    assert repairs[-1] == {
+        "field": "tool_calls[2].depends_on",
+        "from": None,
+        "to": [],
+        "reason": "an omitted tool dependency is structurally equivalent to an independent call",
+    }
+
+
+def test_parse_action_repairs_omitted_dependency_for_independent_call() -> None:
+    payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+                "depends_on": [],
+            },
+            {
+                "name": "search_customers",
+                "arguments": {"requirement": {}},
+                "reason": "search customers",
+                "call_id": "customers",
+            },
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for reads",
+            "pending_work": ["search"],
+            "depends_on_tool_results": True,
+        },
+    )
+
+    action, errors, repairs = parse_action_with_repairs(json.dumps(payload, ensure_ascii=False))
+
+    assert errors == []
+    assert action.tool_calls[1].depends_on == []
+    assert repairs[-1]["field"] == "tool_calls[2].depends_on"
+
+
+def test_parse_action_accepts_diagnostic_call_id_without_enabling_graph_mode() -> None:
+    payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+            }
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for read",
+            "pending_work": ["search"],
+            "depends_on_tool_results": True,
+        },
+    )
+
+    action, errors, _ = parse_action_with_repairs(json.dumps(payload, ensure_ascii=False))
+
+    assert errors == []
+    assert action.tool_calls[0].call_id == "games"
+    assert action.tool_calls[0].depends_on is None
+
+
+def test_parse_action_rejects_unknown_and_cyclic_tool_dependencies() -> None:
+    unknown_payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+                "depends_on": ["missing"],
+            }
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for reads",
+            "pending_work": ["search"],
+            "depends_on_tool_results": True,
+        },
+    )
+    cycle_payload = terminal_payload(
+        reply_to_user="",
+        tool_calls=[
+            {
+                "name": "search_current_games",
+                "arguments": {"requirement": {}},
+                "reason": "search games",
+                "call_id": "games",
+                "depends_on": ["customers"],
+            },
+            {
+                "name": "search_customers",
+                "arguments": {"requirement": {}},
+                "reason": "search customers",
+                "call_id": "customers",
+                "depends_on": ["games"],
+            },
+        ],
+        stop_reason={
+            "can_stop": False,
+            "why": "waiting for reads",
+            "pending_work": ["search"],
+            "depends_on_tool_results": True,
+        },
+    )
+
+    _, unknown_errors, _ = parse_action_with_repairs(json.dumps(unknown_payload, ensure_ascii=False))
+    _, cycle_errors, _ = parse_action_with_repairs(json.dumps(cycle_payload, ensure_ascii=False))
+
+    assert unknown_errors == ["tool call games depends on unknown call_id values: missing"]
+    assert cycle_errors == ["tool dependency graph contains a cycle"]

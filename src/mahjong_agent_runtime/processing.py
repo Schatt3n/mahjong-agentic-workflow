@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from .budget import TokenBudget
 from .copywriting import DEFAULT_CUSTOMER_VISIBLE_TEXT_PROMPT_PATH, action_with_customer_visible_rewrites
 from .hooks import HookManager
 from .llm import AgentLLMClient
-from .models import AgentAction, ToolResult, UserMessage
+from .models import AgentAction, ToolCall, ToolResult, UserMessage
 from .runtime_components import ActionProcessingResult, ModelActionStep, TurnBudgets
 from .store import InMemoryAgentStore
 from .tool_consistency import latest_read_requirement, validate_tool_call_consistency
@@ -48,6 +49,15 @@ def input_batch_run_is_stale(store: Any, message: UserMessage) -> bool:
 
 
 @dataclass(slots=True)
+class SingleToolExecution:
+    """One tool outcome plus loop-control signals used by the batch scheduler."""
+
+    result: ToolResult
+    blocked_by_consistency: bool = False
+    blocked_by_stale_run: bool = False
+
+
+@dataclass(slots=True)
 class ToolExecutionService:
     """Execute model-proposed tool calls behind production boundaries."""
 
@@ -55,6 +65,10 @@ class ToolExecutionService:
     tool_gateway: ToolGateway
     trace_recorder: Any
     hook_manager: HookManager | None = None
+    max_parallel_read_tools: int = 4
+
+    def __post_init__(self) -> None:
+        self.max_parallel_read_tools = max(1, int(self.max_parallel_read_tools))
 
     def execute_tool_calls(
         self,
@@ -68,96 +82,40 @@ class ToolExecutionService:
         run_version: int,
         context_payload: dict[str, Any] | None = None,
     ) -> ActionProcessingResult:
-        """Execute tools sequentially and append tool results to short-term memory."""
+        """Execute a legacy sequence or an explicit dependency graph.
 
-        tool_results: list[ToolResult] = []
-        pending_tool_results: list[ToolResult] = []
-        blocked_by_consistency = False
-        blocked_by_stale_run = False
-        for call_index, call in enumerate(action.tool_calls, start=1):
-            consistency_error = validate_tool_call_consistency(
-                call,
-                previous_step_tool_results + pending_tool_results,
-            )
-            if consistency_error:
-                reference_requirement = latest_read_requirement(
-                    previous_step_tool_results + pending_tool_results,
-                    tool_name="search_current_games",
-                )
-                result = ToolResult(
-                    name=call.name,
-                    called=False,
-                    allowed=False,
-                    result={
-                        "instruction": (
-                            "Fix the tool arguments and call the tool again. Preserve explicit requirement fields "
-                            "from previous read-only tool results unless the user has clearly changed them."
-                        ),
-                        "call": call.to_dict(),
-                        "reference_tool_name": "search_current_games",
-                        "reference_requirement": reference_requirement or {},
-                    },
-                    error=consistency_error,
-                )
-                tool_results.append(result)
-                pending_tool_results.append(result)
-                self.trace_recorder.record(
-                    trace_id,
-                    "tool_argument_consistency_error",
-                    {"call": call.to_dict(), "error": consistency_error, "step_index": step_index},
-                    level="WARN",
-                )
-                self.trace_recorder.record(trace_id, "tool_result", result.to_dict(), level="WARN")
-                blocked_by_consistency = True
-                break
+        Calls without complete graph metadata retain the original sequential
+        behavior. In graph mode, only backend-registered parallel-safe read-only
+        calls in the same dependency wave run concurrently. Writes are always
+        serialized, and all results are restored to model-declared order before
+        they are appended to short-term memory.
+        """
 
-            stale_result = self.stale_write_tool_result(
-                call_name=call.name,
+        if self._uses_dependency_graph(action):
+            results_by_index, blocked_by_consistency, blocked_by_stale_run = self._execute_dependency_graph(
+                action,
                 message=message,
+                trace_id=trace_id,
+                previous_step_tool_results=previous_step_tool_results,
+                step_index=step_index,
                 run_id=run_id,
                 run_version=run_version,
+                context_payload=context_payload,
             )
-            if stale_result is not None:
-                tool_results.append(stale_result)
-                pending_tool_results.append(stale_result)
-                self.trace_recorder.record(trace_id, "conversation_run_stale", stale_result.to_dict(), level="WARN")
-                self.trace_recorder.record(trace_id, "tool_result", stale_result.to_dict(), level="WARN")
-                blocked_by_stale_run = True
-                break
+        else:
+            results_by_index, blocked_by_consistency, blocked_by_stale_run = self._execute_legacy_sequence(
+                action,
+                message=message,
+                trace_id=trace_id,
+                previous_step_tool_results=previous_step_tool_results,
+                step_index=step_index,
+                run_id=run_id,
+                run_version=run_version,
+                context_payload=context_payload,
+            )
 
-            self._emit(
-                "before_tool_execute",
-                trace_id=trace_id,
-                payload={"call": call.to_dict(), "step_index": step_index, "call_index": call_index},
-            )
-            self.trace_recorder.record(
-                trace_id,
-                "tool_called",
-                {"call": call.to_dict(), "step_index": step_index},
-            )
-            result = self.tool_gateway.execute(
-                call,
-                trace_id=trace_id,
-                conversation_id=message.conversation_id,
-                sender_id=message.sender_id,
-                sender_name=message.sender_name,
-                step_index=step_index * 100 + call_index,
-                source_message_id=message.message_id,
-                message_reference_contract=dict(
-                    (context_payload or {}).get("message_reference_contract") or {}
-                ),
-            )
-            tool_results.append(result)
-            pending_tool_results.append(result)
-            self.trace_recorder.record(trace_id, "tool_result", result.to_dict())
-            self._emit(
-                "after_tool_execute",
-                trace_id=trace_id,
-                payload={"result": result.to_dict(), "step_index": step_index, "call_index": call_index},
-            )
-            for transition in result.state_transitions:
-                step = "state_transition_replayed" if result.deduplicated else "state_transition"
-                self.trace_recorder.record(trace_id, step, transition.to_dict())
+        tool_results = [results_by_index[index] for index in sorted(results_by_index)]
+        pending_tool_results = list(tool_results)
 
         self.store.append_tool_turn(
             message.conversation_id,
@@ -197,6 +155,368 @@ class ToolExecutionService:
             tool_results=tool_results,
             pending_tool_results=pending_tool_results,
         )
+
+    def _uses_dependency_graph(self, action: AgentAction) -> bool:
+        """Enable graph scheduling only when every call declares complete metadata."""
+
+        return bool(action.tool_calls) and all(
+            bool(call.call_id) and call.depends_on is not None
+            for call in action.tool_calls
+        )
+
+    def _execute_legacy_sequence(
+        self,
+        action: AgentAction,
+        *,
+        message: UserMessage,
+        trace_id: str,
+        previous_step_tool_results: list[ToolResult],
+        step_index: int,
+        run_id: str,
+        run_version: int,
+        context_payload: dict[str, Any] | None,
+    ) -> tuple[dict[int, ToolResult], bool, bool]:
+        """Preserve exact pre-parallel behavior for old model responses and fixtures."""
+
+        results: dict[int, ToolResult] = {}
+        blocked_by_consistency = False
+        blocked_by_stale_run = False
+        for call_index, call in enumerate(action.tool_calls, start=1):
+            observed = previous_step_tool_results + [results[index] for index in sorted(results)]
+            outcome = self._execute_one(
+                call,
+                call_index=call_index,
+                call_id=call.call_id,
+                observed_results=observed,
+                message=message,
+                trace_id=trace_id,
+                step_index=step_index,
+                run_id=run_id,
+                run_version=run_version,
+                context_payload=context_payload,
+            )
+            results[call_index] = outcome.result
+            blocked_by_consistency = blocked_by_consistency or outcome.blocked_by_consistency
+            blocked_by_stale_run = blocked_by_stale_run or outcome.blocked_by_stale_run
+            if outcome.blocked_by_consistency or outcome.blocked_by_stale_run:
+                break
+        return results, blocked_by_consistency, blocked_by_stale_run
+
+    def _execute_dependency_graph(
+        self,
+        action: AgentAction,
+        *,
+        message: UserMessage,
+        trace_id: str,
+        previous_step_tool_results: list[ToolResult],
+        step_index: int,
+        run_id: str,
+        run_version: int,
+        context_payload: dict[str, Any] | None,
+    ) -> tuple[dict[int, ToolResult], bool, bool]:
+        """Execute dependency-ready waves while keeping writes serialized."""
+
+        calls_by_index = {index: call for index, call in enumerate(action.tool_calls, start=1)}
+        remaining = set(calls_by_index)
+        completed_ids: set[str] = set()
+        succeeded_by_id: dict[str, bool] = {}
+        results: dict[int, ToolResult] = {}
+        blocked_by_consistency = False
+        blocked_by_stale_run = False
+        wave_index = 0
+
+        while remaining and not blocked_by_stale_run:
+            dependency_blocked = [
+                index
+                for index in sorted(remaining)
+                if any(
+                    dependency in completed_ids and not succeeded_by_id.get(dependency, False)
+                    for dependency in calls_by_index[index].depends_on or []
+                )
+            ]
+            for index in dependency_blocked:
+                call = calls_by_index[index]
+                failed_dependencies = [
+                    dependency
+                    for dependency in call.depends_on or []
+                    if dependency in completed_ids and not succeeded_by_id.get(dependency, False)
+                ]
+                result = ToolResult(
+                    name=call.name,
+                    called=False,
+                    allowed=False,
+                    call_id=call.call_id,
+                    result={
+                        "failed_dependencies": failed_dependencies,
+                        "instruction": "A prerequisite tool failed. Replan from its result before retrying this call.",
+                    },
+                    error="tool dependency failed: " + ",".join(failed_dependencies),
+                )
+                results[index] = result
+                remaining.remove(index)
+                completed_ids.add(str(call.call_id))
+                succeeded_by_id[str(call.call_id)] = False
+                blocked_by_consistency = True
+                self.trace_recorder.record(trace_id, "tool_dependency_blocked", result.to_dict(), level="WARN")
+
+            if not remaining:
+                break
+            ready = [
+                index
+                for index in sorted(remaining)
+                if set(calls_by_index[index].depends_on or []) <= completed_ids
+            ]
+            if not ready:
+                for index in sorted(remaining):
+                    call = calls_by_index[index]
+                    result = ToolResult(
+                        name=call.name,
+                        called=False,
+                        allowed=False,
+                        call_id=call.call_id,
+                        result={"declared_dependencies": list(call.depends_on or [])},
+                        error="tool dependency graph is unresolved or cyclic",
+                    )
+                    results[index] = result
+                    self.trace_recorder.record(trace_id, "tool_dependency_invalid", result.to_dict(), level="WARN")
+                blocked_by_consistency = True
+                break
+
+            parallel_ready = [index for index in ready if self._is_parallel_safe(calls_by_index[index])]
+            if len(parallel_ready) >= 2 and self.max_parallel_read_tools > 1:
+                batch = parallel_ready
+                execution_mode = "parallel_read"
+            else:
+                batch = [ready[0]]
+                execution_mode = "sequential"
+            wave_index += 1
+            observed = previous_step_tool_results + [results[index] for index in sorted(results)]
+            outcomes = self._execute_wave(
+                batch,
+                calls_by_index=calls_by_index,
+                execution_mode=execution_mode,
+                wave_index=wave_index,
+                observed_results=observed,
+                message=message,
+                trace_id=trace_id,
+                step_index=step_index,
+                run_id=run_id,
+                run_version=run_version,
+                context_payload=context_payload,
+            )
+            for index, outcome in outcomes.items():
+                call = calls_by_index[index]
+                results[index] = outcome.result
+                remaining.remove(index)
+                completed_ids.add(str(call.call_id))
+                succeeded_by_id[str(call.call_id)] = self._tool_result_succeeded(outcome.result)
+                blocked_by_consistency = blocked_by_consistency or outcome.blocked_by_consistency
+                blocked_by_stale_run = blocked_by_stale_run or outcome.blocked_by_stale_run
+        return results, blocked_by_consistency, blocked_by_stale_run
+
+    def _execute_wave(
+        self,
+        call_indices: list[int],
+        *,
+        calls_by_index: dict[int, ToolCall],
+        execution_mode: str,
+        wave_index: int,
+        observed_results: list[ToolResult],
+        message: UserMessage,
+        trace_id: str,
+        step_index: int,
+        run_id: str,
+        run_version: int,
+        context_payload: dict[str, Any] | None,
+    ) -> dict[int, SingleToolExecution]:
+        """Run one graph wave and emit batch-level observability events."""
+
+        started = time.perf_counter()
+        call_ids = [calls_by_index[index].call_id for index in call_indices]
+        self.trace_recorder.record(
+            trace_id,
+            "tool_batch_started",
+            {
+                "step_index": step_index,
+                "wave_index": wave_index,
+                "execution_mode": execution_mode,
+                "call_ids": call_ids,
+                "tool_names": [calls_by_index[index].name for index in call_indices],
+            },
+        )
+        outcomes: dict[int, SingleToolExecution] = {}
+        if execution_mode == "parallel_read":
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_parallel_read_tools, len(call_indices)),
+                thread_name_prefix="agent-read-tool",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._execute_one,
+                        calls_by_index[index],
+                        call_index=index,
+                        call_id=calls_by_index[index].call_id,
+                        observed_results=list(observed_results),
+                        message=message,
+                        trace_id=trace_id,
+                        step_index=step_index,
+                        run_id=run_id,
+                        run_version=run_version,
+                        context_payload=context_payload,
+                    ): index
+                    for index in call_indices
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        outcomes[index] = future.result()
+                    except Exception as exc:
+                        call = calls_by_index[index]
+                        result = ToolResult(
+                            name=call.name,
+                            called=False,
+                            allowed=False,
+                            call_id=call.call_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        outcomes[index] = SingleToolExecution(result=result, blocked_by_consistency=True)
+                        self.trace_recorder.record(
+                            trace_id,
+                            "parallel_tool_worker_failed",
+                            {"call": call.to_dict(), "error": result.error},
+                            level="ERROR",
+                        )
+        else:
+            index = call_indices[0]
+            call = calls_by_index[index]
+            outcomes[index] = self._execute_one(
+                call,
+                call_index=index,
+                call_id=call.call_id,
+                observed_results=observed_results,
+                message=message,
+                trace_id=trace_id,
+                step_index=step_index,
+                run_id=run_id,
+                run_version=run_version,
+                context_payload=context_payload,
+            )
+        self.trace_recorder.record(
+            trace_id,
+            "tool_batch_completed",
+            {
+                "step_index": step_index,
+                "wave_index": wave_index,
+                "execution_mode": execution_mode,
+                "call_ids": call_ids,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                "succeeded": {
+                    str(calls_by_index[index].call_id): self._tool_result_succeeded(outcome.result)
+                    for index, outcome in outcomes.items()
+                },
+            },
+        )
+        return outcomes
+
+    def _execute_one(
+        self,
+        call: ToolCall,
+        *,
+        call_index: int,
+        call_id: str | None,
+        observed_results: list[ToolResult],
+        message: UserMessage,
+        trace_id: str,
+        step_index: int,
+        run_id: str,
+        run_version: int,
+        context_payload: dict[str, Any] | None,
+    ) -> SingleToolExecution:
+        """Validate and execute one call using a stable pre-wave observation."""
+
+        consistency_error = validate_tool_call_consistency(call, observed_results)
+        if consistency_error:
+            reference_requirement = latest_read_requirement(observed_results, tool_name="search_current_games")
+            result = ToolResult(
+                name=call.name,
+                called=False,
+                allowed=False,
+                call_id=call_id,
+                result={
+                    "instruction": (
+                        "Fix the tool arguments and call the tool again. Preserve explicit requirement fields "
+                        "from previous read-only tool results unless the user has clearly changed them."
+                    ),
+                    "call": call.to_dict(),
+                    "reference_tool_name": "search_current_games",
+                    "reference_requirement": reference_requirement or {},
+                },
+                error=consistency_error,
+            )
+            self.trace_recorder.record(
+                trace_id,
+                "tool_argument_consistency_error",
+                {"call": call.to_dict(), "error": consistency_error, "step_index": step_index},
+                level="WARN",
+            )
+            self.trace_recorder.record(trace_id, "tool_result", result.to_dict(), level="WARN")
+            return SingleToolExecution(result=result, blocked_by_consistency=True)
+
+        stale_result = self.stale_write_tool_result(
+            call_name=call.name,
+            message=message,
+            run_id=run_id,
+            run_version=run_version,
+        )
+        if stale_result is not None:
+            stale_result.call_id = call_id
+            self.trace_recorder.record(trace_id, "conversation_run_stale", stale_result.to_dict(), level="WARN")
+            self.trace_recorder.record(trace_id, "tool_result", stale_result.to_dict(), level="WARN")
+            return SingleToolExecution(result=stale_result, blocked_by_stale_run=True)
+
+        self._emit(
+            "before_tool_execute",
+            trace_id=trace_id,
+            payload={"call": call.to_dict(), "step_index": step_index, "call_index": call_index},
+        )
+        self.trace_recorder.record(
+            trace_id,
+            "tool_called",
+            {"call": call.to_dict(), "step_index": step_index, "call_index": call_index},
+        )
+        result = self.tool_gateway.execute(
+            call,
+            trace_id=trace_id,
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+            sender_name=message.sender_name,
+            step_index=step_index * 100 + call_index,
+            source_message_id=message.message_id,
+            message_reference_contract=dict((context_payload or {}).get("message_reference_contract") or {}),
+        )
+        result.call_id = call_id
+        self.trace_recorder.record(trace_id, "tool_result", result.to_dict())
+        self._emit(
+            "after_tool_execute",
+            trace_id=trace_id,
+            payload={"result": result.to_dict(), "step_index": step_index, "call_index": call_index},
+        )
+        for transition in result.state_transitions:
+            transition_step = "state_transition_replayed" if result.deduplicated else "state_transition"
+            self.trace_recorder.record(trace_id, transition_step, transition.to_dict())
+        return SingleToolExecution(result=result)
+
+    def _is_parallel_safe(self, call: ToolCall) -> bool:
+        definition = self.tool_gateway.tools.get(call.name)
+        return bool(
+            definition
+            and definition.execution_mode == "read_only"
+            and definition.parallel_safe
+        )
+
+    @staticmethod
+    def _tool_result_succeeded(result: ToolResult) -> bool:
+        return bool(result.called and result.allowed and not result.error)
 
     def stale_write_tool_result(
         self,

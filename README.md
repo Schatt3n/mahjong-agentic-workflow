@@ -198,6 +198,19 @@ handle user message
 
 所有有副作用的工具都会经过 schema、主体权限、资源归属、状态机、幂等和并发版本校验。
 
+### 工具依赖图与并行执行
+
+主模型可以为同一步的工具调用声明 `call_id` 和 `depends_on`。后端校验依赖图无重复 ID、未知依赖或环，再按依赖波次执行：
+
+- `check_room_availability`、`search_current_games`、`search_customers` 是后端注册的 `parallel_safe + read_only` 工具，同一波且无依赖时可并行。
+- `create_game`、`record_candidate_reply`、草稿与审计写入始终串行，模型不能通过参数绕过。
+- 前置工具失败时，依赖它的调用不会执行，失败链作为 `ToolResult` 回馈模型重新规划。
+- 并行完成顺序不影响上下文；所有结果按模型原始声明顺序重排后再回喂。
+- 依赖图中所有调用必须有唯一 `call_id`；省略/返回 `null` 的 `depends_on` 统一归一化为 `[]`，未知依赖、自依赖和环仍会被拒绝。
+- 旧模型输出若没有依赖元数据，保持原有串行语义，不猜测调用间关系。
+
+并发度默认为 `4`，可通过 `MAHJONG_AGENT_MAX_PARALLEL_READ_TOOLS` 调整。该优化对网络/外部查询工具价值最大；当前端到端延迟仍主要受外部 LLM 调用影响。
+
 ### 未来预约与定时招募
 
 未来预约不是把一句“明天再问”留在模型记忆里，而是立即写入业务状态和持久化任务：
@@ -279,6 +292,9 @@ MAHJONG_LLM_MAX_CONCURRENCY=3
 # 主 Agent 单次输入预算。工具结果回喂后的多轮规划需要预留足够空间；
 # 摘要阈值、每轮调用次数和总预算仍会独立限制无界消耗。
 MAHJONG_AGENT_MAX_TOKENS_PER_CALL=32000
+
+# 同一 Agent 步内最多并行执行的后端授权只读工具数
+MAHJONG_AGENT_MAX_PARALLEL_READ_TOOLS=4
 
 # 推荐为写入 API 配置鉴权；不要提交真实 token
 MAHJONG_AGENT_API_TOKEN=<local-api-token>
@@ -497,12 +513,12 @@ PYTHONPATH=src python scripts/run_privacy_isolation_live_eval.py \
 
 最近一次完整验证结果（2026-07-19，`deepseek-v4-flash`）：
 
-- 自动化测试：`292 passed, 1 skipped`
+- 自动化测试：`303 passed, 1 skipped`
 - Agent 确定性回归：`138/138`
 - 真实 DeepSeek 老板对话场景：`11/11`
 - 真实 DeepSeek 跨会话隐私场景：`10/10`，共 `30` 次模型调用，无隐私泄露、人工降级或合同错误
 - 确定性并发竞争场景：`8/8`，每类 `40` 次并发操作
-- 真实 DeepSeek 并发场景：`22/22`，`85` 次模型调用，模型调用失败 `0`
+- 真实 DeepSeek 并发场景：`22/22`，`81` 次模型调用，模型调用失败 `0`
 - 供应商请求并发：配置上限 `3`，实测峰值 `3`，最大等待 `1`
 - badcase 回归覆盖：`fixed=24, open=0`
 
@@ -510,8 +526,8 @@ PYTHONPATH=src python scripts/run_privacy_isolation_live_eval.py \
 
 | 指标 | P50 | P95 | P99 | 最大值 | 样本量 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 单次模型调用延迟 | `4.49s` | `8.54s` | `9.91s` | `9.91s` | `85` 次调用 |
-| 端到端场景延迟 | `17.97s` | `29.53s` | `33.51s` | `33.51s` | `22` 个场景 |
+| 单次模型调用延迟 | `4.91s` | `8.44s` | `10.50s` | `10.50s` | `81` 次调用 |
+| 端到端场景延迟 | `18.75s` | `29.81s` | `30.61s` | `30.61s` | `22` 个场景 |
 
 `P95` 表示 95% 的样本延迟不高于该值，`P99` 同理表示 99% 分位。上表是本地 MacBook 运行 Agent、通过网络调用外部 DeepSeek API 得到的小样本回归基线，用于发现迭代退化，不等同于生产容量压测结果或 SLA 承诺。当前 P95/P99 主要受外部模型网络延迟、多轮工具结果回喂、话术生成和客户可见内容审查的串行调用影响。
 

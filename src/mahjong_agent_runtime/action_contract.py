@@ -55,6 +55,28 @@ def normalize_action_contract(payload: dict[str, Any]) -> tuple[dict[str, Any], 
 
     normalized = dict(payload)
     repairs: list[dict[str, Any]] = []
+    raw_tool_calls = normalized.get("tool_calls")
+    if isinstance(raw_tool_calls, list):
+        graph_mode = any(isinstance(raw_call, dict) and "depends_on" in raw_call for raw_call in raw_tool_calls)
+        if graph_mode:
+            normalized_calls: list[Any] = []
+            for index, raw_call in enumerate(raw_tool_calls, start=1):
+                if not isinstance(raw_call, dict):
+                    normalized_calls.append(raw_call)
+                    continue
+                call = dict(raw_call)
+                if call.get("depends_on") is None:
+                    call["depends_on"] = []
+                    repairs.append(
+                        {
+                            "field": f"tool_calls[{index}].depends_on",
+                            "from": None,
+                            "to": [],
+                            "reason": "an omitted tool dependency is structurally equivalent to an independent call",
+                        }
+                    )
+                normalized_calls.append(call)
+            normalized["tool_calls"] = normalized_calls
     raw_plan = normalized.get("objective_plan")
     if isinstance(raw_plan, list):
         normalized_plan: list[Any] = []
@@ -179,6 +201,15 @@ def validate_action_contract(payload: dict[str, Any]) -> list[str]:
             errors.append(f"tool_calls[{index}].reason is required")
         if "idempotency_key" in call and call.get("idempotency_key") is not None and not isinstance(call.get("idempotency_key"), str):
             errors.append(f"tool_calls[{index}].idempotency_key must be string or null")
+        if "call_id" in call and (not isinstance(call.get("call_id"), str) or not call.get("call_id", "").strip()):
+            errors.append(f"tool_calls[{index}].call_id must be non-empty string")
+        if "depends_on" in call:
+            dependencies = call.get("depends_on")
+            if not isinstance(dependencies, list):
+                errors.append(f"tool_calls[{index}].depends_on must be array")
+            elif any(not isinstance(item, str) or not item.strip() for item in dependencies):
+                errors.append(f"tool_calls[{index}].depends_on items must be non-empty strings")
+    errors.extend(validate_tool_dependency_contract(payload.get("tool_calls") or []))
     status = payload.get("objective_status")
     tool_calls = payload.get("tool_calls") or []
     reply = payload.get("reply_to_user")
@@ -195,6 +226,74 @@ def validate_action_contract(payload: dict[str, Any]) -> list[str]:
         errors.append("needs_human objective_status requires needs_human=true")
     if payload.get("needs_human") is True and status != "needs_human":
         errors.append("needs_human=true requires objective_status=needs_human")
+    return errors
+
+
+def validate_tool_dependency_contract(raw_calls: Any) -> list[str]:
+    """Validate the optional per-action tool dependency graph.
+
+    Legacy actions without graph metadata remain valid and execute
+    sequentially. Once any call declares dependencies, every call must have a
+    unique call_id. Missing dependency arrays are normalized to [] before this
+    validation because an omitted edge means the call declared no prerequisite.
+    """
+
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return []
+    calls = [item for item in raw_calls if isinstance(item, dict)]
+    # A model may attach a diagnostic call_id to a single legacy call while
+    # omitting an empty dependency list. That does not authorize parallelism
+    # and is safe to execute sequentially. Graph mode starts only when the
+    # model explicitly declares at least one depends_on field.
+    graph_mode = any("depends_on" in item for item in calls)
+    if not graph_mode:
+        return []
+
+    errors: list[str] = []
+    call_ids: list[str] = []
+    for index, call in enumerate(calls, start=1):
+        call_id = call.get("call_id")
+        depends_on = call.get("depends_on")
+        if not isinstance(call_id, str) or not call_id.strip():
+            errors.append(f"tool_calls[{index}].call_id is required in dependency graph mode")
+        else:
+            call_ids.append(call_id)
+        if not isinstance(depends_on, list):
+            errors.append(f"tool_calls[{index}].depends_on is required in dependency graph mode")
+
+    duplicate_ids = sorted({item for item in call_ids if call_ids.count(item) > 1})
+    if duplicate_ids:
+        errors.append("tool call_id values must be unique: " + ",".join(duplicate_ids))
+    if errors:
+        return errors
+    known_ids = set(call_ids)
+    dependencies_by_id: dict[str, set[str]] = {}
+    for call in calls:
+        call_id = call.get("call_id")
+        dependencies = call.get("depends_on")
+        if not isinstance(call_id, str) or not call_id.strip() or not isinstance(dependencies, list):
+            continue
+        dependency_ids = {item for item in dependencies if isinstance(item, str) and item.strip()}
+        unknown = sorted(dependency_ids - known_ids)
+        if unknown:
+            errors.append(f"tool call {call_id} depends on unknown call_id values: {','.join(unknown)}")
+        if call_id in dependency_ids:
+            errors.append(f"tool call {call_id} must not depend on itself")
+        # Unknown identifiers have already produced a precise error above. Do
+        # not leave them in the cycle detector, otherwise one malformed edge
+        # would also be reported as an unrelated graph cycle.
+        dependencies_by_id[call_id] = dependency_ids & known_ids
+
+    remaining = {key: set(value) for key, value in dependencies_by_id.items()}
+    resolved: set[str] = set()
+    while remaining:
+        ready = [key for key, dependencies in remaining.items() if dependencies <= resolved]
+        if not ready:
+            errors.append("tool dependency graph contains a cycle")
+            break
+        for key in ready:
+            resolved.add(key)
+            remaining.pop(key, None)
     return errors
 
 

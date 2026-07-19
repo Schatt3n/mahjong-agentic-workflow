@@ -54,6 +54,7 @@ class AgentRuntime:
     consecutive_no_progress_limit: int = 2
     max_progress_replans: int = 1
     max_cycle_period: int = 3
+    max_parallel_read_tools: int = 4
     llm_timeout_seconds: float = 45.0
     context_summary_preemptive_ratio: float = 0.85
     task_context_idle_seconds: int = 4 * 60 * 60
@@ -99,6 +100,7 @@ class AgentRuntime:
             tool_gateway=self.tool_gateway,
             trace_recorder=self.trace_recorder,
             hook_manager=self.hook_manager,
+            max_parallel_read_tools=self.max_parallel_read_tools,
         )
         self.action_processor = ActionProcessor(
             llm_client=self.llm_client,

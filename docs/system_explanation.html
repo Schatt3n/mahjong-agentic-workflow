@@ -838,6 +838,15 @@ return reverse(selected)</pre>
   }
 }</pre>
         <p>这是通用的“读后写一致性”保护，不是针对一句话写的 if-else。</p>
+
+        <h3>11.6 无依赖只读工具如何并行</h3>
+        <p>模型在同一步中为工具调用提供唯一 <code>call_id</code> 和 <code>depends_on</code>。后端校验依赖图后按波次执行；只有注册为 <code>read_only + parallel_safe</code> 的工具才能在同波线程池中并行。当前允许并行的是房态查询、现有局查询和候选人查询。建局、修改参与者、草稿与审计写入始终串行。</p>
+        <pre>[
+  {"call_id":"rooms", "depends_on":[], "name":"check_room_availability"},
+  {"call_id":"games", "depends_on":[], "name":"search_current_games"},
+  {"call_id":"create", "depends_on":["rooms","games"], "name":"create_game"}
+]</pre>
+        <p>前置失败时，后续依赖不执行，失败证据会回喂模型重新规划。并行完成顺序不影响上下文，结果会按模型原始调用顺序重排。依赖图中每个调用都必须有唯一 <code>call_id</code>；省略或返回 <code>null</code> 的 <code>depends_on</code> 会归一化为空依赖，而未知依赖、自依赖和环仍会被拒绝。旧输出未声明依赖时仍串行，不由后端猜测。trace 使用 <code>tool_batch_started</code> 和 <code>tool_batch_completed</code> 记录波次与耗时。</p>
       </section>
 
       <section id="memory">
@@ -1792,6 +1801,7 @@ post_turn_summary_result</pre>
           <tr><td><code>MAHJONG_AGENT_MAX_CALLS_PER_TURN</code></td><td>8</td><td>单条用户消息的模型调用预算</td></tr>
           <tr><td><code>MAHJONG_LLM_MAX_COMPLETION_TOKENS</code></td><td>1600</td><td>主模型最大生成长度</td></tr>
           <tr><td><code>MAHJONG_LLM_MAX_CONCURRENCY</code></td><td>3</td><td>主供应商并发槽</td></tr>
+          <tr><td><code>MAHJONG_AGENT_MAX_PARALLEL_READ_TOOLS</code></td><td>4</td><td>单个 Agent 步内并行只读工具上限</td></tr>
           <tr><td><code>MAHJONG_LLM_FALLBACK_MAX_CONCURRENCY</code></td><td>2</td><td>fallback 并发槽</td></tr>
           <tr><td><code>MAHJONG_INPUT_QUIET_PERIOD_SECONDS</code></td><td>30s</td><td>碎片输入静默窗口</td></tr>
           <tr><td><code>MAHJONG_WECHATY_INPUT_GATE_TIMEOUT_SECONDS</code></td><td>12s</td><td>输入门禁超时</td></tr>

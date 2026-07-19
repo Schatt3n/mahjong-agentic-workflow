@@ -218,6 +218,7 @@ def build_runtime() -> AgentRuntime:
         consecutive_no_progress_limit=env_int("MAHJONG_AGENT_NO_PROGRESS_LIMIT", 2),
         max_progress_replans=env_int("MAHJONG_AGENT_MAX_PROGRESS_REPLANS", 1),
         max_cycle_period=env_int("MAHJONG_AGENT_MAX_CYCLE_PERIOD", 3),
+        max_parallel_read_tools=env_int("MAHJONG_AGENT_MAX_PARALLEL_READ_TOOLS", 4),
         llm_timeout_seconds=float(env_int("MAHJONG_AGENT_LLM_TIMEOUT_SECONDS", 45)),
         context_summary_preemptive_ratio=env_float("MAHJONG_CONTEXT_SUMMARY_PREEMPTIVE_RATIO", 0.85),
         customer_visible_text_generation_enabled=env_bool("MAHJONG_TEXT_GENERATION_ENABLED", True),
