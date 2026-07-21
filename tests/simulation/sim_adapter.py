@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ SQLITE_LOCK_MARKERS = (
     "database table is locked",
     "database schema is locked",
 )
+MENTION_PATTERN = re.compile(r"@([\u4e00-\u9fa5a-zA-Z0-9]+)")
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,6 +69,7 @@ class RequestOutcome:
     error: str = ""
     sent_at: float | None = None
     inbox_deliveries: int = 0
+    next_speaker_only: str | None = None
 
     @property
     def sqlite_lock_error(self) -> bool:
@@ -87,7 +90,7 @@ class StaticAgentLLMClient:
             self.call_count += 1
         payload = self._context_payload(messages)
         previous_tool_results = payload.get("previous_tool_results") or []
-        action = self._terminal_action() if previous_tool_results else self._tool_action()
+        action = self._terminal_action(payload) if previous_tool_results else self._tool_action()
         return json.dumps(action, ensure_ascii=False)
 
     @staticmethod
@@ -147,7 +150,10 @@ class StaticAgentLLMClient:
         }
 
     @staticmethod
-    def _terminal_action() -> dict[str, Any]:
+    def _terminal_action(payload: dict[str, Any]) -> dict[str, Any]:
+        current_message = payload.get("current_message") or {}
+        sender_name = str(current_message.get("sender_name") or "").strip()
+        reply = f"@{sender_name} 你几点方便？" if sender_name else "你几点方便？"
         return {
             "goal": "查询当前可用麻将局",
             "objective_status": "completed",
@@ -169,7 +175,7 @@ class StaticAgentLLMClient:
                 }
             ],
             "plan_revision_reason": "收到只读工具结果后生成固定模拟回复。",
-            "reply_to_user": "我看一下。",
+            "reply_to_user": reply,
             "tool_calls": [],
             "needs_human": False,
             "stop_reason": {
@@ -300,10 +306,16 @@ class SimulationAdapter:
         self.base_url = base_url.rstrip("/")
         self.request_timeout_seconds = max(0.1, float(request_timeout_seconds))
         self._user_ids = [user.customer_id for user in users]
+        self._user_ids_by_name: dict[str, list[str]] = {}
+        for user in users:
+            self._user_ids_by_name.setdefault(user.display_name, []).append(user.customer_id)
         self._inboxes: dict[str, list[InboxMessage]] = {
             customer_id: [] for customer_id in self._user_ids
         }
         self._inbox_lock = threading.Lock()
+        self._turn_lock = threading.Lock()
+        self._next_speaker_only: dict[str, str] = {}
+        self._speaker_lock_acquired_at: dict[str, float] = {}
 
     def inbox_for(self, customer_id: str) -> list[InboxMessage]:
         with self._inbox_lock:
@@ -312,6 +324,64 @@ class SimulationAdapter:
     def inbox_sizes(self) -> dict[str, int]:
         with self._inbox_lock:
             return {customer_id: len(messages) for customer_id, messages in self._inboxes.items()}
+
+    def next_speaker_only(self, conversation_id: str) -> str | None:
+        """Return the user currently holding the next turn for a conversation."""
+
+        with self._turn_lock:
+            return self._next_speaker_only.get(conversation_id)
+
+    def expired_speaker_locks(
+        self,
+        timeout_seconds: float,
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, str]]:
+        """Snapshot locks old enough for the orchestrator's timeout safety valve."""
+
+        current = time.monotonic() if now is None else now
+        with self._turn_lock:
+            return [
+                (conversation_id, user_id)
+                for conversation_id, user_id in self._next_speaker_only.items()
+                if current - self._speaker_lock_acquired_at.get(conversation_id, current)
+                >= timeout_seconds
+            ]
+
+    def seconds_until_lock_timeout(
+        self,
+        timeout_seconds: float,
+        *,
+        now: float | None = None,
+    ) -> float | None:
+        current = time.monotonic() if now is None else now
+        with self._turn_lock:
+            if not self._next_speaker_only:
+                return None
+            return max(
+                0.0,
+                min(
+                    timeout_seconds
+                    - (current - self._speaker_lock_acquired_at.get(conversation_id, current))
+                    for conversation_id in self._next_speaker_only
+                ),
+            )
+
+    def release_speaker_lock(
+        self,
+        conversation_id: str,
+        *,
+        expected_user_id: str | None = None,
+    ) -> bool:
+        """Release a turn lock, optionally only when it still belongs to a user."""
+
+        with self._turn_lock:
+            current = self._next_speaker_only.get(conversation_id)
+            if current is None or (expected_user_id is not None and current != expected_user_id):
+                return False
+            self._next_speaker_only.pop(conversation_id, None)
+            self._speaker_lock_acquired_at.pop(conversation_id, None)
+            return True
 
     def send(self, action: SimulationAction, *, deadline: float) -> RequestOutcome:
         payload = action.to_wechat_payload()
@@ -365,6 +435,7 @@ class SimulationAdapter:
     def _deliver_reply(self, outcome: RequestOutcome) -> int:
         reply = str(outcome.response.get("final_reply") or "")
         trace_id = str(outcome.response.get("trace_id") or "")
+        outcome.next_speaker_only = self._update_next_speaker(outcome.action.conversation_id, reply)
         recipients = self._user_ids if outcome.action.channel == "group" else [outcome.action.sender_id]
         received_at = time.time()
         with self._inbox_lock:
@@ -381,3 +452,24 @@ class SimulationAdapter:
                     )
                 )
         return len(recipients)
+
+    def _update_next_speaker(self, conversation_id: str, reply: str) -> str | None:
+        """Translate an Agent ``@nickname`` into a conversation-scoped turn lock."""
+
+        mentioned_user_id: str | None = None
+        for nickname in MENTION_PATTERN.findall(reply):
+            matches = self._user_ids_by_name.get(nickname, [])
+            if len(matches) == 1:
+                mentioned_user_id = matches[0]
+                break
+
+        with self._turn_lock:
+            if mentioned_user_id is None:
+                # A reply without a resolvable mention is a broadcast.  It must
+                # release any previous lock so all users can compete fairly.
+                self._next_speaker_only.pop(conversation_id, None)
+                self._speaker_lock_acquired_at.pop(conversation_id, None)
+                return None
+            self._next_speaker_only[conversation_id] = mentioned_user_id
+            self._speaker_lock_acquired_at[conversation_id] = time.monotonic()
+            return mentioned_user_id

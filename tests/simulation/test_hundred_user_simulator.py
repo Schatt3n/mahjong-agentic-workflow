@@ -4,6 +4,7 @@ import json
 import sqlite3
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,13 @@ SIMULATION_DIR = Path(__file__).resolve().parent
 if str(SIMULATION_DIR) not in sys.path:
     sys.path.insert(0, str(SIMULATION_DIR))
 
-from behavior_policy import BehaviorPolicy, QUESTION_POOL, SimulationAction  # noqa: E402
+from behavior_policy import (  # noqa: E402
+    FOLLOW_UP_REPLY_POOL,
+    NEW_TOPIC_POOL,
+    BehaviorPolicy,
+    QUESTION_POOL,
+    SimulationAction,
+)
 from hundred_user_simulator import HundredUserSimulator, parse_speed  # noqa: E402
 from sim_adapter import (  # noqa: E402
     RequestOutcome,
@@ -32,7 +39,7 @@ from sim_factory import (  # noqa: E402
     build_population,
     ensure_isolated_database,
 )
-from sim_orchestrator import RateLimiter, SimulationOrchestrator  # noqa: E402
+from sim_orchestrator import DialogState, RateLimiter, SimulationOrchestrator  # noqa: E402
 
 
 def _users() -> list[VirtualUser]:
@@ -71,6 +78,49 @@ class _LockedAdapter:
 class _UnusedAdapter(_LockedAdapter):
     def send(self, action: SimulationAction, *, deadline: float) -> RequestOutcome:  # pragma: no cover
         raise AssertionError("duration limit should stop before the first scheduled action")
+
+
+class _ExpiredLockAdapter(_LockedAdapter):
+    def __init__(self, users: list[VirtualUser], locked_user_id: str) -> None:
+        super().__init__(users)
+        self.conversation_id = f"sim:group:{GROUP_ID}"
+        self.locked_user_id = locked_user_id
+        self.sent_actions: list[SimulationAction] = []
+
+    def next_speaker_only(self, conversation_id: str) -> str | None:
+        return self.locked_user_id if conversation_id == self.conversation_id else None
+
+    def expired_speaker_locks(self, timeout_seconds: float):
+        del timeout_seconds
+        return [(self.conversation_id, self.locked_user_id)] if self.locked_user_id else []
+
+    def seconds_until_lock_timeout(self, timeout_seconds: float) -> float | None:
+        del timeout_seconds
+        return 0.0 if self.locked_user_id else None
+
+    def release_speaker_lock(
+        self,
+        conversation_id: str,
+        *,
+        expected_user_id: str | None = None,
+    ) -> bool:
+        if conversation_id != self.conversation_id:
+            return False
+        if expected_user_id is not None and expected_user_id != self.locked_user_id:
+            return False
+        self.locked_user_id = ""
+        return True
+
+    def send(self, action: SimulationAction, *, deadline: float) -> RequestOutcome:
+        del deadline
+        self.sent_actions.append(action)
+        return RequestOutcome(
+            action=action,
+            sent=True,
+            status_code=200,
+            response={"trace_id": "trace_timeout", "final_reply": "收到"},
+            sent_at=time.monotonic(),
+        )
 
 
 def test_population_factory_is_deterministic_and_isolated(tmp_path: Path) -> None:
@@ -154,6 +204,39 @@ def test_behavior_policy_uses_personas_typos_recalls_and_eighty_twenty_channels(
         channels.append(action.channel)
     group_ratio = channels.count("group") / len(channels)
     assert 0.78 <= group_ratio <= 0.82
+
+
+def test_behavior_policy_uses_dialog_state_for_follow_up_or_silence() -> None:
+    users = _users()
+    active = next(user for user in users if user.persona == PERSONA_ACTIVE_GAMBLER)
+    policy = BehaviorPolicy(users, seed=42)
+    state = DialogState(
+        turn_count=1,
+        pending_response_to="user",
+        last_agent_reply=f"@{active.display_name} 你几点方便？",
+        last_conversation_id=f"sim:group:{GROUP_ID}",
+        last_channel="group",
+    )
+
+    action = policy.get_next_action(
+        active,
+        sequence=101,
+        due_simulated_seconds=20.0,
+        dialog_state=state,
+    )
+    assert action is not None
+    assert action.text in FOLLOW_UP_REPLY_POOL
+    assert action.channel == "group"
+    assert action.conversation_id == f"sim:group:{GROUP_ID}"
+
+    state.last_agent_reply = "好的，我看一下。"
+    next_action = policy.get_next_action(
+        active,
+        sequence=102,
+        due_simulated_seconds=30.0,
+        dialog_state=state,
+    )
+    assert next_action is None or next_action.text in NEW_TOPIC_POOL
 
 
 def test_wechat_payload_contains_raw_channel_fields() -> None:
@@ -248,6 +331,89 @@ def test_adapter_broadcasts_group_replies_and_private_replies() -> None:
     assert len(adapter.inbox_for(users[1].customer_id)) == 1
 
 
+def test_adapter_extracts_mentions_and_broadcast_reply_releases_turn_lock() -> None:
+    users = _users()
+    adapter = SimulationAdapter(base_url="http://127.0.0.1:1", users=users)
+    conversation_id = f"sim:group:{GROUP_ID}"
+    action = SimulationAction(
+        due_simulated_seconds=1.0,
+        sequence=1,
+        channel="group",
+        conversation_id=conversation_id,
+        sender_id=users[80].customer_id,
+        sender_name=users[80].display_name,
+        text="还有位置吗",
+    )
+    mentioned = users[81]
+    mentioned_outcome = RequestOutcome(
+        action=action,
+        sent=True,
+        status_code=200,
+        response={"trace_id": "trace_mention", "final_reply": f"@{mentioned.display_name} 几点来？"},
+    )
+    adapter._deliver_reply(mentioned_outcome)
+    assert mentioned_outcome.next_speaker_only == mentioned.customer_id
+    assert adapter.next_speaker_only(conversation_id) == mentioned.customer_id
+
+    broadcast_outcome = RequestOutcome(
+        action=action,
+        sent=True,
+        status_code=200,
+        response={"trace_id": "trace_broadcast", "final_reply": "大家都可以说"},
+    )
+    adapter._deliver_reply(broadcast_outcome)
+    assert broadcast_outcome.next_speaker_only is None
+    assert adapter.next_speaker_only(conversation_id) is None
+
+
+def test_orchestrator_only_dispatches_the_mentioned_group_user(tmp_path: Path) -> None:
+    users = _users()
+    adapter = SimulationAdapter(base_url="http://127.0.0.1:1", users=users)
+    policy = BehaviorPolicy(users, seed=42)
+    orchestrator = SimulationOrchestrator(
+        users=users,
+        behavior_policy=policy,
+        adapter=adapter,
+        max_messages=2,
+        max_duration_seconds=1,
+        speed=1000,
+        report_path=tmp_path / "unused.json",
+    )
+    conversation_id = f"sim:group:{GROUP_ID}"
+    target = users[81]
+    other = users[80]
+    lock_action = SimulationAction(
+        due_simulated_seconds=0.0,
+        sequence=1,
+        channel="group",
+        conversation_id=conversation_id,
+        sender_id=other.customer_id,
+        sender_name=other.display_name,
+        text="测试",
+    )
+    adapter._deliver_reply(
+        RequestOutcome(
+            action=lock_action,
+            sent=True,
+            status_code=200,
+            response={"final_reply": f"@{target.display_name} 确认一下？"},
+        )
+    )
+    orchestrator._enqueue_action(replace(lock_action, sequence=2))
+    orchestrator._enqueue_action(
+        replace(
+            lock_action,
+            sequence=3,
+            sender_id=target.customer_id,
+            sender_name=target.display_name,
+        )
+    )
+
+    selected = orchestrator._take_dispatchable_action(time.monotonic() - 1)
+    assert selected is not None
+    assert selected.sender_id == target.customer_id
+
+
 def test_mock_http_simulation_generates_complete_report_and_inboxes(tmp_path: Path) -> None:
     store, users = build_population(tmp_path / "test_sim.db", seed=42)
     runtime, client = build_runtime(store, "mock")
@@ -272,6 +438,88 @@ def test_mock_http_simulation_generates_complete_report_and_inboxes(tmp_path: Pa
     assert report["has_empty_final_reply"] is False
     assert report["users_with_inbox_messages"] == 100
     assert client.call_count == 20
+
+
+def test_mock_http_conversation_reaches_turn_limit_and_reports_completion(tmp_path: Path) -> None:
+    store, generated_users = build_population(tmp_path / "test_sim.db", seed=42)
+    active_id = generated_users[80].customer_id
+    users = [
+        replace(
+            user,
+            persona=(PERSONA_ACTIVE_GAMBLER if user.customer_id == active_id else PERSONA_LURKER),
+        )
+        for user in generated_users
+    ]
+    runtime, _ = build_runtime(store, "mock")
+    report_path = tmp_path / "multi_turn_report.json"
+    with running_http_backend(runtime) as base_url:
+        simulator = HundredUserSimulator(
+            users=users,
+            base_url=base_url,
+            max_messages=10,
+            max_duration_seconds=1.5,
+            speed=1000.0,
+            report_path=report_path,
+        )
+        report = simulator.run()
+
+    state = simulator.orchestrator.active_sessions[active_id]
+    assert report["total_messages"] == 5
+    assert state.turn_count == 5
+    assert state.status == "idle"
+    assert state.pending_response_to is None
+    assert report["sessions_with_at_least_3_turns"] == 1
+    assert report["multi_turn_completion_rate"] == 1.0
+    assert report["average_dialog_turns"] == 5.0
+    assert report["timeout_broken_sessions"] == 0
+
+
+def test_expired_turn_lock_forces_silence_and_counts_broken_session(tmp_path: Path) -> None:
+    users = _users()
+    locked_user = users[0]
+    adapter = _ExpiredLockAdapter(users, locked_user.customer_id)
+    orchestrator = SimulationOrchestrator(
+        users=users,
+        behavior_policy=BehaviorPolicy(users, seed=42),
+        adapter=adapter,  # type: ignore[arg-type]
+        max_messages=1,
+        max_duration_seconds=1,
+        speed=1000,
+        lock_timeout_seconds=0.01,
+        report_path=tmp_path / "timeout_report.json",
+    )
+    report = orchestrator.run()
+
+    assert len(adapter.sent_actions) == 1
+    assert adapter.sent_actions[0].text == "（沉默/退出）"
+    assert adapter.sent_actions[0].event_type == "timeout_exit"
+    assert orchestrator.active_sessions[locked_user.customer_id].status == "idle"
+    assert report["timeout_broken_sessions"] == 1
+
+
+def test_timeout_exit_can_bypass_a_stuck_inflight_request(tmp_path: Path) -> None:
+    users = _users()
+    locked_user = users[0]
+    adapter = _ExpiredLockAdapter(users, locked_user.customer_id)
+    orchestrator = SimulationOrchestrator(
+        users=users,
+        behavior_policy=BehaviorPolicy(users, seed=42),
+        adapter=adapter,  # type: ignore[arg-type]
+        max_messages=2,
+        max_duration_seconds=1,
+        speed=1,
+        lock_timeout_seconds=0.01,
+        report_path=tmp_path / "unused_timeout_report.json",
+    )
+    orchestrator._inflight_conversations.add(adapter.conversation_id)
+    orchestrator._inflight_users.add(locked_user.customer_id)
+    started = time.monotonic() - 1
+    orchestrator._enqueue_expired_lock_actions(started)
+
+    selected = orchestrator._take_dispatchable_action(started)
+    assert selected is not None
+    assert selected.event_type == "timeout_exit"
+    assert selected.text == "（沉默/退出）"
 
 
 def test_orchestrator_fails_after_five_consecutive_sqlite_locks(tmp_path: Path) -> None:

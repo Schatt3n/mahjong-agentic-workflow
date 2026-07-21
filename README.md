@@ -447,9 +447,9 @@ PYTHONPATH=src python scripts/run_evals.py
 | 层级 | 文件 | 职责 |
 | --- | --- | --- |
 | 人口工厂 | `sim_factory.py` | 使用 Faker 生成 100 个中文用户、余额和川麻/国标偏好，写入专用 `test_sim.db`，并创建包含全部用户的单一群聊 |
-| 行为大脑 | `behavior_policy.py` | 固定分配 80 个潜水用户、15 个每 10 个模拟秒询问一次的活跃用户、5 个发送错别字和撤回事件的异常用户 |
-| 调度引擎 | `sim_orchestrator.py` | 使用 `PriorityQueue`、最多 10 个发送线程和全局滑动窗口限流，支持 `--speed=10x`，执行 500 条/120 秒/连续 5 次 SQLite 锁错误三类停止条件 |
-| 双向适配器 | `sim_adapter.py` | 发送 WeChaty 形态 HTTP Payload，接收序列化 `AgentRuntimeResult`，将群回复广播到群成员 inbox、私聊回复写入发送者 inbox |
+| 行为大脑 | `behavior_policy.py` | 固定分配 80 个潜水用户、15 个每 10 个模拟秒行动的活跃用户、5 个发送错别字和撤回事件的异常用户；依据 `DialogState` 从首轮问题、承接回复、新话题或静默中选择下一步 |
+| 调度引擎 | `sim_orchestrator.py` | 使用 `PriorityQueue`、最多 10 个发送线程和全局滑动窗口限流，维护每个用户的轮次及等待状态；同一用户和同一会话严格串行，支持 `--speed=10x`，执行消息数/时长/SQLite 连续锁错误三类停止条件 |
+| 双向适配器 | `sim_adapter.py` | 发送 WeChaty 形态 HTTP Payload，接收序列化 `AgentRuntimeResult`，将群回复广播到群成员 inbox、私聊回复写入发送者 inbox，并从 `@昵称` 建立会话级下一发言人锁 |
 
 默认压测必须显式选择 mock 模型，不会读取 API Key，也不会构造真实模型客户端：
 
@@ -459,7 +459,9 @@ SIM_LLM_MODE=mock PYTHONPATH=src \
   python tests/simulation/hundred_user_simulator.py --speed=10x
 ```
 
-全局 Agent 调用被硬限制为每秒最多 5 次，因此完整 500 条运行至少约 100 秒，`--speed` 只加速剧本时钟，不绕过成本保护。结果写入 `tests/simulation/sim_report.json`，测试状态库固定为 `tests/simulation/test_sim.db`，两者均已加入 `.gitignore`。报告包含总消息数、群聊/私聊数量、平均/P95/P99 时延、工具成功率、SQLite 锁错误、空回复、inbox 投递数量和停止原因。
+多轮调度遵循“先收到 Agent 回复，再生成用户下一轮”的顺序。Agent 回复包含问号、`几点`、`几人` 或 `确认` 时，用户会从次轮回复池中承接；群回复包含 `@昵称` 时，只有该用户可以继续发言，广播回复会释放锁。单用户最多进行 5 轮；发言锁超过 10 秒会发送一次“（沉默/退出）”并强制解锁。
+
+全局 Agent 调用被硬限制为每秒最多 5 次，因此完整 500 条运行至少约 100 秒，`--speed` 只加速剧本时钟，不绕过成本保护。结果写入 `tests/simulation/sim_report.json`，测试状态库固定为 `tests/simulation/test_sim.db`，两者均已加入 `.gitignore`。报告包含总消息数、群聊/私聊数量、平均/P95/P99 时延、工具成功率、SQLite 锁错误、空回复、inbox 投递数量、三轮以上会话数、多轮完成率、平均对话轮次、超时断裂会话数和停止原因。
 
 只有明确设置 `SIM_LLM_MODE=real` 才会创建真实模型客户端并产生费用：
 

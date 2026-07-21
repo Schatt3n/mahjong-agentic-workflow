@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 try:  # Package import under pytest, direct import when the CLI file is executed.
     from .sim_factory import (
@@ -46,6 +46,49 @@ QUESTION_POOL: tuple[str, ...] = (
     "今天房间满了吗",
     "能不能帮我找两个人",
 )
+
+# The first-turn pool keeps the original 20 high-frequency Mahjong questions.
+# Follow-up messages are deliberately short fragments, because they represent a
+# user answering the Agent rather than opening another independent topic.
+FIRST_TURN_QUESTION_POOL = QUESTION_POOL
+FOLLOW_UP_REPLY_POOL: tuple[str, ...] = (
+    "晚上七点左右",
+    "现在就可以",
+    "我一个人",
+    "我们两个",
+    "0.5，无烟",
+    "一块也可以",
+    "四个小时",
+    "五个小时都行",
+    "确认，可以",
+    "对，就按这个来",
+    "可以，帮我问问",
+    "都可以，你看着安排",
+)
+NEW_TOPIC_POOL: tuple[str, ...] = (
+    "对了，今晚还有别的局吗",
+    "明天中午有人打吗",
+    "有无烟的再叫我",
+    "川麻那桌还缺人吗",
+    "现在最快几点能开",
+    "包间还有空的吗",
+)
+QUESTION_CUES = ("?", "？", "几点", "几人", "确认")
+
+
+class DialogStateView(Protocol):
+    """Read-only shape consumed by the behavior layer.
+
+    ``DialogState`` itself lives in the orchestrator so one simulation run owns
+    one consistent state registry.  A protocol avoids coupling the behavior
+    layer back to the scheduler module.
+    """
+
+    turn_count: int
+    pending_response_to: str | None
+    last_agent_reply: str
+    last_conversation_id: str | None
+    last_channel: str | None
 
 
 @dataclass(slots=True, order=True, frozen=True)
@@ -127,21 +170,42 @@ class BehaviorPolicy:
         *,
         sequence: int,
         due_simulated_seconds: float,
+        dialog_state: DialogStateView | None = None,
     ) -> SimulationAction | None:
         if user.persona == PERSONA_LURKER:
             return None
-        channel = "group" if self.random.random() < 0.80 else "private"
-        conversation_id = (
-            f"sim:group:{GROUP_ID}"
-            if channel == "group"
-            else f"sim:private:{user.customer_id}"
-        )
+
+        turn_count = int(getattr(dialog_state, "turn_count", 0))
+        last_agent_reply = str(getattr(dialog_state, "last_agent_reply", "") or "")
+        is_answering_agent = turn_count >= 1 and reply_requires_user(last_agent_reply)
+
+        if turn_count == 0:
+            text = self.random.choice(FIRST_TURN_QUESTION_POOL)
+        elif is_answering_agent:
+            text = self._follow_up_reply(last_agent_reply)
+        else:
+            # A non-question reply closes the current exchange.  The user may
+            # start a fresh topic, or remain silent for this scheduling cycle.
+            if self.random.random() < 0.50:
+                return None
+            text = self.random.choice(NEW_TOPIC_POOL)
+
+        previous_conversation_id = getattr(dialog_state, "last_conversation_id", None)
+        previous_channel = getattr(dialog_state, "last_channel", None)
+        if is_answering_agent and previous_conversation_id and previous_channel:
+            channel = str(previous_channel)
+            conversation_id = str(previous_conversation_id)
+        else:
+            channel = "group" if self.random.random() < 0.80 else "private"
+            conversation_id = (
+                f"sim:group:{GROUP_ID}"
+                if channel == "group"
+                else f"sim:private:{user.customer_id}"
+            )
 
         event_type = "text"
         recalled_message_id: str | None = None
-        if user.persona == PERSONA_ACTIVE_GAMBLER:
-            text = "还有位置吗"
-        else:
+        if user.persona == PERSONA_TROUBLEMAKER:
             turn = self._trouble_turn.get(user.customer_id, 0) + 1
             self._trouble_turn[user.customer_id] = turn
             recalled_action = self._last_text_message.get(user.customer_id)
@@ -169,22 +233,46 @@ class BehaviorPolicy:
             self._last_text_message[user.customer_id] = action
         return action
 
-    def first_action(self, user: VirtualUser, *, sequence: int) -> SimulationAction | None:
+    def first_action(
+        self,
+        user: VirtualUser,
+        *,
+        sequence: int,
+        dialog_state: DialogStateView | None = None,
+    ) -> SimulationAction | None:
         return self.get_next_action(
             user,
             sequence=sequence,
             due_simulated_seconds=self.interval_for(user),
+            dialog_state=dialog_state,
         ) if user.persona != PERSONA_LURKER else None
 
-    def following_action(self, user: VirtualUser, previous: SimulationAction, *, sequence: int) -> SimulationAction:
+    def following_action(
+        self,
+        user: VirtualUser,
+        previous: SimulationAction,
+        *,
+        sequence: int,
+        dialog_state: DialogStateView | None = None,
+    ) -> SimulationAction | None:
         action = self.get_next_action(
             user,
             sequence=sequence,
             due_simulated_seconds=previous.due_simulated_seconds + self.interval_for(user),
+            dialog_state=dialog_state,
         )
-        if action is None:  # Defensive: callers only schedule speaking personas.
-            raise ValueError("cannot schedule a following action for a lurker")
         return action
+
+    def _follow_up_reply(self, agent_reply: str) -> str:
+        if "几点" in agent_reply:
+            candidates = FOLLOW_UP_REPLY_POOL[0:2]
+        elif "几人" in agent_reply:
+            candidates = FOLLOW_UP_REPLY_POOL[2:4]
+        elif "确认" in agent_reply:
+            candidates = FOLLOW_UP_REPLY_POOL[8:10]
+        else:
+            candidates = FOLLOW_UP_REPLY_POOL[4:]
+        return self.random.choice(candidates)
 
     @staticmethod
     def _with_typo(text: str) -> str:
@@ -200,3 +288,10 @@ class BehaviorPolicy:
             if source in text:
                 return text.replace(source, target, 1)
         return f"{text}。。"
+
+
+def reply_requires_user(reply: str) -> bool:
+    """Whether an Agent reply explicitly asks the user for another turn."""
+
+    normalized = str(reply or "")
+    return any(cue in normalized for cue in QUESTION_CUES)

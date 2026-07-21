@@ -7,13 +7,14 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, PriorityQueue
 from typing import Callable
 
 try:
-    from .behavior_policy import BehaviorPolicy, SimulationAction
+    from .behavior_policy import BehaviorPolicy, SimulationAction, reply_requires_user
     from .sim_adapter import RequestOutcome, SimulationAdapter
     from .sim_factory import (
         DEFAULT_USER_COUNT,
@@ -23,7 +24,7 @@ try:
         VirtualUser,
     )
 except ImportError:  # pragma: no cover - direct script execution path
-    from behavior_policy import BehaviorPolicy, SimulationAction  # type: ignore
+    from behavior_policy import BehaviorPolicy, SimulationAction, reply_requires_user  # type: ignore
     from sim_adapter import RequestOutcome, SimulationAdapter  # type: ignore
     from sim_factory import (  # type: ignore
         DEFAULT_USER_COUNT,
@@ -40,6 +41,20 @@ DEFAULT_RATE_LIMIT = 5
 DEFAULT_WORKERS = 10
 DEFAULT_SPEED = 1.0
 DEFAULT_REPORT_PATH = Path(__file__).with_name("sim_report.json")
+MAX_DIALOG_TURNS = 5
+LOCK_TIMEOUT = 10.0
+
+
+@dataclass(slots=True)
+class DialogState:
+    """Conversation state owned by one virtual user within a simulation run."""
+
+    turn_count: int = 0
+    pending_response_to: str | None = None
+    last_agent_reply: str = ""
+    status: str = "active"
+    last_conversation_id: str | None = None
+    last_channel: str | None = None
 
 
 class RateLimiter:
@@ -119,6 +134,8 @@ class SimulationOrchestrator:
         rate_limit: int = DEFAULT_RATE_LIMIT,
         speed: float = DEFAULT_SPEED,
         report_path: Path = DEFAULT_REPORT_PATH,
+        max_dialog_turns: int = MAX_DIALOG_TURNS,
+        lock_timeout_seconds: float = LOCK_TIMEOUT,
     ) -> None:
         if len(users) != DEFAULT_USER_COUNT:
             raise ValueError("SimulationOrchestrator requires exactly 100 virtual users")
@@ -126,6 +143,10 @@ class SimulationOrchestrator:
             raise ValueError("max_workers must be between 1 and 10")
         if speed <= 0:
             raise ValueError("speed must be positive")
+        if max_dialog_turns < 1:
+            raise ValueError("max_dialog_turns must be positive")
+        if lock_timeout_seconds <= 0:
+            raise ValueError("lock_timeout_seconds must be positive")
         self.users = list(users)
         self.users_by_id = {user.customer_id: user for user in users}
         self.behavior_policy = behavior_policy
@@ -136,10 +157,22 @@ class SimulationOrchestrator:
         self.max_workers = int(max_workers)
         self.speed = float(speed)
         self.report_path = report_path
+        self.max_dialog_turns = int(max_dialog_turns)
+        self.lock_timeout_seconds = float(lock_timeout_seconds)
         self.rate_limiter = RateLimiter(max_calls=rate_limit)
         self.stop_event = threading.Event()
         self._schedule: PriorityQueue[SimulationAction] = PriorityQueue()
         self._next_sequence = 1
+        self.active_sessions: dict[str, DialogState] = {
+            user.customer_id: DialogState() for user in users
+        }
+        self._inflight_conversations: set[str] = set()
+        self._inflight_users: set[str] = set()
+        self._queued_sequences_by_user: dict[str, set[int]] = {}
+        self._cancelled_sequences: set[int] = set()
+        self._timeout_actions_pending: set[str] = set()
+        self._timeout_broken_user_ids: set[str] = set()
+        self._timeout_broken_conversation_ids: set[str] = set()
 
     def run(self) -> dict[str, object]:
         started_at = datetime.now(timezone.utc)
@@ -161,24 +194,27 @@ class SimulationOrchestrator:
                     stop_reason = "duration_limit"
                     self.stop_event.set()
 
+                if not self.stop_event.is_set() and submitted < self.max_messages:
+                    self._enqueue_expired_lock_actions(started_monotonic)
+
                 while (
                     not self.stop_event.is_set()
                     and submitted < self.max_messages
                     and len(futures) < self.max_workers
                 ):
-                    try:
-                        action = self._schedule.get_nowait()
-                    except Empty:
-                        break
-                    due_at = started_monotonic + action.due_simulated_seconds / self.speed
-                    if time.monotonic() < due_at:
-                        self._schedule.put(action)
+                    action = self._take_dispatchable_action(started_monotonic)
+                    if action is None:
                         break
                     future = executor.submit(self._send_with_rate_limit, action, deadline)
                     futures[future] = action
+                    if action.event_type != "timeout_exit":
+                        self._inflight_conversations.add(action.conversation_id)
+                        self._inflight_users.add(action.sender_id)
+                    state = self.active_sessions[action.sender_id]
+                    state.pending_response_to = "agent"
+                    state.last_conversation_id = action.conversation_id
+                    state.last_channel = action.channel
                     submitted += 1
-                    if submitted < self.max_messages:
-                        self._schedule_following(action)
 
                 if submitted >= self.max_messages and not futures:
                     stop_reason = "message_limit"
@@ -196,6 +232,9 @@ class SimulationOrchestrator:
                 completed: list[RequestOutcome] = []
                 for future in done:
                     action = futures.pop(future)
+                    if action.event_type != "timeout_exit":
+                        self._inflight_conversations.discard(action.conversation_id)
+                        self._inflight_users.discard(action.sender_id)
                     try:
                         outcome = future.result()
                     except Exception as exc:  # Keep the run observable instead of crashing the reporter.
@@ -220,6 +259,12 @@ class SimulationOrchestrator:
                     if consecutive_lock_errors >= 5:
                         stop_reason = "sqlite_lock_failure"
                         self.stop_event.set()
+                    self._advance_dialog_after_outcome(
+                        outcome,
+                        allow_schedule=(
+                            not self.stop_event.is_set() and submitted < self.max_messages
+                        ),
+                    )
 
             if stop_reason != "sqlite_lock_failure" and len(outcomes) < self.max_messages:
                 stop_reason = "duration_limit"
@@ -239,6 +284,10 @@ class SimulationOrchestrator:
             max_workers=self.max_workers,
             rate_limit=self.rate_limiter.max_calls,
             speed=self.speed,
+            active_sessions=self.active_sessions,
+            timeout_broken_user_ids=self._timeout_broken_user_ids,
+            max_dialog_turns=self.max_dialog_turns,
+            lock_timeout_seconds=self.lock_timeout_seconds,
             stop_reason=stop_reason,
             max_consecutive_lock_errors=max_consecutive_lock_errors,
             started_at=started_at,
@@ -254,9 +303,13 @@ class SimulationOrchestrator:
 
     def _seed_schedule(self) -> None:
         for user in self.behavior_policy.speaking_users():
-            action = self.behavior_policy.first_action(user, sequence=self._claim_sequence())
+            action = self.behavior_policy.first_action(
+                user,
+                sequence=self._claim_sequence(),
+                dialog_state=self.active_sessions[user.customer_id],
+            )
             if action is not None:
-                self._schedule.put(action)
+                self._enqueue_action(action)
 
     def _schedule_following(self, previous: SimulationAction) -> None:
         user = self.users_by_id[previous.sender_id]
@@ -264,8 +317,200 @@ class SimulationOrchestrator:
             user,
             previous,
             sequence=self._claim_sequence(),
+            dialog_state=self.active_sessions[user.customer_id],
         )
+        if action is not None:
+            self._enqueue_action(action)
+
+    def _advance_dialog_after_outcome(
+        self,
+        outcome: RequestOutcome,
+        *,
+        allow_schedule: bool,
+    ) -> None:
+        """Apply one HTTP result before selecting the user's next utterance."""
+
+        action = outcome.action
+        state = self.active_sessions[action.sender_id]
+        state.turn_count += 1
+        state.last_conversation_id = action.conversation_id
+        state.last_channel = action.channel
+
+        if action.event_type == "timeout_exit":
+            state.pending_response_to = None
+            state.status = "idle"
+            self._cancel_queued_actions_for_user(action.sender_id)
+            self._timeout_actions_pending.discard(action.conversation_id)
+            self._release_speaker_lock(action.conversation_id)
+            return
+
+        if action.conversation_id in self._timeout_broken_conversation_ids:
+            # A late network response must not revive a dialogue already closed
+            # by the lock timeout safety valve.
+            state.pending_response_to = None
+            state.status = "idle"
+            self._release_speaker_lock(action.conversation_id)
+            return
+
+        if not (200 <= outcome.status_code < 300):
+            state.pending_response_to = None
+            state.status = "idle"
+            return
+
+        reply = str(outcome.response.get("final_reply") or "")
+        state.last_agent_reply = reply
+        mentioned_user_id = outcome.next_speaker_only
+
+        if mentioned_user_id and mentioned_user_id != action.sender_id:
+            state.pending_response_to = None
+            state.status = "idle"
+            if allow_schedule:
+                self._schedule_mentioned_user(mentioned_user_id, outcome)
+            return
+
+        if state.turn_count >= self.max_dialog_turns:
+            state.pending_response_to = None
+            state.status = "idle"
+            self._release_speaker_lock(action.conversation_id, action.sender_id)
+            return
+
+        state.pending_response_to = "user" if reply_requires_user(reply) else None
+        state.status = "active"
+        if not allow_schedule:
+            return
+        before = len(self._queued_sequences_by_user.get(action.sender_id, set()))
+        self._schedule_following(action)
+        after = len(self._queued_sequences_by_user.get(action.sender_id, set()))
+        if after == before:
+            state.status = "idle"
+
+    def _schedule_mentioned_user(
+        self,
+        mentioned_user_id: str,
+        outcome: RequestOutcome,
+    ) -> None:
+        """Replace stale queued speech with a reply from the mentioned user."""
+
+        target = self.users_by_id.get(mentioned_user_id)
+        if target is None:
+            return
+        state = self.active_sessions[mentioned_user_id]
+        if state.turn_count >= self.max_dialog_turns:
+            state.status = "idle"
+            self._release_speaker_lock(outcome.action.conversation_id, mentioned_user_id)
+            return
+        state.status = "active"
+        state.pending_response_to = "user"
+        state.last_agent_reply = str(outcome.response.get("final_reply") or "")
+        state.last_conversation_id = outcome.action.conversation_id
+        state.last_channel = outcome.action.channel
+        self._cancel_queued_actions_for_user(mentioned_user_id)
+        action = self.behavior_policy.following_action(
+            target,
+            outcome.action,
+            sequence=self._claim_sequence(),
+            dialog_state=state,
+        )
+        if action is not None:
+            self._enqueue_action(action)
+
+    def _enqueue_action(self, action: SimulationAction) -> None:
         self._schedule.put(action)
+        self._queued_sequences_by_user.setdefault(action.sender_id, set()).add(action.sequence)
+
+    def _cancel_queued_actions_for_user(self, user_id: str) -> None:
+        sequences = self._queued_sequences_by_user.pop(user_id, set())
+        self._cancelled_sequences.update(sequences)
+
+    def _forget_queued_action(self, action: SimulationAction) -> None:
+        sequences = self._queued_sequences_by_user.get(action.sender_id)
+        if not sequences:
+            return
+        sequences.discard(action.sequence)
+        if not sequences:
+            self._queued_sequences_by_user.pop(action.sender_id, None)
+
+    def _take_dispatchable_action(self, started_monotonic: float) -> SimulationAction | None:
+        """Pick a due action without violating per-user or per-conversation order."""
+
+        deferred: list[SimulationAction] = []
+        selected: SimulationAction | None = None
+        now = time.monotonic()
+        scan_limit = self._schedule.qsize()
+        for _ in range(scan_limit):
+            try:
+                action = self._schedule.get_nowait()
+            except Empty:
+                break
+            if action.sequence in self._cancelled_sequences:
+                self._cancelled_sequences.discard(action.sequence)
+                self._forget_queued_action(action)
+                continue
+            due_at = started_monotonic + action.due_simulated_seconds / self.speed
+            if now < due_at:
+                deferred.append(action)
+                break
+            state = self.active_sessions[action.sender_id]
+            if action.event_type != "timeout_exit" and state.status == "idle":
+                self._forget_queued_action(action)
+                continue
+            next_speaker = self._next_speaker_only(action.conversation_id)
+            blocked = action.event_type != "timeout_exit" and (
+                action.conversation_id in self._inflight_conversations
+                or action.sender_id in self._inflight_users
+                or (next_speaker is not None and next_speaker != action.sender_id)
+            )
+            if blocked:
+                deferred.append(action)
+                continue
+            selected = action
+            self._forget_queued_action(action)
+            break
+        for action in deferred:
+            self._schedule.put(action)
+        return selected
+
+    def _enqueue_expired_lock_actions(self, started_monotonic: float) -> None:
+        expired_method = getattr(self.adapter, "expired_speaker_locks", None)
+        if not callable(expired_method):
+            return
+        for conversation_id, user_id in expired_method(self.lock_timeout_seconds):
+            if conversation_id in self._timeout_actions_pending:
+                continue
+            user = self.users_by_id.get(user_id)
+            if user is None:
+                self._release_speaker_lock(conversation_id, user_id)
+                continue
+            self._cancel_queued_actions_for_user(user_id)
+            channel = "group" if ":group:" in conversation_id else "private"
+            due_simulated_seconds = max(
+                0.0,
+                (time.monotonic() - started_monotonic) * self.speed,
+            )
+            self._enqueue_action(
+                SimulationAction(
+                    due_simulated_seconds=due_simulated_seconds,
+                    sequence=self._claim_sequence(),
+                    channel=channel,
+                    conversation_id=conversation_id,
+                    sender_id=user_id,
+                    sender_name=user.display_name,
+                    text="（沉默/退出）",
+                    event_type="timeout_exit",
+                )
+            )
+            self._timeout_actions_pending.add(conversation_id)
+            self._timeout_broken_user_ids.add(user_id)
+            self._timeout_broken_conversation_ids.add(conversation_id)
+
+    def _next_speaker_only(self, conversation_id: str) -> str | None:
+        method = getattr(self.adapter, "next_speaker_only", None)
+        return method(conversation_id) if callable(method) else None
+
+    def _release_speaker_lock(self, conversation_id: str, user_id: str | None = None) -> None:
+        method = getattr(self.adapter, "release_speaker_lock", None)
+        if callable(method):
+            method(conversation_id, expected_user_id=user_id)
 
     def _claim_sequence(self) -> int:
         sequence = self._next_sequence
@@ -282,6 +527,11 @@ class SimulationOrchestrator:
     def _next_wait_timeout(self, started: float, deadline: float, has_futures: bool) -> float:
         remaining = max(0.01, deadline - time.monotonic())
         timeout = min(0.05 if has_futures else 0.2, remaining)
+        lock_wait_method = getattr(self.adapter, "seconds_until_lock_timeout", None)
+        if callable(lock_wait_method):
+            lock_wait = lock_wait_method(self.lock_timeout_seconds)
+            if lock_wait is not None:
+                timeout = min(timeout, max(0.001, lock_wait))
         try:
             action = self._schedule.get_nowait()
         except Empty:
@@ -310,6 +560,10 @@ def build_report(
     max_workers: int,
     rate_limit: int,
     speed: float,
+    active_sessions: dict[str, DialogState],
+    timeout_broken_user_ids: set[str],
+    max_dialog_turns: int,
+    lock_timeout_seconds: float,
     stop_reason: str,
     max_consecutive_lock_errors: int,
     started_at: datetime,
@@ -338,6 +592,18 @@ def build_report(
         PERSONA_ACTIVE_GAMBLER: sum(user.persona == PERSONA_ACTIVE_GAMBLER for user in users),
         PERSONA_TROUBLEMAKER: sum(user.persona == PERSONA_TROUBLEMAKER for user in users),
     }
+    started_sessions = [state for state in active_sessions.values() if state.turn_count > 0]
+    completed_multiturn_sessions = [state for state in started_sessions if state.turn_count >= 3]
+    average_dialog_turns = (
+        round(sum(state.turn_count for state in started_sessions) / len(started_sessions), 2)
+        if started_sessions
+        else 0.0
+    )
+    completion_rate = (
+        round(len(completed_multiturn_sessions) / len(started_sessions), 4)
+        if started_sessions
+        else 0.0
+    )
     return {
         "status": "failed" if stop_reason == "sqlite_lock_failure" else "completed",
         "stop_reason": stop_reason,
@@ -353,6 +619,8 @@ def build_report(
             "max_workers": max_workers,
             "rate_limit_per_second": rate_limit,
             "speed": speed,
+            "max_dialog_turns": max_dialog_turns,
+            "lock_timeout_seconds": lock_timeout_seconds,
         },
         "persona_counts": persona_counts,
         "total_messages": len(outcomes),
@@ -378,6 +646,27 @@ def build_report(
         "inbox_delivery_count": sum(item.inbox_deliveries for item in outcomes),
         "users_with_inbox_messages": sum(size > 0 for size in inbox_sizes.values()),
         "inbox_sizes": inbox_sizes,
+        "multi_turn_conversations": {
+            "started_sessions": len(started_sessions),
+            "sessions_with_at_least_3_turns": len(completed_multiturn_sessions),
+            "completion_rate": completion_rate,
+            "average_dialog_turns": average_dialog_turns,
+            "timeout_broken_sessions": len(timeout_broken_user_ids),
+        },
+        "multi_turn_completion_rate": completion_rate,
+        "sessions_with_at_least_3_turns": len(completed_multiturn_sessions),
+        "average_dialog_turns": average_dialog_turns,
+        "timeout_broken_sessions": len(timeout_broken_user_ids),
+        "dialog_states": {
+            user_id: {
+                "turn_count": state.turn_count,
+                "pending_response_to": state.pending_response_to,
+                "status": state.status,
+                "last_conversation_id": state.last_conversation_id,
+            }
+            for user_id, state in active_sessions.items()
+            if state.turn_count > 0 or state.last_agent_reply
+        },
         "errors": [
             {
                 "sequence": item.action.sequence,
