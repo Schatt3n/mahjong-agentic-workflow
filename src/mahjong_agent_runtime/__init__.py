@@ -12,9 +12,7 @@ from .coordination import (
 )
 from .hooks import HookEvent, HookManager
 from .input_aggregation import InputBatchDispatch, PendingInputScheduler, aggregate_pending_input_batch
-from .lifecycle import ContextLifecycleManager
 from .llm import AgentLLMConfig, OpenAICompatibleAgentClient, StaticAgentClient
-from .loop import AgentLoop
 from .models import (
     AgentAction,
     AgentRuntimeResult,
@@ -38,7 +36,7 @@ from .models import (
     ToolResult,
     UserMessage,
 )
-from .processing import ActionProcessor, ToolExecutionService
+from .services import ActionProcessor, AgentLoop, ContextLifecycleManager, ToolExecutionService
 from .progress import ProgressDecision, ProgressMonitor, detect_tail_cycle, stable_fingerprint
 from .runtime import AgentRuntime
 from .scheduled_tasks import ScheduledAgentTaskScheduler
@@ -55,7 +53,7 @@ from .stores import (
     TaskStore,
 )
 from .summary import ContextSummaryManager, ContextSummaryPolicy, ContextSummaryResult
-from .tools import ToolGateway
+from .domains.tools import ToolGateway
 from .tracing import InMemoryTraceRecorder, JsonlTraceRecorder, validate_trace
 
 
