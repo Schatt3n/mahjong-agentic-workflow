@@ -39,6 +39,11 @@ from .models import (
     new_id,
     now,
 )
+from .stores.idempotency_common import (
+    IDEMPOTENCY_CLAIM_LEASE_SECONDS,
+    tool_result_is_in_progress,
+)
+from .stores.memory.idempotency import InMemoryIdempotencyStoreMixin
 
 
 DEFAULT_ASAP_GAME_TTL_HOURS = 4
@@ -49,7 +54,6 @@ START_KIND_ASAP_WHEN_FULL = "asap_" "when_full"
 DURATION_KIND_OVERNIGHT = "overnight"
 PENDING_INPUT_PROCESSING_LEASE_SECONDS = 120
 SCHEDULED_TASK_PROCESSING_LEASE_SECONDS = 120
-IDEMPOTENCY_CLAIM_LEASE_SECONDS = 120
 DEFAULT_RECRUITMENT_LEAD_HOURS = 2
 GAME_RECRUITMENT_TASK_TYPE = "activate_game_recruitment"
 
@@ -368,17 +372,8 @@ def pending_input_batch_key(conversation_id: str, sender_id: str) -> str:
     return f"{conversation_id or 'default'}\x1f{sender_id or 'unknown'}"
 
 
-def tool_result_is_in_progress(result: ToolResult) -> bool:
-    return bool(
-        not result.called
-        and result.allowed
-        and isinstance(result.result, dict)
-        and result.result.get("idempotency_status") == "claimed"
-    )
-
-
 @dataclass(slots=True)
-class InMemoryAgentStore:
+class InMemoryAgentStore(InMemoryIdempotencyStoreMixin):
     customers: dict[str, CustomerProfile] = field(default_factory=dict)
     customer_relationships: dict[str, CustomerRelationship] = field(default_factory=dict)
     games: dict[str, Game] = field(default_factory=dict)
@@ -1235,52 +1230,6 @@ class InMemoryAgentStore:
             )
             self.transitions.append(transition)
             return task, transition
-
-    def idempotent_result(self, key: str | None) -> ToolResult | None:
-        with self._lock:
-            normalized_key = key or ""
-            existing = self.idempotency_ledger.get(normalized_key)
-            claimed_at = self.idempotency_claimed_at.get(normalized_key)
-            if existing is not None and tool_result_is_in_progress(existing) and claimed_at is not None:
-                if claimed_at <= now() - timedelta(seconds=IDEMPOTENCY_CLAIM_LEASE_SECONDS):
-                    self.idempotency_ledger.pop(normalized_key, None)
-                    self.idempotency_claimed_at.pop(normalized_key, None)
-                    return None
-            return existing
-
-    def claim_idempotent_result(self, key: str | None, claimed_result: ToolResult) -> tuple[bool, ToolResult | None]:
-        if not key:
-            return True, None
-        with self._lock:
-            existing = self.idempotency_ledger.get(key)
-            if existing is not None:
-                claimed_at = self.idempotency_claimed_at.get(key)
-                if not (
-                    tool_result_is_in_progress(existing)
-                    and claimed_at is not None
-                    and claimed_at <= now() - timedelta(seconds=IDEMPOTENCY_CLAIM_LEASE_SECONDS)
-                ):
-                    return False, existing
-            self.idempotency_ledger[key] = claimed_result
-            self.idempotency_claimed_at[key] = now()
-            return True, None
-
-    def remember_result(self, key: str | None, result: ToolResult) -> None:
-        if not key:
-            return
-        with self._lock:
-            self.idempotency_ledger[key] = result
-            self.idempotency_claimed_at.pop(key, None)
-
-    def idempotent_message_result(self, message_id: str | None) -> AgentRuntimeResult | None:
-        with self._lock:
-            return self.message_results.get(message_id or "")
-
-    def remember_message_result(self, message_id: str | None, result: AgentRuntimeResult) -> None:
-        if not message_id:
-            return
-        with self._lock:
-            self.message_results.setdefault(message_id, result)
 
     def upsert_pending_input_fragment(
         self,
