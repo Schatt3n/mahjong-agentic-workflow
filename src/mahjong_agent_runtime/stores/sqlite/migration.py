@@ -284,6 +284,31 @@ class SQLiteMigrationStoreMixin:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS runtime_channel_observations(
+                channel TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                room_topic TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                is_room INTEGER NOT NULL DEFAULT 0,
+                self_message INTEGER NOT NULL DEFAULT 0,
+                route_status TEXT NOT NULL,
+                route_mode TEXT NOT NULL,
+                route_reason TEXT NOT NULL,
+                semantic_action TEXT NOT NULL,
+                semantic_category TEXT NOT NULL,
+                semantic_confidence REAL NOT NULL DEFAULT 0,
+                business_message_detected INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(channel, source_message_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_runtime_turns_conversation_id ON runtime_conversation_turns(conversation_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_a ON runtime_customer_relationships(customer_a_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_b ON runtime_customer_relationships(customer_b_id);
@@ -317,6 +342,12 @@ class SQLiteMigrationStoreMixin:
                 ON runtime_group_game_claims(game_id, customer_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_channel_switch_active
                 ON runtime_channel_switches(customer_id, room_id, status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_channel_observations_room_time
+                ON runtime_channel_observations(room_id, received_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_channel_observations_topic_time
+                ON runtime_channel_observations(room_topic, received_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_channel_observations_semantic_time
+                ON runtime_channel_observations(semantic_action, received_at);
             """
         )
         self._migrate_conversation_task_indexes()

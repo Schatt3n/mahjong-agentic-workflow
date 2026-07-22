@@ -442,6 +442,159 @@ def record_wechaty_raw_message(payload: dict) -> dict:
     )
 
 
+def build_wechaty_channel_observation(
+    *,
+    payload: dict,
+    record: dict,
+    route_result: dict | None = None,
+    route_error: Exception | None = None,
+) -> dict:
+    """Build the normalized archive row without turning it into Agent memory."""
+
+    room_id, room_topic = _wechaty_room_identity(payload)
+    message_text, _ = text_from_wechaty_payload(payload)
+    raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    talker = payload.get("talker") if isinstance(payload.get("talker"), dict) else {}
+    route_payload = route_result if isinstance(route_result, dict) else {}
+    audit = route_payload.get("audit") if isinstance(route_payload.get("audit"), dict) else {}
+    observation = (
+        route_payload.get("observation")
+        if isinstance(route_payload.get("observation"), dict)
+        else {}
+    )
+    semantic_decision = (
+        observation.get("semantic_decision")
+        if isinstance(observation.get("semantic_decision"), dict)
+        else audit.get("input_gate")
+        if isinstance(audit.get("input_gate"), dict)
+        else {}
+    )
+    if route_error is not None:
+        route_status = "route_failed"
+        route_mode = "failed"
+    elif route_result is None:
+        route_status = "received"
+        route_mode = "pending"
+    elif bool(route_payload.get("observe_only")):
+        route_status = "analyzed"
+        route_mode = "observe_only"
+    elif bool(route_payload.get("managed_group")):
+        route_status = "processed"
+        route_mode = "managed_group"
+    elif bool(route_payload.get("routed_to_agent")):
+        route_status = "processed"
+        route_mode = "agent"
+    else:
+        route_status = "analyzed"
+        route_mode = "filtered"
+    semantic_action = str(semantic_decision.get("action") or "")
+    semantic_category = str(semantic_decision.get("category") or "")
+    business_detected = bool(observation.get("business_message_detected")) or semantic_action == "process_business"
+    route_reason = type(route_error).__name__ if route_error is not None else str(audit.get("reason") or "")
+    return {
+        "channel": "wechaty",
+        "source_message_id": str(record.get("source_message_id") or ""),
+        "trace_id": str(record.get("trace_id") or ""),
+        "conversation_id": str(payload.get("conversation_id") or ""),
+        "room_id": room_id,
+        "room_topic": room_topic,
+        "sender_id": str(payload.get("sender_id") or raw_payload.get("talkerId") or ""),
+        "sender_name": (
+            str(payload.get("sender_name") or "").strip()
+            or _wechaty_nested_text(talker, "alias")
+            or _wechaty_nested_text(talker, "name")
+            or _wechaty_nested_text(talker, "payload", "alias")
+            or _wechaty_nested_text(talker, "payload", "name")
+        ),
+        "text": message_text,
+        "message_type": str(payload.get("message_type") or raw_payload.get("type") or ""),
+        "is_room": bool(payload.get("is_room")),
+        "self_message": bool(payload.get("self_message")),
+        "route_status": route_status,
+        "route_mode": route_mode,
+        "route_reason": route_reason,
+        "semantic_action": semantic_action,
+        "semantic_category": semantic_category,
+        "semantic_confidence": semantic_decision.get("confidence") or 0.0,
+        "business_message_detected": business_detected,
+        "received_at": str(record.get("received_at") or ""),
+        "payload": {
+            "raw_payload": payload,
+            "route_result": route_payload,
+            "route_error": (
+                {"type": type(route_error).__name__, "message": str(route_error)}
+                if route_error is not None
+                else None
+            ),
+            "raw_log_path": str(WECHATY_RAW_LOG_PATH),
+        },
+    }
+
+
+def persist_wechaty_channel_observation(
+    runtime: AgentRuntime,
+    *,
+    payload: dict,
+    record: dict,
+    route_result: dict | None = None,
+    route_error: Exception | None = None,
+) -> dict:
+    """Idempotently persist one channel message and its latest route outcome."""
+
+    observation = build_wechaty_channel_observation(
+        payload=payload,
+        record=record,
+        route_result=route_result,
+        route_error=route_error,
+    )
+    stored = runtime.store.upsert_channel_observation(observation)
+    runtime.trace_recorder.record(
+        str(record.get("trace_id") or ""),
+        "wechaty_channel_observation_persisted",
+        {
+            "source_message_id": stored["source_message_id"],
+            "conversation_id": stored["conversation_id"],
+            "room_id": stored["room_id"],
+            "room_topic": stored["room_topic"],
+            "route_status": stored["route_status"],
+            "route_mode": stored["route_mode"],
+            "semantic_action": stored["semantic_action"],
+        },
+    )
+    return stored
+
+
+def ingest_wechaty_raw_message(payload: dict) -> dict:
+    """Write immutable raw evidence, durable normalized data, then route safely."""
+
+    record = record_wechaty_raw_message(payload)
+    runtime = get_runtime()
+    persist_wechaty_channel_observation(runtime, payload=payload, record=record)
+    try:
+        route_result = route_wechaty_raw_to_agent(payload, trace_id=record["trace_id"])
+    except Exception as exc:
+        persist_wechaty_channel_observation(
+            runtime,
+            payload=payload,
+            record=record,
+            route_error=exc,
+        )
+        raise
+    persist_wechaty_channel_observation(
+        runtime,
+        payload=payload,
+        record=record,
+        route_result=route_result,
+    )
+    return {
+        "ok": True,
+        "trace_id": record["trace_id"],
+        "raw_log_path": str(WECHATY_RAW_LOG_PATH),
+        "record": record,
+        "route_result": route_result,
+    }
+
+
 def _wechaty_nested_text(payload: dict, *path: str) -> str:
     value = payload
     for key in path:
@@ -2953,6 +3106,26 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/channels/wechaty/observations":
+            query = parse_qs(parsed.query)
+            limit = int((query.get("limit") or ["100"])[0] or "100")
+            runtime = get_runtime()
+            records = runtime.store.list_channel_observations(
+                channel="wechaty",
+                room_id=str((query.get("room_id") or [""])[0] or "") or None,
+                room_topic_keyword=str((query.get("room_topic") or [""])[0] or "") or None,
+                semantic_action=str((query.get("semantic_action") or [""])[0] or "") or None,
+                limit=limit,
+            )
+            self._json(
+                {
+                    "runtime": "mahjong_agent_runtime",
+                    "database_path": str(DB_PATH),
+                    "count": len(records),
+                    "records": records,
+                }
+            )
+            return
         if parsed.path == "/api/badcases":
             runtime = get_runtime()
             self._json({"records": list(runtime.store.badcases)})
@@ -3104,17 +3277,7 @@ class AgentRuntimeHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/channels/wechaty/raw":
             payload = self._read_json()
-            record = record_wechaty_raw_message(payload)
-            route_result = route_wechaty_raw_to_agent(payload, trace_id=record["trace_id"])
-            self._json(
-                {
-                    "ok": True,
-                    "trace_id": record["trace_id"],
-                    "raw_log_path": str(WECHATY_RAW_LOG_PATH),
-                    "record": record,
-                    "route_result": route_result,
-                }
-            )
+            self._json(ingest_wechaty_raw_message(payload))
             return
         if parsed.path == "/api/invite-drafts/action":
             runtime = get_runtime()

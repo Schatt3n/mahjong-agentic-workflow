@@ -417,6 +417,7 @@ pnpm start
 - 按 `conversation_id + sender_id` 聚合碎片输入。
 - 默认仅允许白名单或测试范围进入主 Agent。
 - 可为指定群聊配置“只读观察”模式：调用语义入口模型区分运营消息、闲聊和不确定消息，但不进入工具循环、不修改业务状态、不生成可外发回复。
+- 只读群消息同时按 `channel + source_message_id` 幂等写入 `runtime_channel_observations`；原始 JSONL 保留不可变证据，SQLite 保存群、发送者、文本、语义分类和路由结果，模型失败时也不会丢失原消息。
 - 可为明确授权的群配置“托管看板”模式。托管群走独立三层入口：L1 处理严格报局/编号认领协议，L2 决定忽略、群内短答或切到私聊，只有需要语义决策时才进入主 Agent。
 - 托管群中的每位用户使用独立会话 `group:<room_id>:customer:<customer_id>`；不会把整个群聊记录当成一个共享上下文喂给模型。
 - 复杂组局请求在好友关系允许时由后端切换到私聊。模型只接收最小切换上下文，不决定发送通道，也看不到群内其他人的原始消息。
@@ -428,6 +429,7 @@ pnpm start
 只读观察群默认从 `data/wechaty_observe_only_rooms.local.json` 读取，示例见
 [`integrations/wechaty/observe_only_rooms.example.json`](integrations/wechaty/observe_only_rooms.example.json)。
 `room_ids` 使用精确匹配，`topic_keywords` 使用子串匹配，以容忍群名追加门店名或公告。
+结构化观测记录可通过 `GET /api/channels/wechaty/observations` 查询，并支持 `room_id`、`room_topic`、`semantic_action` 和 `limit` 参数。
 识别结果记录为 `wechaty_observe_only_message_analyzed` trace 事件，并明确包含
 `state_mutation_allowed=false` 与 `outbound_allowed=false`。
 
