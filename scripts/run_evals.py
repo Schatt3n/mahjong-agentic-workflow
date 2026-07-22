@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REAL_OWNER_LIVE_EVAL_REPORT = ROOT / "runtime_data" / "real_owner_chat_live_eval_report.json"
+REAL_GROUP_DETERMINISTIC_EVAL_REPORT = ROOT / "runtime_data" / "real_group_chat_flow_eval_deterministic.json"
+REAL_GROUP_LIVE_EVAL_REPORT = ROOT / "runtime_data" / "real_group_chat_flow_eval_live.json"
 DETERMINISTIC_CONCURRENCY_REPORT = ROOT / "runtime_data" / "concurrency_eval_deterministic_report.json"
 LIVE_CONCURRENCY_REPORT = ROOT / "runtime_data" / "concurrency_eval_live_report.json"
 
@@ -35,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="also run the real-DeepSeek concurrent eval; requires MAHJONG_LLM_MODEL and an API key",
     )
+    parser.add_argument(
+        "--live-real-group",
+        action="store_true",
+        help="also replay semantic real-group cases through the configured model and main Agent",
+    )
     return parser.parse_args()
 
 
@@ -45,6 +52,15 @@ def main() -> int:
     run_command([sys.executable, "scripts/check_badcase_regression_coverage.py"])
     run_command([sys.executable, "scripts/validate_real_owner_chat_golden.py"])
     run_command([sys.executable, "scripts/validate_real_group_chat_dataset.py"])
+    run_command(
+        [
+            sys.executable,
+            "scripts/run_real_group_chat_flow_eval.py",
+            "--strict",
+            "--report-path",
+            str(REAL_GROUP_DETERMINISTIC_EVAL_REPORT),
+        ]
+    )
     run_command([sys.executable, "scripts/run_agent_runtime_eval.py"])
     run_command(
         [
@@ -81,6 +97,17 @@ def main() -> int:
                 "--strict",
                 "--report-path",
                 str(REAL_OWNER_LIVE_EVAL_REPORT),
+            ]
+        )
+    if args.live_real_group:
+        run_command(
+            [
+                sys.executable,
+                "scripts/run_real_group_chat_flow_eval.py",
+                "--live",
+                "--strict",
+                "--report-path",
+                str(REAL_GROUP_LIVE_EVAL_REPORT),
             ]
         )
     if args.live_concurrency:

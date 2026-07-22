@@ -20,7 +20,7 @@ from .game_queries import SQLiteGameQueriesStoreMixin
 from .group_chat import SQLiteGroupChatStoreMixin
 from .idempotency import SQLiteIdempotencyStoreMixin
 from .input_aggregation import SQLiteInputAggregationStoreMixin
-from .migration import SQLiteMigrationStoreMixin
+from .schema import SQLiteSchemaStoreMixin
 from .persistence import SQLitePersistenceStoreMixin
 from .references import SQLiteReferencesStoreMixin
 from .rooms import SQLiteRoomsStoreMixin
@@ -48,7 +48,7 @@ class SQLiteAgentStore(
     SQLiteWaitingDemandStoreMixin,
     SQLiteGamePersistenceStoreMixin,
     SQLitePersistenceStoreMixin,
-    SQLiteMigrationStoreMixin,
+    SQLiteSchemaStoreMixin,
     SQLiteIdempotencyStoreMixin,
 ):
     """Persistent AgentStore for one-node deployments and local evaluation."""
@@ -67,7 +67,11 @@ class SQLiteAgentStore(
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=5000")
-            self._migrate()
+            try:
+                self._initialize_schema()
+            except Exception:
+                self._connection.close()
+                raise
 
     @contextmanager
     def _write_transaction(self):

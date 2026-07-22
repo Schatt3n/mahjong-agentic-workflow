@@ -530,27 +530,27 @@ def test_sqlite_task_history_indexes_and_checkpoint_survive_restart(tmp_path: Pa
     assert checkpoint.summary == "明天下午两点0.5无烟预约。"
 
 
-def test_sqlite_migration_backfills_legacy_task_checkpoint_projection(tmp_path: Path) -> None:
-    database = tmp_path / "task_checkpoint_migration.sqlite3"
+def test_sqlite_does_not_reconstruct_deleted_task_checkpoint_from_other_projection(tmp_path: Path) -> None:
+    database = tmp_path / "task_checkpoint_no_reconstruction.sqlite3"
     store = SQLiteAgentStore(database)
     message = UserMessage(
-        conversation_id="task_checkpoint_migration",
+        conversation_id="task_checkpoint_no_reconstruction",
         sender_id="A",
         sender_name="A",
         text="明天晚上七点帮我约一桌",
-        message_id="msg_migration_source",
+        message_id="msg_no_reconstruction_source",
     )
-    prepared = TaskContextManager(store).prepare(message, trace_id="trace_migration_source")
-    store.append_user_turn(message, "trace_migration_source")
+    prepared = TaskContextManager(store).prepare(message, trace_id="trace_no_reconstruction_source")
+    store.append_user_turn(message, "trace_no_reconstruction_source")
     store.upsert_conversation_checkpoint(
         conversation_id=message.conversation_id,
         summary="明天晚上七点的预约。",
         facts={"planned_start": "tomorrow 19:00"},
         open_questions=[],
-        trace_id="trace_migration_checkpoint",
+        trace_id="trace_no_reconstruction_checkpoint",
     )
-    # Simulate a database written by the previous schema: the conversation
-    # projection exists, but the task-scoped archive table has no row yet.
+    # Conversation and task checkpoints are separate projections. Reopening
+    # must not silently recreate a deliberately removed task checkpoint.
     store._connection.execute(
         "DELETE FROM runtime_task_context_checkpoints WHERE task_context_id = ?",
         (prepared.context.task_context_id,),
@@ -562,8 +562,7 @@ def test_sqlite_migration_backfills_legacy_task_checkpoint_projection(tmp_path: 
     reopened = SQLiteAgentStore(database)
     checkpoint = reopened.get_task_context_checkpoint(prepared.context.task_context_id)
 
-    assert checkpoint is not None
-    assert checkpoint.summary == "明天晚上七点的预约。"
+    assert checkpoint is None
 
 
 def test_idle_conversation_without_active_game_starts_new_task_context() -> None:

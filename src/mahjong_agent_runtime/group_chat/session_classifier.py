@@ -13,10 +13,10 @@ _SYSTEM_PROMPT = """你是麻将群运营助手。你只做当前群聊 Session 
 
 输入只包含当前看板、当前 Session 的历史和一条新的聚合消息。不得猜测或引用其他 Session、其他私聊或内部系统信息。
 
-判断规则：
-- claim：用户提到看板上某局的特征并表达加入意愿。
-- new_demand：用户想组局，但当前看板没有唯一匹配项。
-- query：用户询问局的状态或公开信息。
+判断规则（先按用户本轮言语行为分类，再参考看板；看板为空不能改变言语行为）：
+- query：用户在询问当前有没有局、还有没有位置、是否齐人或其他公开状态。例如“1块杭麻有人吗”“0.5还有嘛”即使看板为空也仍是 query，后续主 Agent 会负责查询。
+- claim：用户明确表达要加入某个现有看板局，例如“4来”“红中568我打”。没有加入意愿，或只是发布“三缺一/在线等”，都不是 claim。
+- new_demand：用户发布自己的缺人需求，或明确要求老板新建/组一个局。例如“三缺一在线等”“帮我组个0.5无烟局”。
 - thread_update：同一组局讨论中的条件补充或确认。
 - chitchat：与麻将组局无关的闲聊。
 
@@ -28,7 +28,43 @@ _SYSTEM_PROMPT = """你是麻将群运营助手。你只做当前群聊 Session 
 - 只有简单公开查询可以 group_reply。
 - 中间更新和闲聊使用 ignore。
 
-严格输出一个 JSON 对象，不得输出 Markdown、解释前缀或额外字段。"""
+领域语义：
+- 173/272/371 分别表示当前 1/2/3 人、还缺 3/2/1 人，不是玩法或桌号。
+- cq 是“杭麻-财敲”的群内别名；“川麻换三/换三”表示“川麻-换三张”。
+- game_type 只写“杭麻/川麻/红中麻将”等主类型；ruleset 单独写“财敲/换三张”等子玩法，禁止把“杭麻-财敲”整体塞进任一字段。
+- 人数短码写入 participant_code。
+- 568/368/132 等三位码是场馆本地规则码。未得到场馆确认前只原样提取为 rule_code，不得解释成底注、封顶或番数。
+- “一块也行、0.5 也可以”表示多个可接受档位，按出现顺序写入 accepted_stakes。
+- “三缺一/真三缺一”必须提取 current_players=3、missing_players=1；未出现的玩法、时间、烟况不得补造。
+- “在线等/急”等明确紧急表达统一写 urgency="high"；普通需求写 "normal" 或 null，不得创造其他枚举值。
+
+严格输出一个 JSON 对象，不得输出 Markdown、解释前缀或额外字段。
+intent 和 channel_action 必须分别是一个字符串标量，禁止输出数组。"""
+
+
+class SessionClassificationContractError(ValueError):
+    """Raised after bounded model repair still cannot satisfy the contract."""
+
+    def __init__(self, message: str, *, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def _canonical_feature(value: object, *, field_name: str) -> str:
+    """Compare semantic values without changing the board's display representation."""
+
+    normalized = str(value or "").strip().lower()
+    if field_name == "stakes":
+        return normalized.removesuffix("块").removesuffix("元")
+    if field_name == "game_type":
+        return {
+            "cq": "杭麻",
+            "财敲": "杭麻",
+            "杭麻财敲": "杭麻",
+            "红中": "红中麻将",
+            "川麻换三": "川麻",
+        }.get(normalized, normalized)
+    return normalized
 
 
 def session_classification_contract() -> dict[str, Any]:
@@ -44,12 +80,20 @@ def session_classification_contract() -> dict[str, Any]:
         ],
         "intent": ["claim", "new_demand", "query", "thread_update", "chitchat"],
         "channel_action": ["private_switch", "group_reply", "ignore"],
+        "scalar_fields": ["intent", "channel_action", "confidence", "reasoning"],
         "extracted_features": {
             "game_type": "string|null",
             "stakes": "string|null",
             "time": "string|null",
-            "table_id": "string|null",
+            "participant_code": "173|272|371|null; participant count shorthand",
             "smoking": "string|null",
+            "accepted_stakes": "array<string>|null",
+            "current_players": "integer|null",
+            "missing_players": "integer|null",
+            "urgency": "high|normal|null",
+            "duration_hours": "number|null",
+            "ruleset": "string|null",
+            "rule_code": "string|null",
         },
         "matched_board_no": "integer|null; must exist in board_state when non-null",
         "confidence": "number in [0,1]",
@@ -59,11 +103,18 @@ def session_classification_contract() -> dict[str, Any]:
 
 
 class GroupSessionClassifier:
-    """Call a model once and validate the semantic result as a strict contract."""
+    """Run one semantic task with bounded contract repair, never schema coercion."""
 
-    def __init__(self, llm: AgentLLMClient, *, timeout_seconds: float = 12) -> None:
+    def __init__(
+        self,
+        llm: AgentLLMClient,
+        *,
+        timeout_seconds: float = 12,
+        max_contract_retries: int = 1,
+    ) -> None:
         self.llm = llm
         self.timeout_seconds = timeout_seconds
+        self.max_contract_retries = max(0, max_contract_retries)
 
     def classify(
         self,
@@ -79,15 +130,43 @@ class GroupSessionClassifier:
             "new_message": new_message.to_dict(),
             "output_contract": session_classification_contract(),
         }
-        content = self.llm.complete(
-            [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
-            ],
-            trace_id=trace_id,
-            timeout_seconds=self.timeout_seconds,
-        )
-        return self._parse(content, board_state=board_state)
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
+        ]
+        attempts = self.max_contract_retries + 1
+        last_error: ValueError | TypeError | json.JSONDecodeError | None = None
+        for attempt_index in range(attempts):
+            content = self.llm.complete(
+                messages,
+                trace_id=trace_id if attempt_index == 0 else f"{trace_id}_contract_retry_{attempt_index}",
+                timeout_seconds=self.timeout_seconds,
+            )
+            try:
+                return self._parse(content, board_state=board_state)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                last_error = exc
+                if attempt_index + 1 >= attempts:
+                    break
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一个输出未通过合同校验："
+                                f"{type(exc).__name__}: {exc}。请重新输出完整 JSON 对象；"
+                                "intent 与 channel_action 必须是单个字符串标量，禁止数组；"
+                                "不得解释、不得输出 Markdown、不得省略字段。"
+                            ),
+                        },
+                    ]
+                )
+        assert last_error is not None
+        raise SessionClassificationContractError(
+            f"group session classification contract failed after {attempts} attempts: {last_error}",
+            attempts=attempts,
+        ) from last_error
 
     @staticmethod
     def _parse(content: str, *, board_state: BoardState | None) -> SessionClassification:
@@ -102,8 +181,12 @@ class GroupSessionClassifier:
         missing = sorted(required - payload.keys())
         if missing:
             raise ValueError(f"group session classifier missing fields: {', '.join(missing)}")
-        intent = str(payload["intent"])
-        action = str(payload["channel_action"])
+        intent = payload["intent"]
+        action = payload["channel_action"]
+        if not isinstance(intent, str):
+            raise ValueError("intent must be one string scalar")
+        if not isinstance(action, str):
+            raise ValueError("channel_action must be one string scalar")
         if intent not in session_classification_contract()["intent"]:
             raise ValueError(f"invalid group session intent: {intent}")
         if action not in session_classification_contract()["channel_action"]:
@@ -111,7 +194,10 @@ class GroupSessionClassifier:
         features = payload["extracted_features"]
         if not isinstance(features, dict):
             raise ValueError("extracted_features must be an object")
-        confidence = float(payload["confidence"])
+        raw_confidence = payload["confidence"]
+        if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+            raise ValueError("confidence must be a number")
+        confidence = float(raw_confidence)
         if not 0 <= confidence <= 1:
             raise ValueError("confidence must be in [0,1]")
         matched = payload["matched_board_no"]
@@ -124,17 +210,35 @@ class GroupSessionClassifier:
         response = payload["response"]
         if response is not None and not isinstance(response, str):
             raise ValueError("response must be a string or null")
+        reasoning = payload["reasoning"]
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("reasoning must be a non-empty string")
+        allowed_feature_keys = (
+            "game_type",
+            "stakes",
+            "time",
+            "participant_code",
+            "smoking",
+            "accepted_stakes",
+            "current_players",
+            "missing_players",
+            "urgency",
+            "duration_hours",
+            "ruleset",
+            "rule_code",
+        )
         classification = SessionClassification(
             intent=intent,
-            extracted_features={
-                key: features.get(key) for key in ("game_type", "stakes", "time", "table_id", "smoking")
-            },
+            extracted_features={key: features.get(key) for key in allowed_feature_keys},
             matched_board_no=matched,
             confidence=confidence,
-            reasoning=str(payload["reasoning"]),
+            reasoning=reasoning,
             response=response,
             channel_action=action,
         )
+        urgency = classification.extracted_features.get("urgency")
+        if urgency not in (None, "high", "normal"):
+            raise ValueError(f"invalid urgency: {urgency}")
         return GroupSessionClassifier._enforce_unique_board_match(classification, board_state=board_state)
 
     @staticmethod
@@ -151,11 +255,13 @@ class GroupSessionClassifier:
             "game_type": "game_type",
             "stakes": "stakes",
             "time": "time",
-            "table_id": "table_id",
+            "participant_code": "participant_code",
             "smoking": "smoking",
+            "ruleset": "ruleset",
+            "rule_code": "rule_code",
         }
         stated = {
-            feature: str(value).strip().lower()
+            feature: _canonical_feature(value, field_name=feature)
             for feature, value in classification.extracted_features.items()
             if feature in field_map and value not in (None, "", [])
         }
@@ -164,7 +270,10 @@ class GroupSessionClassifier:
         matching = [
             item
             for item in board_state.items
-            if all(str(getattr(item, field_map[key]) or "").strip().lower() == value for key, value in stated.items())
+            if all(
+                _canonical_feature(getattr(item, field_map[key]), field_name=key) == value
+                for key, value in stated.items()
+            )
         ]
         if len(matching) <= 1:
             return classification
@@ -179,4 +288,8 @@ class GroupSessionClassifier:
         )
 
 
-__all__ = ["GroupSessionClassifier", "session_classification_contract"]
+__all__ = [
+    "GroupSessionClassifier",
+    "SessionClassificationContractError",
+    "session_classification_contract",
+]

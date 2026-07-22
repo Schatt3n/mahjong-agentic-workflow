@@ -26,7 +26,7 @@ from .serialization import (
 )
 
 class SQLiteConversationStoreMixin:
-    """Backend-specific operations extracted from the compatibility store."""
+    """Persist conversation turns, task contexts, memories, and checkpoints."""
 
     __slots__ = ()
 
@@ -537,14 +537,15 @@ class SQLiteConversationStoreMixin:
             return checkpoint, transition
 
     def _task_context_id_for_trace(self, conversation_id: str, trace_id: str) -> str:
-        row = self._connection.execute(
-            """
-            SELECT task_context_id
-            FROM runtime_conversation_turns
-            WHERE conversation_id = ? AND trace_id = ? AND role = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (conversation_id, trace_id, ConversationRole.USER.value),
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT task_context_id
+                FROM runtime_conversation_turns
+                WHERE conversation_id = ? AND trace_id = ? AND role = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (conversation_id, trace_id, ConversationRole.USER.value),
+            ).fetchone()
         return str(row["task_context_id"] or "") if row else ""

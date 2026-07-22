@@ -8,7 +8,7 @@ from .accumulator import MessageAccumulator
 from .models import GroupMessage, GroupSessionOutcome
 from .owner_parser import OwnerMessageParser
 from .quick_filter import QuickFilter
-from .session_classifier import GroupSessionClassifier
+from .session_classifier import GroupSessionClassifier, SessionClassificationContractError
 from .session_merger import SessionCrystallizer, SessionMerger
 from .session_router import SessionRouter
 
@@ -40,6 +40,23 @@ class GroupSessionPipeline:
     def accept(self, message: GroupMessage, *, trace_id: str) -> GroupSessionOutcome:
         """Accept one raw room message without forcing an immediate model call."""
 
+        if str(message.metadata.get("content_type") or "").lower() == "revoke_event":
+            target_message_id = str(message.metadata.get("target_message_id") or "")
+            if not target_message_id:
+                return GroupSessionOutcome(action="revoke_ignored", detail={"reason": "missing_target"})
+            buffered = self.accumulator.invalidate(
+                room_id=message.room_id,
+                source_message_id=target_message_id,
+            )
+            recorded = self.session_router.invalidate_message(
+                room_id=message.room_id,
+                source_message_id=target_message_id,
+            )
+            return GroupSessionOutcome(
+                action="message_revoked",
+                detail={"target_message_id": target_message_id, "buffered_removed": buffered, "session_removed": recorded},
+            )
+
         if self.owner_parser.is_owner(message):
             current = self.store.get_group_board_state(message.room_id)
             parsed = self.owner_parser.process(message, current)
@@ -62,12 +79,28 @@ class GroupSessionPipeline:
             message = accumulated.message
             session = self.session_router.route(message)
             board = self.store.get_group_board_state(message.room_id)
-            classified = self.classifier.classify(
-                board_state=board,
-                session=session,
-                new_message=message,
-                trace_id=accumulated.trace_id,
-            )
+            try:
+                classified = self.classifier.classify(
+                    board_state=board,
+                    session=session,
+                    new_message=message,
+                    trace_id=accumulated.trace_id,
+                )
+            except SessionClassificationContractError as exc:
+                self.session_router.record_unclassified(session, message)
+                outcomes.append(
+                    GroupSessionOutcome(
+                        action="classification_failed",
+                        session_id=session.id,
+                        detail={
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "attempts": exc.attempts,
+                            "fragment_count": message.metadata.get("fragment_count", 1),
+                        },
+                    )
+                )
+                continue
             self.session_router.record(session, message, classified)
             session = self.session_merger.merge_if_related(session)
             crystallized = self.crystallizer.crystallize_if_ready(session)

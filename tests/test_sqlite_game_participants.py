@@ -4,6 +4,8 @@ import json
 import sqlite3
 from datetime import datetime
 
+import pytest
+
 from mahjong_agent_runtime import SQLiteAgentStore, ToolCall, ToolGateway
 
 
@@ -97,7 +99,16 @@ def test_create_and_join_use_normalized_participant_table(tmp_path) -> None:
     ]
 
 
-def test_migration_backfills_legacy_embedded_participants_once(tmp_path) -> None:
+def test_fresh_sqlite_store_marks_current_schema_version(tmp_path) -> None:
+    db_path = tmp_path / "current_schema.sqlite3"
+
+    store = SQLiteAgentStore(db_path)
+    version = int(store._connection.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == 1
+
+
+def test_old_embedded_participant_schema_is_rejected_without_mutation(tmp_path) -> None:
     db_path = tmp_path / "legacy_participants.sqlite3"
     created_at = "2026-07-20T10:00:00+08:00"
     legacy_payload = {
@@ -153,40 +164,15 @@ def test_migration_backfills_legacy_embedded_participants_once(tmp_path) -> None
     connection.commit()
     connection.close()
 
-    store = SQLiteAgentStore(db_path)
-    migrated = store.require_game("game_legacy")
-    assert [
-        (
-            item.customer_id,
-            item.status,
-            item.seat_count,
-            item.party_id,
-            item.source,
-            item.known_member_ids,
-            item.anonymous_seat_count,
-        )
-        for item in migrated.participants
-    ] == [
-        ("friend", "confirmed", 2, "party_friend", "candidate_reply", ["friend"], 1),
-        ("owner", "joined", 1, "party_owner", "requester", ["owner"], 0),
-    ]
-    with store._lock:
-        payload = json.loads(
-            store._connection.execute(
-                "SELECT payload FROM runtime_games WHERE game_id = 'game_legacy'"
-            ).fetchone()["payload"]
-        )
-        rows = store._connection.execute(
-            "SELECT customer_id, joined_at FROM runtime_game_participants WHERE game_id = 'game_legacy'"
-        ).fetchall()
-    assert "participants" not in payload
-    assert "parties" not in payload
-    assert {row["customer_id"] for row in rows} == {"owner", "friend"}
-    assert {row["joined_at"] for row in rows} == {created_at}
+    with pytest.raises(RuntimeError, match="automatic legacy migration is intentionally disabled"):
+        SQLiteAgentStore(db_path)
 
-    # Reopening must not replay stale embedded JSON or duplicate rows.
-    reopened = SQLiteAgentStore(db_path)
-    count = reopened._connection.execute(
-        "SELECT COUNT(*) AS count FROM runtime_game_participants WHERE game_id = 'game_legacy'"
-    ).fetchone()["count"]
-    assert count == 2
+    # Refusing an old schema must never rewrite the source payload.
+    connection = sqlite3.connect(db_path)
+    stored_payload = json.loads(
+        connection.execute(
+            "SELECT payload FROM runtime_games WHERE game_id = 'game_legacy'"
+        ).fetchone()[0]
+    )
+    connection.close()
+    assert stored_payload == legacy_payload

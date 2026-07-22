@@ -918,7 +918,7 @@ return reverse(selected)</pre>
 
         <h3>13.4 Party 和 Participant</h3>
         <p>一个微信联系人可能代表两个人。Party 表示“由谁与老板沟通、占几个席位”，Participant 表示已知的实际玩家。未知同伴可以用 <code>anonymous_seat_count</code> 占位，后续再补身份。</p>
-        <p>系统业务运营者始终是麻将馆老板；发起组局的客户是请求方和参与方，不应因为字段名 <code>organizer</code> 被理解成“不一定打”。兼容字段只表示来源联系人，人数计算必须把请求方的席位计入。</p>
+        <p>系统业务运营者始终是麻将馆老板；当前领域模型中的 <code>organizer_id</code> 表示发起组局需求的客户和首位参与方，不表示运营者。人数计算必须把请求方的席位计入。</p>
       </section>
 
       <section id="state">

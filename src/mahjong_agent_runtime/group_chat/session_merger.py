@@ -40,7 +40,7 @@ class SessionMerger:
 
     @staticmethod
     def _topics_related(left: ChatSession, right: ChatSession) -> bool:
-        for key in ("game_type", "stakes", "time", "table_id", "smoking"):
+        for key in ("game_type", "ruleset", "stakes", "rule_code", "time", "participant_code", "smoking"):
             left_value = left.extracted_state.get(key)
             right_value = right.extracted_state.get(key)
             if facts_conflict(key, left_value, right_value):
@@ -52,7 +52,7 @@ class SessionMerger:
         return any(
             left.extracted_state.get(key) == right.extracted_state.get(key)
             and left.extracted_state.get(key) not in (None, "")
-            for key in ("game_type", "stakes", "time", "table_id", "smoking")
+            for key in ("game_type", "ruleset", "stakes", "rule_code", "time", "participant_code", "smoking")
         )
 
 

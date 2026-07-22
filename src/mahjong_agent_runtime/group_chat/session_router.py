@@ -26,6 +26,7 @@ class SessionRouter:
         self.clock = clock
         self._sessions: dict[str, ChatSession] = {}
         self._message_sessions: dict[tuple[str, str], str] = {}
+        self._message_classifications: dict[tuple[str, str], SessionClassification] = {}
         self._lock = threading.RLock()
 
     def route(self, message: GroupMessage) -> ChatSession:
@@ -84,6 +85,61 @@ class SessionRouter:
             source_ids = message.metadata.get("accumulated_source_message_ids") or [message.message_id]
             for source_id in source_ids:
                 self._message_sessions[(message.room_id, str(source_id))] = session.id
+                self._message_classifications[(message.room_id, str(source_id))] = classification
+
+    def record_unclassified(self, session: ChatSession, message: GroupMessage) -> None:
+        """Retain raw session context after contract failure without deriving business facts."""
+
+        with self._lock:
+            session.messages.append(message)
+            session.participants.add(message.sender_external_id)
+            session.last_activity_at = message.sent_at
+            source_ids = message.metadata.get("accumulated_source_message_ids") or [message.message_id]
+            for source_id in source_ids:
+                self._message_sessions[(message.room_id, str(source_id))] = session.id
+
+    def invalidate_message(self, *, room_id: str, source_message_id: str) -> bool:
+        """Remove a revoked message and rebuild facts from the surviving session turns."""
+
+        with self._lock:
+            key = (room_id, source_message_id)
+            session_id = self._message_sessions.pop(key, None)
+            self._message_classifications.pop(key, None)
+            session = self._sessions.get(session_id or "")
+            if session is None:
+                return False
+            session.messages = [
+                message
+                for message in session.messages
+                if source_message_id
+                not in (message.metadata.get("accumulated_source_message_ids") or [message.message_id])
+            ]
+            if not session.messages:
+                session.extracted_state.clear()
+                session.participants.clear()
+                session.topic = ""
+                session.related_board_item_id = None
+                session.status = "resolved"
+                return True
+            session.extracted_state.clear()
+            session.participants = {message.sender_external_id for message in session.messages}
+            session.related_board_item_id = None
+            for message in session.messages:
+                source_ids = message.metadata.get("accumulated_source_message_ids") or [message.message_id]
+                classification = next(
+                    (
+                        self._message_classifications.get((room_id, str(source_id)))
+                        for source_id in source_ids
+                        if self._message_classifications.get((room_id, str(source_id))) is not None
+                    ),
+                    None,
+                )
+                if classification is None:
+                    continue
+                session.extracted_state = merge_session_facts(session.extracted_state, classification.extracted_features)
+                if classification.matched_board_no is not None:
+                    session.related_board_item_id = str(classification.matched_board_no)
+            return True
 
     def list_sessions(self, room_id: str | None = None) -> list[ChatSession]:
         with self._lock:

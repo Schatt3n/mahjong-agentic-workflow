@@ -469,6 +469,7 @@ export MAHJONG_WECHATY_BOARD_MERGE_WINDOW_SECONDS=30
 - 同一 Session 可以包含多个参与者；引用关系优先，其次才使用发送者时间窗口和结构化特征。两个精确且冲突的事实会阻止合并；“今晚 -> 7点”这类范围到精确值会被视为合法细化。
 - 老板发布的多行看板会替换 `BoardState`，单条完整局信息只更新或追加对应项，不会清空其他局。`BoardState` 写入 SQLite 表 `runtime_group_board_states`，Session 当前仅保存在进程内。
 - 模型若声称唯一认领，但已提取条件仍同时匹配多个看板项，合同校验会降级为歧义认领并切私聊确认，避免把用户加错局。
+- 群聊分类输出执行严格合同校验；格式错误时只允许一次带原始错误反馈的合同修复，仍不合法则产出可观测的 `classification_failed`，保留原始消息但不猜测字段、不执行任何业务动作。
 - 该链路目前用于确定性测试和真实 DeepSeek 模拟，尚未接管真实 WeChaty 群入口。真实只读观察群仍保持“不改状态、不外发”；完成 trace 接入、ActionRouter 和灰度开关后再逐群启用。
 
 真实模型模拟：
@@ -510,7 +511,11 @@ logs/wechaty_weixin_raw.jsonl      # 微信原始消息日志
 runtime_data/                      # 本地评测报告与临时数据库
 ```
 
-SQLite 保存客户画像、客户关系、局、局参与者、房间、邀约草稿、状态迁移、对话、checkpoint、任务记忆、消息结果、幂等账本、待处理输入批次和持久化定时任务。`runtime_game_participants` 以 `(game_id, customer_id)` 作复合主键，单独记录入局状态和 `joined_at`；`runtime_games.payload` 不再嵌套持久化参与者，旧数据在存储初始化时幂等回填到新表。Redis 只在配置后承担跨进程协调，不是业务真相来源。
+SQLite 保存客户画像、客户关系、局、局参与者、房间、邀约草稿、状态迁移、对话、checkpoint、任务记忆、消息结果、幂等账本、待处理输入批次和持久化定时任务。`runtime_game_participants` 以 `(game_id, customer_id)` 作复合主键，单独记录入局状态和 `joined_at`；`runtime_games.payload` 不再嵌套持久化参与者。Redis 只在配置后承担跨进程协调，不是业务真相来源。
+
+### 开发期 Schema 策略
+
+当前 SQLite schema 使用严格版本号。开发期只维护一套当前结构，不提供旧字段回退、双写或启动时自动迁移；现有数据库版本不匹配时会明确拒绝启动，应重建可再生运行库。测试、badcase、golden/adversarial dataset 以及 `logs/wechaty_weixin_raw.jsonl` 等线上原始观测消息是独立证据资产，不随运行库重建而删除或覆盖。正式生产后若存在不可重建状态，再为具体发布版本设计一次性离线迁移、备份、校验和回滚流程。
 
 每条链路可以通过 `trace_id` 回溯：
 
@@ -809,7 +814,7 @@ src/mahjong_agent_runtime/
     base.py                               # AgentStore Protocol 与基础合同
     memory/store.py                       # 内存聚合 Store
     sqlite/store.py                       # SQLite 聚合 Store
-    sqlite/migration.py                   # DDL 与旧数据迁移
+    sqlite/schema.py                      # 当前 DDL 与严格 schema 版本校验
     sqlite/game_persistence.py            # Game 与独立参与者表持久化
     sqlite/game_mutations.py              # 建局、入局和状态变更事务
   context.py                              # 上下文构建兼容入口
@@ -871,5 +876,6 @@ tests/                                    # 单元、边界和生产不变量测
 6. badcase 先变成可复现测试，再修提示词、合同、上下文、工具或领域模型中的通用根因，不得用一次性语义 `if-else` 止血。
 7. 每次代码提交默认执行全量 `pytest`、统一 eval 和对应专项验证；涉及模型链路时运行真实模型回放，不能运行时必须明确说明。
 8. 文档和对外表述必须与真实能力一致，不把个人微信灰度验证包装成官方生产接入。
+9. 开发期不为旧数据库保留兼容分支；运行状态可重建，测试、评测和原始观测消息不可删除或覆盖。
 
 提交前还必须逐项完成 [AGENTS.md 的提交与推送门禁](AGENTS.md#7-提交与推送门禁)。

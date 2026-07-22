@@ -506,11 +506,21 @@ class SQLiteGroupChatStoreMixin:
                     id=str(item.get("id") or ""),
                     display_no=int(item.get("display_no") or 0),
                     game_type=str(item.get("game_type") or ""),
-                    table_id=str(item.get("table_id") or ""),
+                    participant_code=str(item["participant_code"]),
                     time=str(item.get("time") or "") or None,
                     smoking=str(item.get("smoking") or "") or None,
                     stakes=str(item.get("stakes") or ""),
                     special_rules=str(item.get("special_rules") or "") or None,
+                    ruleset=str(item.get("ruleset") or "") or None,
+                    end_time=str(item.get("end_time") or "") or None,
+                    duration_hours=(
+                        float(item["duration_hours"])
+                        if item.get("duration_hours") is not None
+                        else None
+                    ),
+                    rule_code=str(item.get("rule_code") or "") or None,
+                    temporary_constraints=[str(value) for value in item.get("temporary_constraints") or []],
+                    source_message_id=str(item.get("source_message_id") or "") or None,
                     status=str(item.get("status") or "waiting"),
                     slots_total=int(item.get("slots_total") or 4),
                     slots_filled=int(item.get("slots_filled") or 0),

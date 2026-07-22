@@ -10,7 +10,7 @@ from .serialization import (
 )
 
 class SQLiteGamePersistenceStoreMixin:
-    """Backend-specific operations extracted from the compatibility store."""
+    """Persist game aggregates using the current normalized schema."""
 
     __slots__ = ()
 

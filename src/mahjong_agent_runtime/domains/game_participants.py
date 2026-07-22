@@ -18,7 +18,7 @@ def normalize_game_participants(
     known_players: list[dict[str, Any]],
     default_requester_seat_count: int = 1,
 ) -> list[GameParticipant]:
-    """Compatibility: organizer_id is the requesting contact, not the store operator."""
+    """Treat the requesting contact as the first playing party, never the store operator."""
     participants: list[GameParticipant] = []
     seen: set[str] = set()
 

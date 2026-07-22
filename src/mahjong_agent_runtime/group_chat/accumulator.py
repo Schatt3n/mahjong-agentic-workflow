@@ -61,6 +61,33 @@ class MessageAccumulator:
                 ready.append(self._merge(self._pending.pop(key)))
             return sorted(ready, key=lambda item: item.message.sent_at)
 
+    def invalidate(self, *, room_id: str, source_message_id: str) -> bool:
+        """Remove a revoked source message before it reaches semantic processing."""
+
+        removed = False
+        with self._lock:
+            for key, pending in list(self._pending.items()):
+                if key[0] != room_id:
+                    continue
+                retained = [item for item in pending.fragments if item.message_id != source_message_id]
+                if len(retained) == len(pending.fragments):
+                    continue
+                removed = True
+                if retained:
+                    pending.fragments = retained
+                    pending.quiet_deadline = retained[-1].sent_at + timedelta(seconds=self.quiet_seconds)
+                else:
+                    self._pending.pop(key, None)
+            retained_ready: list[AccumulatedMessage] = []
+            for item in self._ready:
+                source_ids = item.message.metadata.get("accumulated_source_message_ids") or [item.message.message_id]
+                if item.message.room_id == room_id and source_message_id in source_ids:
+                    removed = True
+                    continue
+                retained_ready.append(item)
+            self._ready = retained_ready
+        return removed
+
     @staticmethod
     def _merge(pending: _PendingFragments) -> AccumulatedMessage:
         fragments = sorted(pending.fragments, key=lambda item: item.sent_at)

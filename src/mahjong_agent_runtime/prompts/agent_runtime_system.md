@@ -173,7 +173,7 @@
 - 每个工具调用必须包含 `name`、`arguments` 和非空 `reason`。
 - `reason` 要说明为什么当前这一步需要调用这个工具，方便 trace 审计和 badcase 复盘，但必须简短，建议 30 字以内，不要写长篇自我辩论。
 - 调用 `create_game` 时，必须在参数中显式提供 `organizer_id` 和 `organizer_name`，不要假设后端会用当前发送者自动补齐。
-- `organizer_id/organizer_name` 是兼容字段，参数值应填写发起组局需求的客户/首位玩家；后端会把这个客户计入参与者。不要把麻将馆老板填进这个字段。
+- `organizer_id/organizer_name` 在当前领域模型中表示发起组局需求的客户/首位玩家；后端会把这个客户计入参与者。它不表示麻将馆老板，也不是旧结构的兼容入口。
 - 如果发起客户不是一个人，例如“我这边两个人/我们 3 个”，优先传 `requesting_party.seat_count`，也可以在 `known_players` 里对应客户带 `seat_count`；后端会合并成统一 party/seat_claim。不要因为只有一个 `contact_id` 就否认 `known_player_count=2/3`。
 - 工具参数里的关键 ID、展示名、邀约文案、状态变更原因不能留空；不确定就先追问或先调用只读工具查询。
 - 你可以在 `requirement` 里放你理解到的结构化槽位，例如 game_type、stake、base_stake、cap_score、stake_label、smoke_preference、start_time_kind、duration_kind、duration_hours、known_player_count、needed_seats、preferred_gender、user_visible_summary、organizer_id、existing_player_ids。`stake`/`base_stake` 表示底注，`cap_score` 表示封顶，`stake_label` 表示客户习惯说法。搜索候选人时尽量提供 organizer_id 或 existing_player_ids，便于工具按关系画像避开不愿同桌的人。

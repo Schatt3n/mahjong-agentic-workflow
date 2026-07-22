@@ -46,12 +46,18 @@ class ToolGateway:
         message_reference_contract: dict[str, Any] | None = None,
     ) -> ToolResult:
         definition = self.tools.get(call.name)
+        canonical_arguments = (
+            definition.canonical_arguments(call.arguments)
+            if definition is not None
+            else dict(call.arguments)
+        )
         idempotency_key = (
             backend_tool_idempotency_key(
                 call,
                 conversation_id=conversation_id,
                 sender_id=sender_id,
                 source_message_id=source_message_id,
+                arguments=canonical_arguments,
             )
             or call.idempotency_key
             or f"{trace_id}:tool:{step_index}:{call.name}"
@@ -319,10 +325,16 @@ def backend_tool_idempotency_key(
     conversation_id: str,
     sender_id: str,
     source_message_id: str | None,
+    arguments: dict[str, Any] | None = None,
 ) -> str | None:
     if not source_message_id:
         return None
-    canonical_args = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    canonical_args = json.dumps(
+        call.arguments if arguments is None else arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     digest = hashlib.sha256(canonical_args.encode("utf-8")).hexdigest()[:24]
     return (
         f"conversation:{conversation_id}:sender:{sender_id}:"

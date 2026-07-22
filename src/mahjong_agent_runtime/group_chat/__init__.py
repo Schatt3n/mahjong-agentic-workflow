@@ -34,7 +34,11 @@ from .parsing import parse_claim_item_no, parse_explicit_need, parse_game_post
 from .rule_engine import L1RuleEngine
 from .owner_parser import OwnerMessageParser, OwnerParseResult
 from .quick_filter import QuickFilter
-from .session_classifier import GroupSessionClassifier, session_classification_contract
+from .session_classifier import (
+    GroupSessionClassifier,
+    SessionClassificationContractError,
+    session_classification_contract,
+)
 from .session_pipeline import GroupSessionPipeline
 from .session_router import SessionRouter
 from .session_merger import SessionCrystallizer, SessionMerger
@@ -58,6 +62,7 @@ __all__ = [
     "GroupHandleResult",
     "GroupMessage",
     "GroupSessionClassifier",
+    "SessionClassificationContractError",
     "GroupSessionOutcome",
     "GroupSessionPipeline",
     "GroupMessageHandler",

@@ -215,7 +215,7 @@ AgentLoop → Response → Channel
 
 ## 4. 核心数据对象与持久化模型
 
-项目没有 SQLAlchemy、Peewee 或 Pydantic 模型。核心数据契约集中在 `src/mahjong_agent_runtime/models.py`，均为标准库 `@dataclass`。SQLite DDL 位于 `stores/sqlite/migration.py`，多数表采用“关键索引列 + 完整对象 JSON payload”；局参与者是独立关系表，不再嵌入局 payload。
+项目没有 SQLAlchemy、Peewee 或 Pydantic 模型。核心数据契约集中在 `src/mahjong_agent_runtime/models.py`，均为标准库 `@dataclass`。SQLite 当前版本 DDL 位于 `stores/sqlite/schema.py`，多数表采用“关键索引列 + 完整对象 JSON payload”；局参与者是独立关系表，不再嵌入局 payload。开发阶段不提供旧版本自动迁移、双写或读取回退，数据库版本不匹配时直接拒绝启动并要求重建开发库。
 
 | 对象名 | 文件位置 | 核心字段（5 个） | 核心职责 |
 |---|---|---|---|
@@ -628,7 +628,7 @@ flowchart LR
 | Task Context | `src/mahjong_agent_runtime/task_context.py` |
 | 核心数据类 | `src/mahjong_agent_runtime/models.py` |
 | Store 协议 | `src/mahjong_agent_runtime/stores/base.py` |
-| SQLite 聚合与 DDL | `src/mahjong_agent_runtime/stores/sqlite/store.py`、`migration.py` |
+| SQLite 聚合与当前版本 DDL | `src/mahjong_agent_runtime/stores/sqlite/store.py`、`schema.py` |
 | Game/Participant 持久化 | `src/mahjong_agent_runtime/stores/sqlite/game_persistence.py` |
 | 输入聚合调度 | `src/mahjong_agent_runtime/input_aggregation.py` |
 | 持久化任务调度 | `src/mahjong_agent_runtime/scheduled_tasks.py` |

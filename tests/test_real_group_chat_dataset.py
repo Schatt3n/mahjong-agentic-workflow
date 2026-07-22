@@ -7,12 +7,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "validate_real_group_chat_dataset.py"
+FLOW_EVAL_SCRIPT = ROOT / "scripts" / "run_real_group_chat_flow_eval.py"
 
 
 def load_validator_module():
     spec = importlib.util.spec_from_file_location("validate_real_group_chat_dataset", SCRIPT)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load {SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_flow_eval_module():
+    spec = importlib.util.spec_from_file_location("run_real_group_chat_flow_eval", FLOW_EVAL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load {FLOW_EVAL_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -82,3 +93,46 @@ def test_adversarial_cases_cannot_be_promoted_without_resolving_open_questions()
     adversarial = [record for record in records if record["quality_tier"] == "adversarial"]
     assert all(record["review_status"] == "pending_domain_review" for record in adversarial)
     assert all(record["open_questions"] for record in adversarial)
+
+
+def test_real_group_chat_gold_runs_through_deterministic_production_components() -> None:
+    module = load_flow_eval_module()
+
+    report = module.RealGroupChatFlowEvaluator(llm_client=None).evaluate(
+        module.read_jsonl(module.DEFAULT_DATASET)
+    )
+
+    assert report["summary"] == {
+        **report["summary"],
+        "total": 12,
+        "executed": 9,
+        "passed": 9,
+        "failed": 0,
+        "skipped": 3,
+        "pass_rate": 1.0,
+    }
+
+
+def test_real_group_chat_domain_codes_remain_separate_from_stakes() -> None:
+    module = load_flow_eval_module()
+    report = module.RealGroupChatFlowEvaluator(llm_client=None).evaluate(
+        module.read_jsonl(module.DEFAULT_DATASET)
+    )
+    compact = next(item for item in report["cases"] if item["case_id"] == "real_group_compact_multi_board_001")
+    items = compact["actual"]["board_items"]
+
+    assert items[0]["game_type"] == "杭麻"
+    assert items[0]["ruleset"] == "财敲"
+    assert items[2]["game_type"] == "红中麻将"
+    assert items[3]["rule_code"] == "368"
+    assert items[3]["stake"] is None
+
+
+def test_real_group_chat_eval_accepts_semantically_equivalent_domain_labels() -> None:
+    module = load_flow_eval_module()
+
+    assert module.subset_errors(
+        {"stakes": "1", "smoking": "无烟"},
+        {"stakes": "1块", "smoking": "no"},
+        path="classification.extracted_features",
+    ) == []

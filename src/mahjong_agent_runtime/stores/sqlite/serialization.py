@@ -26,7 +26,6 @@ from ...models import (
     MessageReference,
     OutboundDraftStatus,
     OutboundMessageDraft,
-    Party,
     PendingInputBatch,
     PendingInputBatchStatus,
     PendingMemoryCandidate,
@@ -39,7 +38,6 @@ from ...models import (
     ToolCall,
     ToolResult,
 )
-from ...domains import normalize_game_participants, normalize_game_parties
 
 
 def customer_from_payload(payload: dict[str, Any]) -> CustomerProfile:
@@ -219,25 +217,12 @@ def game_participant_from_row(row: sqlite3.Row) -> GameParticipant:
 
 
 def game_from_payload(payload: dict[str, Any]) -> Game:
-    participants = normalize_game_participants(
-        organizer_id=str(payload.get("organizer_id") or ""),
-        organizer_name=str(payload.get("organizer_name") or ""),
-        known_players=list(payload.get("participants") or []),
-    )
-    parties = [
-        Party(
-            party_id=str(item.get("party_id") or f"party_{item.get('contact_id') or item.get('customer_id') or ''}"),
-            contact_id=str(item.get("contact_id") or item.get("customer_id") or ""),
-            contact_name=str(item.get("contact_name") or item.get("display_name") or item.get("contact_id") or ""),
-            seat_count=int(item.get("seat_count") or 1),
-            known_member_ids=[str(member) for member in item.get("known_member_ids") or []],
-            anonymous_seat_count=int(item.get("anonymous_seat_count") or 0),
-            status=str(item.get("status") or "joined"),
-            source=str(item.get("source") or "requester"),
+    embedded_fields = {key for key in ("participants", "parties", "seat_claims") if key in payload}
+    if embedded_fields:
+        names = ", ".join(sorted(embedded_fields))
+        raise ValueError(
+            f"unsupported embedded game fields: {names}; rebuild the development database"
         )
-        for item in payload.get("parties") or []
-        if isinstance(item, dict)
-    ]
     return Game(
         game_id=str(payload.get("game_id") or ""),
         conversation_id=str(payload.get("conversation_id") or ""),
@@ -245,8 +230,8 @@ def game_from_payload(payload: dict[str, Any]) -> Game:
         organizer_name=str(payload.get("organizer_name") or ""),
         requirement=dict(payload.get("requirement") or {}),
         status=GameStatus(str(payload.get("status") or GameStatus.FORMING.value)),
-        participants=participants,
-        parties=parties,
+        participants=[],
+        parties=[],
         seats_total=int(payload.get("seats_total") or 4),
         planned_start_at=optional_datetime_from_payload(payload.get("planned_start_at")),
         planned_end_at=optional_datetime_from_payload(payload.get("planned_end_at")),

@@ -8,6 +8,7 @@ from mahjong_agent_runtime import InMemoryAgentStore, SQLiteAgentStore
 from mahjong_agent_runtime.group_chat import (
     GroupMessage,
     GroupSessionClassifier,
+    SessionClassificationContractError,
     GroupSessionPipeline,
     MessageAccumulator,
     OwnerMessageParser,
@@ -82,7 +83,7 @@ def classification(
             "game_type": None,
             "stakes": None,
             "time": None,
-            "table_id": None,
+            "participant_code": None,
             **(features or {}),
         },
         "matched_board_no": matched_board_no,
@@ -127,12 +128,18 @@ def test_case_1_owner_multiline_board_replaces_persisted_board_without_model() -
     assert board.items[0].to_dict() | {} == {
         "id": board.items[0].id,
         "display_no": 1,
-        "game_type": "cq",
-        "table_id": "371",
+        "game_type": "杭麻",
+        "participant_code": "371",
         "time": "人齐开",
         "smoking": "无烟",
         "stakes": "1块",
         "special_rules": None,
+        "ruleset": "财敲",
+        "end_time": None,
+        "duration_hours": None,
+        "rule_code": None,
+        "temporary_constraints": [],
+        "source_message_id": "board",
         "status": "waiting",
         "slots_total": 4,
         "slots_filled": 3,
@@ -140,8 +147,10 @@ def test_case_1_owner_multiline_board_replaces_persisted_board_without_model() -
     }
     assert board.items[2].special_rules == "3爆"
     assert board.items[2].stakes == ""
-    assert board.items[3].stakes == "568"
-    assert board.items[4].stakes == "368"
+    assert board.items[3].stakes == ""
+    assert board.items[3].rule_code == "568"
+    assert board.items[4].stakes == ""
+    assert board.items[4].rule_code == "368"
     assert llm.calls == []
 
 
@@ -155,12 +164,12 @@ def test_case_1_board_state_survives_sqlite_restart(tmp_path) -> None:
 
     assert restored is not None
     assert restored.source_message_id == "board"
-    assert [(item.game_type, item.table_id, item.stakes) for item in restored.items] == [
-        ("cq", "371", "1块"),
-        ("cq", "272", "1块"),
-        ("红中", "173", ""),
-        ("红中", "272", "568"),
-        ("红中", "173", "368"),
+    assert [(item.game_type, item.ruleset, item.participant_code, item.stakes, item.rule_code) for item in restored.items] == [
+        ("杭麻", "财敲", "371", "1块", None),
+        ("杭麻", "财敲", "272", "1块", None),
+        ("红中麻将", None, "173", "", None),
+        ("红中麻将", None, "272", "", "568"),
+        ("红中麻将", None, "173", "", "368"),
     ]
 
 
@@ -178,9 +187,10 @@ def test_case_2_owner_single_line_updates_unique_board_item_without_invalid_stat
     assert result.action == "board_updated"
     board = store.get_group_board_state("room-1")
     assert board is not None
-    item = next(item for item in board.items if item.table_id == "371")
+    item = next(item for item in board.items if item.participant_code == "371")
     assert item.time == "人齐开"
     assert item.status == "waiting"
+    assert not hasattr(item, "table_id")
     assert board.source_message_id == "update"
     assert llm.calls == []
 
@@ -200,7 +210,7 @@ def test_owner_single_full_board_line_updates_one_item_without_erasing_board() -
     board = store.get_group_board_state("room-1")
     assert board is not None
     assert len(board.items) == 5
-    item = next(item for item in board.items if item.game_type == "cq" and item.table_id == "272")
+    item = next(item for item in board.items if item.game_type == "杭麻" and item.participant_code == "272")
     assert item.time == "18:45"
     assert item.stakes == "1块"
     assert [entry.display_no for entry in board.items] == [1, 2, 3, 4, 5]
@@ -227,6 +237,32 @@ def test_owner_single_new_board_line_appends_without_erasing_existing_items() ->
     assert llm.calls == []
 
 
+def test_owner_explicit_new_board_number_appends_despite_repeated_participant_code() -> None:
+    store = InMemoryAgentStore()
+    llm = RecordingLLM()
+    target = pipeline(store, llm)
+    for index, text in enumerate(("1️⃣4点，1有烟，272", "2️⃣5点，0.5无烟，272", "3️⃣3点半，1无烟，371")):
+        result = target.accept(
+            message(text, sender="owner", message_id=f"seed-{index}", sent_at=NOW),
+            trace_id=f"trace-seed-{index}",
+        )
+        assert result.action in {"board_replaced", "board_updated"}
+
+    result = target.accept(
+        message("4️⃣5点半，1少烟，272", sender="owner", message_id="append-4", sent_at=NOW),
+        trace_id="trace-append-4",
+    )
+
+    assert result.action == "board_updated"
+    board = store.get_group_board_state("room-1")
+    assert board is not None
+    assert [item.display_no for item in board.items] == [1, 2, 3, 4]
+    assert board.items[-1].time == "17:30"
+    assert board.items[-1].smoking == "少烟"
+    assert board.items[-1].participant_code == "272"
+    assert llm.calls == []
+
+
 def test_case_3_fragmented_unique_claim_is_one_model_call_with_only_session_and_board_context() -> None:
     store = InMemoryAgentStore()
     llm = RecordingLLM(
@@ -235,7 +271,7 @@ def test_case_3_fragmented_unique_claim_is_one_model_call_with_only_session_and_
             matched_board_no=4,
             confidence=0.96,
             channel_action="private_switch",
-            features={"game_type": "红中", "stakes": "568", "time": "19:00", "table_id": "272"},
+            features={"game_type": "红中麻将", "rule_code": "568", "time": "19:00", "participant_code": "272"},
         )
     )
     target = pipeline(store, llm)
@@ -529,3 +565,77 @@ def test_case_10_concurrent_topics_remain_isolated() -> None:
     assert second_payload["current_session"]["participants"] == ["另一个人"]
     assert "cq还有吗" not in llm.calls[0]["messages"][-1]["content"]
     assert "红中568我打" not in llm.calls[1]["messages"][-1]["content"]
+
+
+def test_classifier_retries_invalid_scalar_contract_without_coercing_array() -> None:
+    invalid = classification(
+        intent="query",
+        matched_board_no=None,
+        confidence=0.9,
+        channel_action="group_reply",
+        response="暂时没有。",
+    )
+    invalid["channel_action"] = ["group_reply"]
+    valid = classification(
+        intent="query",
+        matched_board_no=None,
+        confidence=0.9,
+        channel_action="group_reply",
+        response="暂时没有。",
+    )
+    llm = RecordingLLM(invalid, valid)
+    target = pipeline(InMemoryAgentStore(), llm)
+    target.accept(message("0.5还有吗", sender="A", message_id="contract-retry"), trace_id="trace-contract")
+
+    outcome = target.flush_due(at=NOW + timedelta(seconds=6))[0]
+
+    assert outcome.action == "group_reply"
+    assert outcome.classification is not None
+    assert outcome.classification.channel_action == "group_reply"
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["trace_id"] == "trace-contract_contract_retry_1"
+    assert "channel_action must be one string scalar" in llm.calls[1]["messages"][-1]["content"]
+
+
+def test_classifier_rejects_array_contract_instead_of_taking_first_value() -> None:
+    invalid = classification(
+        intent="query",
+        matched_board_no=None,
+        confidence=0.9,
+        channel_action="group_reply",
+        response="暂时没有。",
+    )
+    invalid["channel_action"] = ["group_reply"]
+
+    try:
+        GroupSessionClassifier._parse(json.dumps(invalid, ensure_ascii=False), board_state=None)
+    except ValueError as exc:
+        assert str(exc) == "channel_action must be one string scalar"
+    else:
+        raise AssertionError("array-valued channel_action must not be coerced")
+
+
+def test_exhausted_contract_retry_retains_raw_context_without_business_action() -> None:
+    first = classification(
+        intent="query",
+        matched_board_no=None,
+        confidence=0.9,
+        channel_action="group_reply",
+        response="暂时没有。",
+    )
+    second = dict(first)
+    first["channel_action"] = ["group_reply"]
+    second["channel_action"] = ["group_reply"]
+    llm = RecordingLLM(first, second)
+    target = pipeline(InMemoryAgentStore(), llm)
+    target.accept(message("0.5还有吗", sender="A", message_id="contract-failed"), trace_id="trace-failed")
+
+    outcome = target.flush_due(at=NOW + timedelta(seconds=6))[0]
+
+    assert outcome.action == "classification_failed"
+    assert outcome.classification is None
+    assert outcome.detail["attempts"] == 2
+    assert outcome.detail["error_type"] == SessionClassificationContractError.__name__
+    session = target.session_router.list_sessions("room-1")[0]
+    assert [item.message_id for item in session.messages] == ["contract-failed"]
+    assert session.extracted_state == {}

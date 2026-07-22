@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from mahjong_agent_runtime import SQLiteAgentStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,3 +49,26 @@ def test_deterministic_concurrency_suite_preserves_business_invariants(tmp_path)
     assert evidence["state_transitions"]
     assert by_name["room_inventory_race"].checks[0]["actual"] == 1
     assert by_name["duplicate_invite_race"].checks[0]["actual"] == 1
+
+
+def test_sqlite_trace_context_lookup_waits_for_store_lock(tmp_path) -> None:
+    store = SQLiteAgentStore(tmp_path / "trace_context_lock.sqlite3")
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_store_lock() -> None:
+        with store._lock:
+            lock_acquired.set()
+            assert release_lock.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        holder = pool.submit(hold_store_lock)
+        assert lock_acquired.wait(timeout=2)
+        lookup = pool.submit(store._task_context_id_for_trace, "conversation", "trace")
+
+        time.sleep(0.05)
+        assert lookup.done() is False
+
+        release_lock.set()
+        holder.result(timeout=2)
+        assert lookup.result(timeout=2) == ""

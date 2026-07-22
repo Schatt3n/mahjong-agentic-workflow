@@ -9,6 +9,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from mahjong_agent_runtime import (
     AgentAction,
     AgentRuntime,
@@ -3339,7 +3341,7 @@ def test_runtime_create_game_counts_requesting_customer_as_player() -> None:
     assert game.to_dict()["remaining_seats"] == 3
 
 
-def test_runtime_sqlite_create_game_counts_requester_and_repairs_legacy_payload(tmp_path) -> None:
+def test_runtime_sqlite_rejects_embedded_participant_payload(tmp_path) -> None:
     store = seeded_store(SQLiteAgentStore(tmp_path / "runtime_requester_counts.sqlite3"))
 
     game, _ = store.create_game(
@@ -3364,11 +3366,8 @@ def test_runtime_sqlite_create_game_counts_requester_and_repairs_legacy_payload(
             (json.dumps(payload, ensure_ascii=False), game.game_id),
         )
 
-    repaired = store.games[game.game_id]
-    assert [(item.customer_id, item.status, item.source) for item in repaired.participants] == [
-        ("zhang", "joined", "requester")
-    ]
-    assert repaired.remaining_seats() == 3
+    with pytest.raises(ValueError, match="unsupported embedded game fields"):
+        _ = store.games[game.game_id]
 
 
 def test_runtime_game_participants_can_represent_multiple_seats() -> None:

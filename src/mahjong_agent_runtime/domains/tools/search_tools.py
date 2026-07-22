@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ...models import ToolCall, ToolResult
 from ...stores import AgentStore
 from ..game_domain import normalize_requirement
 from .shared import current_game_search_reply_contract
+
+
+def canonical_search_current_games_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Collapse equivalent model arguments into one search identity."""
+
+    return {
+        "requirement": normalize_requirement(dict(arguments.get("requirement") or {})),
+        "limit": int(arguments.get("limit") or 8),
+    }
+
+
+def canonical_search_customers_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Collapse equivalent candidate-search arguments into one search identity."""
+
+    return {
+        "requirement": normalize_requirement(dict(arguments.get("requirement") or {})),
+        "exclude_customer_ids": sorted(
+            {str(item) for item in arguments.get("exclude_customer_ids") or []}
+        ),
+        "limit": int(arguments.get("limit") or 8),
+    }
 
 def search_current_games(store: AgentStore, call: ToolCall, trace_id: str, conversation_id: str, sender_id: str, sender_name: str) -> ToolResult:
     requirement = normalize_requirement(dict(call.arguments.get("requirement") or {}))

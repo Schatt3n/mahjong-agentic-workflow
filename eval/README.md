@@ -43,6 +43,19 @@ python scripts/validate_real_group_chat_dataset.py
 PYTHONPATH=src python -m pytest -q tests/test_real_group_chat_dataset.py
 ```
 
+校验器只负责数据格式与匿名化，不能证明 Agent 能正确处理样本。真实群聊 Gold 还必须回放到实际的 `OwnerMessageParser`、`QuickFilter`、`MessageAccumulator`、`SessionRouter` 和 `GroupSessionClassifier`：
+
+```bash
+# 不调用模型：看板解析、状态演进、引用、撤回和噪声过滤
+PYTHONPATH=src python scripts/run_real_group_chat_flow_eval.py --strict
+
+# 调用当前配置的模型，并把语义样本继续送入主 Agent 验证工具选择
+PYTHONPATH=src python scripts/run_real_group_chat_flow_eval.py --live --strict \
+  --report-path runtime_data/real_group_chat_flow_eval_live.json
+```
+
+报告逐 case 保存 `expected`、`actual`、差异、模型调用次数、模型耗时、主 Agent 工具调用和 trace 步骤。`cq` 规范化为“杭麻/财敲”，“川麻换三”规范化为“川麻/换三张”；`568/368/132` 等三位码在场馆确认规则前仅保存在 `rule_code`，不得推断成底注、封顶或番数。
+
 单独运行上下文压缩质量评测：
 
 ```bash
@@ -70,5 +83,7 @@ PYTHONPATH=src python scripts/run_privacy_isolation_live_eval.py --strict
 ```bash
 MAHJONG_LLM_PROVIDER=deepseek MAHJONG_LLM_MODEL=deepseek-v4-flash DEEPSEEK_API_KEY=*** PYTHONPATH=src python scripts/run_evals.py --live-real-owner
 ```
+
+追加 `--live-real-group` 可把真实群聊语义样本也纳入总评估。
 
 `scripts/check_badcase_regression_coverage.py` 会审计所有 fixed badcase 是否已经闭环到当前回归资产，避免问题只停留在日志里。

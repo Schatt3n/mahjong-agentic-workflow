@@ -29,12 +29,19 @@ from .schemas import (
     requesting_party_schema,
     requirement_schema,
 )
-from .search_tools import check_room_availability, search_current_games, search_customers
+from .search_tools import (
+    canonical_search_current_games_arguments,
+    canonical_search_customers_arguments,
+    check_room_availability,
+    search_current_games,
+    search_customers,
+)
 from .shared import CANDIDATE_REPLY_STATUSES, GAME_STATUSES
 from .waiting_tools import cancel_waiting_demand, register_waiting_demand
 
 
 ToolHandler = Callable[[ToolCall, str, str, str, str], ToolResult]
+ToolArgumentsCanonicalizer = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(slots=True)
@@ -46,6 +53,14 @@ class ToolDefinition:
     schema: dict[str, Any]
     handler: ToolHandler | None = None
     parallel_safe: bool = False
+    arguments_canonicalizer: ToolArgumentsCanonicalizer | None = None
+
+    def canonical_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Return the semantic arguments used for idempotency and progress checks."""
+
+        if self.arguments_canonicalizer is None:
+            return dict(arguments)
+        return self.arguments_canonicalizer(dict(arguments))
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +118,7 @@ def default_tool_definitions(store: AgentStore) -> dict[str, ToolDefinition]:
             {"type": "object", "required": ["requirement"], "properties": {"requirement": requirement_schema, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}},
             partial(search_current_games, store),
             parallel_safe=True,
+            arguments_canonicalizer=canonical_search_current_games_arguments,
         ),
         "search_customers": ToolDefinition(
             "search_customers",
@@ -112,6 +128,7 @@ def default_tool_definitions(store: AgentStore) -> dict[str, ToolDefinition]:
             {"type": "object", "required": ["requirement"], "properties": {"requirement": requirement_schema, "exclude_customer_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}},
             partial(search_customers, store),
             parallel_safe=True,
+            arguments_canonicalizer=canonical_search_customers_arguments,
         ),
         "register_waiting_demand": ToolDefinition(
             "register_waiting_demand",

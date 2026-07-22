@@ -1,26 +1,34 @@
-"""SQLite migration store operations."""
+"""SQLite schema initialization and strict version validation."""
 
 from __future__ import annotations
 
-from ...models import now
-from ...domains import (
-    normalize_game_participants,
-    normalize_game_parties,
-)
-from .serialization import (
-    _dumps,
-    _game_from_payload,
-    _game_storage_payload,
-    _loads,
-    _optional_datetime_from_payload,
-)
+CURRENT_SCHEMA_VERSION = 1
 
-class SQLiteMigrationStoreMixin:
-    """Backend-specific operations extracted from the compatibility store."""
+
+class SQLiteSchemaStoreMixin:
+    """Create only the current schema and reject older database layouts."""
 
     __slots__ = ()
 
-    def _migrate(self) -> None:
+    def _initialize_schema(self) -> None:
+        existing_tables = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        schema_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if existing_tables and schema_version != CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "unsupported SQLite schema version "
+                f"{schema_version}; expected {CURRENT_SCHEMA_VERSION}. "
+                "Rebuild the development database; automatic legacy migration is intentionally disabled."
+            )
+        if not existing_tables and schema_version not in {0, CURRENT_SCHEMA_VERSION}:
+            raise RuntimeError(
+                "unsupported SQLite schema version "
+                f"{schema_version}; expected {CURRENT_SCHEMA_VERSION}"
+            )
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS runtime_customers(
@@ -316,6 +324,12 @@ class SQLiteMigrationStoreMixin:
                 PRIMARY KEY(channel, source_message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_runtime_turns_conversation_id ON runtime_conversation_turns(conversation_id, id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_turns_task_context
+                ON runtime_conversation_turns(conversation_id, task_context_id, id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_turns_source_message
+                ON runtime_conversation_turns(conversation_id, source_message_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_task_checkpoints_conversation
+                ON runtime_task_context_checkpoints(conversation_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_a ON runtime_customer_relationships(customer_a_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_b ON runtime_customer_relationships(customer_b_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_games_status ON runtime_games(status);
@@ -356,149 +370,5 @@ class SQLiteMigrationStoreMixin:
                 ON runtime_channel_observations(semantic_action, received_at);
             """
         )
-        self._migrate_conversation_task_indexes()
-        self._migrate_embedded_game_participants()
+        self._connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         self._connection.commit()
-
-    def _migrate_conversation_task_indexes(self) -> None:
-        """Add task/message lookup columns without breaking existing databases."""
-
-        columns = {
-            str(row["name"])
-            for row in self._connection.execute("PRAGMA table_info(runtime_conversation_turns)").fetchall()
-        }
-        if "task_context_id" not in columns:
-            self._connection.execute(
-                "ALTER TABLE runtime_conversation_turns ADD COLUMN task_context_id TEXT NOT NULL DEFAULT ''"
-            )
-        if "source_message_id" not in columns:
-            self._connection.execute(
-                "ALTER TABLE runtime_conversation_turns ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''"
-            )
-
-        rows = self._connection.execute(
-            """
-            SELECT id, payload
-            FROM runtime_conversation_turns
-            WHERE task_context_id = '' OR source_message_id = ''
-            """
-        ).fetchall()
-        for row in rows:
-            payload = _loads(row["payload"])
-            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            self._connection.execute(
-                """
-                UPDATE runtime_conversation_turns
-                SET task_context_id = ?, source_message_id = ?
-                WHERE id = ?
-                """,
-                (
-                    str(metadata.get("task_context_id") or ""),
-                    str(metadata.get("source_message_id") or ""),
-                    int(row["id"]),
-                ),
-            )
-        self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_runtime_turns_task_context
-            ON runtime_conversation_turns(conversation_id, task_context_id, id)
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_runtime_turns_source_message
-            ON runtime_conversation_turns(conversation_id, source_message_id)
-            """
-        )
-        self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_runtime_task_checkpoints_conversation
-            ON runtime_task_context_checkpoints(conversation_id, updated_at)
-            """
-        )
-        legacy_checkpoints = self._connection.execute(
-            """
-            SELECT conversation_id, payload, updated_at
-            FROM runtime_conversation_checkpoints
-            """
-        ).fetchall()
-        for row in legacy_checkpoints:
-            payload = _loads(row["payload"])
-            task_context_id = str(payload.get("task_context_id") or "")
-            if not task_context_id:
-                continue
-            self._connection.execute(
-                """
-                INSERT INTO runtime_task_context_checkpoints(
-                    task_context_id, conversation_id, payload, updated_at
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(task_context_id) DO NOTHING
-                """,
-                (
-                    task_context_id,
-                    str(row["conversation_id"]),
-                    str(row["payload"]),
-                    str(row["updated_at"]),
-                ),
-            )
-
-    def _migrate_embedded_game_participants(self) -> None:
-        """Backfill legacy embedded participants and remove them from game JSON.
-
-        The migration is idempotent. Once normalized rows exist, they are the
-        authority and a stale legacy payload can never overwrite them.
-        """
-
-        rows = self._connection.execute(
-            "SELECT game_id, payload, updated_at FROM runtime_games"
-        ).fetchall()
-        for row in rows:
-            game_id = str(row["game_id"])
-            payload = _loads(row["payload"])
-            participant_count = int(
-                self._connection.execute(
-                    "SELECT COUNT(*) AS count FROM runtime_game_participants WHERE game_id = ?",
-                    (game_id,),
-                ).fetchone()["count"]
-            )
-            if participant_count == 0:
-                legacy_participant_payloads = {
-                    str(item.get("customer_id") or ""): item
-                    for item in payload.get("participants") or []
-                    if isinstance(item, dict) and str(item.get("customer_id") or "")
-                }
-                participants = normalize_game_participants(
-                    organizer_id=str(payload.get("organizer_id") or ""),
-                    organizer_name=str(payload.get("organizer_name") or ""),
-                    known_players=list(payload.get("participants") or []),
-                )
-                legacy_joined_at = _optional_datetime_from_payload(payload.get("created_at")) or now()
-                for participant in participants:
-                    raw = legacy_participant_payloads.get(participant.customer_id, {})
-                    participant.display_name = str(raw.get("display_name") or participant.display_name)
-                    participant.source = str(raw.get("source") or participant.source)
-                    participant.party_id = str(raw.get("party_id") or participant.party_id or "") or None
-                    participant.known_member_ids = [
-                        str(item) for item in raw.get("known_member_ids") or participant.known_member_ids
-                    ]
-                    participant.anonymous_seat_count = max(
-                        0,
-                        int(raw.get("anonymous_seat_count", participant.anonymous_seat_count) or 0),
-                    )
-                    participant.joined_at = (
-                        _optional_datetime_from_payload(raw.get("joined_at"))
-                        if isinstance(raw, dict)
-                        else None
-                    ) or legacy_joined_at
-                migration_game = _game_from_payload(payload)
-                migration_game.participants = participants
-                migration_game.parties = normalize_game_parties(participants)
-                self._save_game_participants(migration_game)
-
-            normalized_payload = _game_storage_payload(_game_from_payload(payload))
-            if normalized_payload != payload:
-                self._connection.execute(
-                    "UPDATE runtime_games SET payload = ?, updated_at = ? WHERE game_id = ?",
-                    (_dumps(normalized_payload), str(row["updated_at"]), game_id),
-                )

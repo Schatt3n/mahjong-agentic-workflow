@@ -20,6 +20,9 @@ class QuickFilter:
     """Reject obvious noise only; ambiguous natural language continues downstream."""
 
     def should_filter(self, message: GroupMessage) -> bool:
+        content_type = str(message.metadata.get("content_type") or "").strip().lower()
+        if content_type in {"sticker_xml", "sticker", "pin_event", "unpin_event", "pat_event"}:
+            return True
         text = "".join((message.text or "").split())
         if not text:
             return True

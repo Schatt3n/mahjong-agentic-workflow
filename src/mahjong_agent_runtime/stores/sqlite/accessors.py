@@ -39,7 +39,7 @@ from .serialization import (
 )
 
 class SQLiteAccessorsStoreMixin:
-    """Backend-specific operations extracted from the compatibility store."""
+    """Read current-schema entities and hydrate normalized aggregate views."""
 
     __slots__ = ()
 

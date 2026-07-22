@@ -109,11 +109,17 @@ class BoardItem:
     id: str
     display_no: int
     game_type: str
-    table_id: str
+    participant_code: str
     time: str | None
     smoking: str | None
     stakes: str
     special_rules: str | None
+    ruleset: str | None = None
+    end_time: str | None = None
+    duration_hours: float | None = None
+    rule_code: str | None = None
+    temporary_constraints: list[str] = field(default_factory=list)
+    source_message_id: str | None = None
     status: Literal["waiting", "full", "playing"] = "waiting"
     slots_total: int = 4
     slots_filled: int = 0
@@ -121,6 +127,14 @@ class BoardItem:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def current_players(self) -> int:
+        return self.slots_filled
+
+    @property
+    def missing_players(self) -> int:
+        return max(0, self.slots_total - self.slots_filled)
 
 
 @dataclass(slots=True)
