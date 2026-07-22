@@ -138,6 +138,17 @@ class SQLiteAccessorsStoreMixin:
             }
 
     @property
+    def task_context_checkpoints(self) -> dict[str, ConversationCheckpoint]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT task_context_id, payload FROM runtime_task_context_checkpoints"
+            ).fetchall()
+            return {
+                str(row["task_context_id"]): _checkpoint_from_payload(_loads(row["payload"]))
+                for row in rows
+            }
+
+    @property
     def task_contexts(self) -> dict[str, ConversationTaskContext]:
         with self._lock:
             rows = self._connection.execute("SELECT payload FROM runtime_task_contexts").fetchall()

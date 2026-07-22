@@ -145,6 +145,11 @@ class AgentRuntime(RuntimeCompatibilityMixin):
         """Handle one user message with per-conversation ordering and idempotency."""
 
         assert self.coordination_manager is not None
+        # Channel/user payloads cannot self-authorize historical task recovery.
+        # Only the dedicated system-event entry points may add this private key.
+        public_metadata = dict(message.metadata or {})
+        public_metadata.pop("_trusted_source_task_context_id", None)
+        message.metadata = public_metadata
         with self.coordination_manager.lock(f"conversation:{message.conversation_id or 'default'}"):
             actual_trace_id = trace_id or f"trace_{uuid.uuid4().hex[:12]}"
             self._emit("message_received", actual_trace_id, {"message": message.to_dict()})
@@ -223,6 +228,7 @@ class AgentRuntime(RuntimeCompatibilityMixin):
                 summary_result = self.context_lifecycle.maybe_summarize_after_turn(
                     conversation_id=message.conversation_id,
                     trace_id=actual_trace_id,
+                    task_context_id=self.context_lifecycle.summary_task_context_id(message),
                 )
                 if summary_result is not None and summary_result.transition is not None:
                     result.state_transitions.append(summary_result.transition)
@@ -254,6 +260,9 @@ class AgentRuntime(RuntimeCompatibilityMixin):
         assert self.coordination_manager is not None
         metadata = dict(message.metadata or {})
         metadata.update({"internal_event": True, "delivery_mode": "internal_only"})
+        source_task_context_id = str(metadata.get("task_context_id") or "")
+        if source_task_context_id:
+            metadata["_trusted_source_task_context_id"] = source_task_context_id
         message.metadata = metadata
         with self.coordination_manager.lock(f"conversation:{message.conversation_id or 'default'}"):
             actual_trace_id = trace_id or f"trace_system_{uuid.uuid4().hex[:12]}"
@@ -288,6 +297,7 @@ class AgentRuntime(RuntimeCompatibilityMixin):
                 summary_result = self.context_lifecycle.maybe_summarize_after_turn(
                     conversation_id=message.conversation_id,
                     trace_id=actual_trace_id,
+                    task_context_id=self.context_lifecycle.summary_task_context_id(message),
                 )
                 if summary_result is not None and summary_result.transition is not None:
                     result.state_transitions.append(summary_result.transition)
@@ -323,6 +333,12 @@ class AgentRuntime(RuntimeCompatibilityMixin):
 
         assert self.coordination_manager is not None
         message = trigger.to_user_message()
+        source_task_context_id = str(trigger.payload.get("task_context_id") or "")
+        if source_task_context_id:
+            message.metadata = {
+                **dict(message.metadata),
+                "_trusted_source_task_context_id": source_task_context_id,
+            }
         with self.coordination_manager.lock(f"conversation:{trigger.conversation_id or 'default'}"):
             actual_trace_id = trace_id or f"trace_trigger_{uuid.uuid4().hex[:12]}"
             message_key = message_idempotency_key(message)
@@ -370,6 +386,7 @@ class AgentRuntime(RuntimeCompatibilityMixin):
                 summary_result = self.context_lifecycle.maybe_summarize_after_turn(
                     conversation_id=trigger.conversation_id,
                     trace_id=actual_trace_id,
+                    task_context_id=self.context_lifecycle.summary_task_context_id(message),
                 )
                 if summary_result is not None and summary_result.transition is not None:
                     result.state_transitions.append(summary_result.transition)

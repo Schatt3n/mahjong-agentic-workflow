@@ -138,6 +138,10 @@ class ContextSummaryQualityEvaluator:
         summary_result = self.summary_manager.summarize_for_quality_evaluation(
             conversation_id=message.conversation_id,
             trace_id=f"{trace_id}:summary",
+            task_context_id=str(
+                baseline_context.payload.get("task_context_window", {}).get("task_context_id") or ""
+            )
+            or None,
         )
         if not summary_result.summarized or summary_result.checkpoint is None:
             report = DecisionConsistencyReport(

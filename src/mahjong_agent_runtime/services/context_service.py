@@ -99,6 +99,7 @@ class ContextLifecycleManager:
             return built, None
         summary_result = self._summarize(
             message,
+            built=built,
             trace_id=trace_id,
             estimated=estimated,
             threshold=threshold,
@@ -146,7 +147,11 @@ class ContextLifecycleManager:
         return rebuilt, summary_result.transition
 
     def maybe_summarize_after_turn(
-        self, *, conversation_id: str, trace_id: str
+        self,
+        *,
+        conversation_id: str,
+        trace_id: str,
+        task_context_id: str | None = None,
     ) -> ContextSummaryResult | None:
         """Run the lower-priority post-turn checkpoint policy when configured."""
 
@@ -155,18 +160,21 @@ class ContextLifecycleManager:
         return self.context_summary_manager.maybe_summarize_after_turn(
             conversation_id=conversation_id,
             trace_id=trace_id,
+            task_context_id=task_context_id,
         )
 
     def _summarize(
         self,
         message: UserMessage,
         *,
+        built: BuiltContext,
         trace_id: str,
         estimated: int,
         threshold: int,
         budget: TokenBudget,
     ) -> ContextSummaryResult | None:
         assert self.context_summary_manager is not None
+        task_context_id = self.summary_task_context_id(message, built=built)
         try:
             return self.context_summary_manager.summarize_for_context_budget(
                 conversation_id=message.conversation_id,
@@ -174,6 +182,7 @@ class ContextLifecycleManager:
                 estimated_context_tokens=estimated,
                 max_context_tokens=budget.max_tokens_per_call,
                 trigger_threshold_tokens=threshold,
+                task_context_id=task_context_id,
             )
         except Exception as exc:
             self.trace_recorder.record(
@@ -187,6 +196,43 @@ class ContextLifecycleManager:
                 level="ERROR",
             )
             return None
+
+    def summary_task_context_id(
+        self,
+        message: UserMessage,
+        *,
+        built: BuiltContext | None = None,
+    ) -> str | None:
+        """Return the backend-resolved summary scope for this turn.
+
+        Trusted scheduled/system events may resume an older task explicitly.
+        Ordinary messages use the task selected by ``TaskContextManager`` and
+        exposed in the already-built context; user text never chooses this id.
+        """
+
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        trusted_source = str(metadata.get("_trusted_source_task_context_id") or "")
+        if trusted_source:
+            task_context = (
+                self.context_summary_manager.store.get_task_context(trusted_source)
+                if self.context_summary_manager
+                else None
+            )
+            if task_context is not None and task_context.conversation_id == message.conversation_id:
+                return trusted_source
+        if built is not None:
+            window = built.payload.get("task_context_window") if isinstance(built.payload, dict) else None
+            if isinstance(window, dict):
+                resolved = str(window.get("task_context_id") or "")
+                if resolved:
+                    return resolved
+        if self.context_summary_manager is None:
+            return None
+        task_context = self.context_summary_manager.store.current_task_context(
+            message.conversation_id,
+            message.sender_id,
+        )
+        return task_context.task_context_id if task_context is not None else None
 
     def _emit(self, event_name: str, *, trace_id: str, payload: dict[str, Any]) -> None:
         if self.hook_manager is not None:

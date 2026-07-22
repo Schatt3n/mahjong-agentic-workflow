@@ -24,6 +24,7 @@ from .message_context import (
 from .relationship_context import build_relationship_context
 from .sanitization import sanitize_current_message_for_context
 from .tool_results import tool_result_for_context
+from .task_recovery import recover_referenced_task_contexts
 
 
 DEFAULT_PROMPT_PATH = Path(__file__).resolve().parents[2].joinpath("prompts", "agent_runtime_system.md")
@@ -93,6 +94,13 @@ class AgentContextBuilder:
             quoted_message_context,
         )
         quoted_message = message.quoted_message
+        recovered_tasks = recover_referenced_task_contexts(
+            self.store,
+            message,
+            current_message,
+            current_task_context_id=task_context.task_context_id if task_context else None,
+            packing_policy=self.packing_policy,
+        )
 
         audit = {
             **conversation.audit,
@@ -116,6 +124,7 @@ class AgentContextBuilder:
             "task_context_started_at": task_context.started_at.isoformat() if task_context else None,
             "system_trigger_present": system_trigger is not None,
             "system_trigger_type": system_trigger.get("trigger_type") if system_trigger else None,
+            **recovered_tasks.audit,
         }
 
         payload = {
@@ -136,6 +145,7 @@ class AgentContextBuilder:
             "quoted_message_context": quoted_message_context,
             "recent_conversation": conversation.recent_conversation,
             "conversation_checkpoint": checkpoint.to_dict() if checkpoint else None,
+            "recovered_task_contexts": recovered_tasks.items,
             "context_budget": audit,
             "sender_profile": customer.profile,
             "sender_relationships": relationship.relationships,

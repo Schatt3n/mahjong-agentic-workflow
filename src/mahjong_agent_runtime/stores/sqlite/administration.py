@@ -29,6 +29,7 @@ class SQLiteAdministrationStoreMixin:
             ("state_transitions", "runtime_state_transitions"),
             ("conversation_turns", "runtime_conversation_turns"),
             ("conversation_checkpoints", "runtime_conversation_checkpoints"),
+            ("task_context_checkpoints", "runtime_task_context_checkpoints"),
             ("task_contexts", "runtime_task_contexts"),
             ("conversation_versions", "runtime_conversation_versions"),
             ("idempotency_ledger", "runtime_idempotency_ledger"),

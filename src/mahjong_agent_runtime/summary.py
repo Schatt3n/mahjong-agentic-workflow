@@ -69,15 +69,26 @@ class ContextSummaryManager:
     policy: ContextSummaryPolicy = field(default_factory=ContextSummaryPolicy)
     prompt_path: Path = DEFAULT_CONTEXT_SUMMARY_PROMPT_PATH
 
-    def maybe_summarize_after_turn(self, *, conversation_id: str, trace_id: str) -> ContextSummaryResult:
+    def maybe_summarize_after_turn(
+        self,
+        *,
+        conversation_id: str,
+        trace_id: str,
+        task_context_id: str | None = None,
+    ) -> ContextSummaryResult:
         """在一轮处理结束后按常规阈值尝试生成 checkpoint。"""
 
-        decision = self.should_summarize(conversation_id)
+        decision = self.should_summarize(conversation_id, task_context_id=task_context_id)
         self._record(trace_id, "context_summary_checked", decision.to_dict())
         if not decision.should_summarize:
             return ContextSummaryResult(False, decision.reason)
 
-        return self._summarize(conversation_id=conversation_id, trace_id=trace_id, trigger="after_turn")
+        return self._summarize(
+            conversation_id=conversation_id,
+            trace_id=trace_id,
+            trigger="after_turn",
+            task_context_id=task_context_id,
+        )
 
     def summarize_for_context_budget(
         self,
@@ -87,6 +98,7 @@ class ContextSummaryManager:
         estimated_context_tokens: int,
         max_context_tokens: int,
         trigger_threshold_tokens: int,
+        task_context_id: str | None = None,
     ) -> ContextSummaryResult:
         """在主模型调用前，因为上下文接近或超过预算而强制尝试摘要。
 
@@ -104,13 +116,19 @@ class ContextSummaryManager:
                 "trigger_threshold_tokens": trigger_threshold_tokens,
             },
         )
-        return self._summarize(conversation_id=conversation_id, trace_id=trace_id, trigger="context_budget")
+        return self._summarize(
+            conversation_id=conversation_id,
+            trace_id=trace_id,
+            trigger="context_budget",
+            task_context_id=task_context_id,
+        )
 
     def summarize_for_quality_evaluation(
         self,
         *,
         conversation_id: str,
         trace_id: str,
+        task_context_id: str | None = None,
     ) -> ContextSummaryResult:
         """Force one checkpoint for an offline decision-consistency evaluation."""
 
@@ -123,12 +141,24 @@ class ContextSummaryManager:
             conversation_id=conversation_id,
             trace_id=trace_id,
             trigger="quality_evaluation",
+            task_context_id=task_context_id,
         )
 
-    def _summarize(self, *, conversation_id: str, trace_id: str, trigger: str) -> ContextSummaryResult:
+    def _summarize(
+        self,
+        *,
+        conversation_id: str,
+        trace_id: str,
+        trigger: str,
+        task_context_id: str | None = None,
+    ) -> ContextSummaryResult:
         """执行一次摘要模型调用并保存 checkpoint。"""
 
-        payload = self._build_summary_payload(conversation_id)
+        payload = self._build_summary_payload(
+            conversation_id,
+            task_context_id=task_context_id,
+        )
+        resolved_task_context_id = str(payload.get("task_context_id") or "") or None
         messages = [
             {"role": "system", "content": self.prompt_path.read_text(encoding="utf-8")},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
@@ -187,14 +217,22 @@ class ContextSummaryManager:
             facts=facts,
             open_questions=[str(item)[:200] for item in summary.get("open_questions") or []][: self.policy.max_open_questions],
             trace_id=trace_id,
+            task_context_id=resolved_task_context_id,
         )
         self._record(trace_id, "context_summary_saved", {"checkpoint": checkpoint.to_dict(), "transition": transition.to_dict()})
         self._record(trace_id, "state_transition", transition.to_dict())
         return ContextSummaryResult(True, "checkpoint updated", checkpoint=checkpoint, transition=transition)
 
-    def should_summarize(self, conversation_id: str) -> ContextSummaryDecision:
-        turns = self.store.recent_turns(conversation_id, self.policy.max_turns_considered)
-        checkpoint = self.store.get_conversation_checkpoint(conversation_id)
+    def should_summarize(
+        self,
+        conversation_id: str,
+        *,
+        task_context_id: str | None = None,
+    ) -> ContextSummaryDecision:
+        _, turns, checkpoint = self._summary_scope(
+            conversation_id,
+            task_context_id=task_context_id,
+        )
         estimated = estimate_tokens([turn.to_dict() for turn in turns])
         turns_since_checkpoint = count_turns_since_checkpoint(turns, checkpoint)
         if len(turns) < self.policy.min_turns_before_summary:
@@ -205,13 +243,21 @@ class ContextSummaryManager:
             return ContextSummaryDecision(False, "recent conversation tokens below threshold", len(turns), turns_since_checkpoint, estimated)
         return ContextSummaryDecision(True, "summary thresholds exceeded", len(turns), turns_since_checkpoint, estimated)
 
-    def _build_summary_payload(self, conversation_id: str) -> dict[str, Any]:
-        raw_turns = self.store.recent_turns(conversation_id, self.policy.max_turns_considered)
-        checkpoint = self.store.get_conversation_checkpoint(conversation_id)
+    def _build_summary_payload(
+        self,
+        conversation_id: str,
+        *,
+        task_context_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_task_context_id, raw_turns, checkpoint = self._summary_scope(
+            conversation_id,
+            task_context_id=task_context_id,
+        )
         active_games = self.store.active_games(conversation_id)
         active_game_ids = {item.game_id for item in active_games}
         payload = {
             "conversation_id": conversation_id,
+            "task_context_id": resolved_task_context_id,
             "existing_checkpoint": checkpoint.to_dict() if checkpoint else None,
             "recent_conversation": [],
             "active_games": [
@@ -245,6 +291,10 @@ class ContextSummaryManager:
                     "candidate_progress",
                     "active_game_id",
                 ],
+                "scope_contract": (
+                    "Summarize only this task_context_id. Do not merge facts from other business episodes "
+                    "that share the same conversation_id."
+                ),
             },
         }
         # The policy limits the entire model request, not just raw turns. Reserve
@@ -264,6 +314,64 @@ class ContextSummaryManager:
             "total_prompt_token_limit": self.policy.max_summary_input_tokens,
         }
         return payload
+
+    def _summary_scope(
+        self,
+        conversation_id: str,
+        *,
+        task_context_id: str | None,
+    ) -> tuple[str | None, list[ConversationTurn], ConversationCheckpoint | None]:
+        """Resolve a task-scoped history before applying any turn limit.
+
+        ``conversation_id`` is a stable channel/privacy boundary and can contain
+        many independent business episodes. A supplied task id is authoritative
+        only when it belongs to that conversation. Without one, the latest task
+        is used for backward-compatible direct callers.
+        """
+
+        requested_task_context_id = str(task_context_id or "") or None
+        task_context = (
+            self.store.get_task_context(requested_task_context_id)
+            if requested_task_context_id
+            else self.store.latest_task_context(conversation_id)
+        )
+        if requested_task_context_id and (
+            task_context is None or task_context.conversation_id != conversation_id
+        ):
+            return requested_task_context_id, [], None
+        if task_context is None:
+            return (
+                None,
+                self.store.recent_turns(conversation_id, self.policy.max_turns_considered),
+                self.store.get_conversation_checkpoint(conversation_id),
+            )
+
+        resolved_task_context_id = task_context.task_context_id
+        turns = self.store.task_context_turns(
+            conversation_id,
+            resolved_task_context_id,
+            self.policy.max_turns_considered,
+        )
+        # Databases created before task-scoped turn indexing can contain turns
+        # without a task id. Retain only legacy turns inside this task's time
+        # window; explicitly tagged turns from other tasks remain excluded.
+        known_turns = {
+            (turn.trace_id, turn.role.value, turn.occurred_at.isoformat(), turn.content)
+            for turn in turns
+        }
+        for turn in self.store.recent_turns(conversation_id, self.policy.max_turns_considered):
+            identity = (turn.trace_id, turn.role.value, turn.occurred_at.isoformat(), turn.content)
+            if (
+                not turn.metadata.get("task_context_id")
+                and turn.occurred_at >= task_context.started_at
+                and (task_context.closed_at is None or turn.occurred_at <= task_context.closed_at)
+                and identity not in known_turns
+            ):
+                turns.append(turn)
+                known_turns.add(identity)
+        turns.sort(key=lambda turn: turn.occurred_at)
+        checkpoint = self.store.get_task_context_checkpoint(resolved_task_context_id)
+        return resolved_task_context_id, turns, checkpoint
 
     def _validate_summary_facts(self, facts: dict[str, Any]) -> str | None:
         game_id = facts.get("active_game_id")

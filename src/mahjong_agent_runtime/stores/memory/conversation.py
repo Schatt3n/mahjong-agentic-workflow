@@ -24,8 +24,14 @@ class InMemoryConversationStoreMixin:
     def append_user_turn(self, message, trace_id: str) -> None:
         task_context = self.current_task_context(message.conversation_id, message.sender_id)
         metadata = dict(getattr(message, "metadata", {}) or {})
-        if task_context is not None:
+        metadata.setdefault("source_message_id", str(getattr(message, "message_id", "") or ""))
+        trusted_task_context_id = str(metadata.pop("_trusted_source_task_context_id", "") or "")
+        if trusted_task_context_id:
+            metadata["task_context_id"] = trusted_task_context_id
+        elif task_context is not None:
             metadata["task_context_id"] = task_context.task_context_id
+        else:
+            metadata.pop("task_context_id", None)
         self.append_turn(
             message.conversation_id,
             ConversationTurn(
@@ -46,10 +52,14 @@ class InMemoryConversationStoreMixin:
         trace_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        task_context = self.latest_task_context(conversation_id)
         turn_metadata = dict(metadata or {})
-        if task_context is not None:
-            turn_metadata.setdefault("task_context_id", task_context.task_context_id)
+        task_context_id = self._task_context_id_for_trace(conversation_id, trace_id)
+        if task_context_id:
+            turn_metadata.setdefault("task_context_id", task_context_id)
+        else:
+            task_context = self.latest_task_context(conversation_id)
+            if task_context is not None:
+                turn_metadata.setdefault("task_context_id", task_context.task_context_id)
         self.append_turn(
             conversation_id,
             ConversationTurn(
@@ -61,8 +71,11 @@ class InMemoryConversationStoreMixin:
         )
 
     def append_tool_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
-        task_context = self.latest_task_context(conversation_id)
-        metadata = {"task_context_id": task_context.task_context_id} if task_context else {}
+        task_context_id = self._task_context_id_for_trace(conversation_id, trace_id)
+        if not task_context_id:
+            task_context = self.latest_task_context(conversation_id)
+            task_context_id = task_context.task_context_id if task_context else ""
+        metadata = {"task_context_id": task_context_id} if task_context_id else {}
         self.append_turn(
             conversation_id,
             ConversationTurn(role=ConversationRole.TOOL, content=text, trace_id=trace_id, metadata=metadata),
@@ -76,9 +89,63 @@ class InMemoryConversationStoreMixin:
         with self._lock:
             return list(self.turns.get(conversation_id, []))[-int(limit):]
 
+    def task_context_turns(
+        self,
+        conversation_id: str,
+        task_context_id: str,
+        limit: int = 60,
+    ) -> list[ConversationTurn]:
+        """Return the newest turns belonging to one business episode.
+
+        The filtering happens before limiting, so unrelated group traffic cannot
+        evict a future appointment's evidence from its own task window.
+        """
+
+        with self._lock:
+            matches = [
+                turn
+                for turn in self.turns.get(conversation_id, [])
+                if str(turn.metadata.get("task_context_id") or "") == task_context_id
+            ]
+            return matches[-int(limit):]
+
+    def find_conversation_turn(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str | None = None,
+        text: str | None = None,
+        sender_id: str | None = None,
+    ) -> ConversationTurn | None:
+        """Resolve an old platform message inside the same conversation only."""
+
+        with self._lock:
+            turns = list(self.turns.get(conversation_id, []))
+            if message_id:
+                for turn in reversed(turns):
+                    if str(turn.metadata.get("source_message_id") or "") == message_id:
+                        return turn
+            normalized_text = str(text or "").strip()
+            if normalized_text:
+                for turn in reversed(turns):
+                    if turn.content != normalized_text:
+                        continue
+                    if sender_id and turn.sender_id != sender_id:
+                        continue
+                    return turn
+            return None
+
     def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpoint | None:
         with self._lock:
             return self.conversation_checkpoints.get(conversation_id)
+
+    def get_task_context_checkpoint(self, task_context_id: str) -> ConversationCheckpoint | None:
+        with self._lock:
+            return self.task_context_checkpoints.get(task_context_id)
+
+    def get_task_context(self, task_context_id: str) -> ConversationTaskContext | None:
+        with self._lock:
+            return self.task_contexts.get(task_context_id)
 
     def current_task_context(self, conversation_id: str, customer_id: str) -> ConversationTaskContext | None:
         with self._lock:
@@ -298,19 +365,25 @@ class InMemoryConversationStoreMixin:
         facts: dict[str, Any],
         open_questions: list[str],
         trace_id: str,
+        task_context_id: str | None = None,
     ) -> tuple[ConversationCheckpoint, StateTransition]:
         with self._lock:
             previous = self.conversation_checkpoints.get(conversation_id)
             task_context = self.latest_task_context(conversation_id)
+            resolved_task_context_id = task_context_id or (
+                task_context.task_context_id if task_context else None
+            )
             checkpoint = ConversationCheckpoint(
                 conversation_id=conversation_id,
                 summary=summary,
                 facts=dict(facts),
                 open_questions=list(open_questions),
-                task_context_id=task_context.task_context_id if task_context else None,
+                task_context_id=resolved_task_context_id,
                 source_trace_id=trace_id,
             )
             self.conversation_checkpoints[conversation_id] = checkpoint
+            if checkpoint.task_context_id:
+                self.task_context_checkpoints[checkpoint.task_context_id] = checkpoint
             transition = StateTransition(
                 entity_type="conversation_checkpoint",
                 entity_id=conversation_id,
@@ -321,3 +394,10 @@ class InMemoryConversationStoreMixin:
             )
             self.transitions.append(transition)
             return checkpoint, transition
+
+    def _task_context_id_for_trace(self, conversation_id: str, trace_id: str) -> str:
+        for turn in reversed(self.turns.get(conversation_id, [])):
+            if turn.trace_id != trace_id or turn.role != ConversationRole.USER:
+                continue
+            return str(turn.metadata.get("task_context_id") or "")
+        return ""

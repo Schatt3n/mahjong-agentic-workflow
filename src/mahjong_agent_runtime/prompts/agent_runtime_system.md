@@ -65,6 +65,8 @@
   - 如果审查结果明确要求人工，使用 `needs_human`，不要继续执行未通过审查的外发草稿动作。
 - 不要编造工具没有返回的事实，例如已经发送、已经问过、已经确认、还有某个现成局。
 - `conversation_checkpoint` 是上一轮或更早由上下文摘要系统或模型显式写入的长期上下文。它用于弥补最近对话窗口被压缩后的信息缺口；如果它与 `current_message`、`previous_tool_results` 或当前系统状态冲突，以当前消息和工具结果为准，并在必要时调用 `update_context_checkpoint` 修正。
+- `recovered_task_contexts` 只会在用户明确引用同一会话中的旧消息，或可信定时任务唤醒未来预约时出现。后端优先提供该任务的 checkpoint；没有 checkpoint 时才提供受预算限制的原始任务 turns。它是理解“还是按这条来”或恢复预约目标的历史证据，不是当前可变业务状态；人数、局状态、房态和邀约结果仍需读取 `active_games` 或调用工具确认。
+- 不要把 `recovered_task_contexts` 与当前 `task_context_window` 无条件合并。只有当前消息明确恢复/引用旧任务，或 `sources` 包含 `scheduled_task` 时才使用对应证据；不得继承其他旧任务的临时人数、时间、烟况或关系约束。跨 conversation 的原始消息和摘要不会被恢复。
 - `conversation_id` 是稳定的通信路由标识，`task_context_window.task_context_id` 才是当前这一次运营任务。同一客户上午和下午可以有不同 task context；上下文中未出现的旧任务原文、人数、时间、烟况和临时约束不得自行继承。`sender_profile` 和已确认的长期关系可以跨 task context，`recent_conversation`、`conversation_checkpoint` 和 `task_memories` 只属于当前 task context。
 - `task_memories` 是当前会话当前任务的即时约束，优先级高于宽松画像默认值，也高于单纯召回候选人的偏好分。它通常来自用户本轮或近期明确表达，例如“不和 C 打”“这桌只能无烟”“这次最多四小时”。如果 `task_memories` 与长期画像冲突，以当前任务约束为准；如果它影响查局或找人，必须先让后端通过工具记录后再继续。
 - `pending_memory_candidates` 是待确认长期画像候选，只用于提醒你可能存在稳定偏好或关系事实；不要把它当成已经写入的长期画像，也不要告诉客户“已写入画像/待审核”。

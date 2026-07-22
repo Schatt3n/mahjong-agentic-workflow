@@ -68,6 +68,7 @@ class InMemoryAgentStore(
     transitions: list[StateTransition] = field(default_factory=list)
     turns: dict[str, list[ConversationTurn]] = field(default_factory=dict)
     conversation_checkpoints: dict[str, ConversationCheckpoint] = field(default_factory=dict)
+    task_context_checkpoints: dict[str, ConversationCheckpoint] = field(default_factory=dict)
     task_contexts: dict[str, ConversationTaskContext] = field(default_factory=dict)
     conversation_versions: dict[str, int] = field(default_factory=dict)
     idempotency_ledger: dict[str, ToolResult] = field(default_factory=dict)

@@ -244,6 +244,7 @@ if max_steps exceeded:
 - 没有活跃局且连续 4 小时无消息时，下一条消息创建新任务。
 - 只要还有活跃局，即使超过 4 小时也不会误切断当前任务。
 - 旧 turn、checkpoint、任务记忆和草稿保留在存储中供审计，但 `AgentContextBuilder` 只投影当前 `task_context_id` 的内容。
+- 四小时是普通空闲任务的轮换条件，不是数据删除时间。未来预约的 ScheduledAgentTask 保存来源 `task_context_id`；用户引用同会话旧消息时也可按消息 ID 反查其任务。
 - 长期客户画像和已审核关系约束可以跨任务保留，“这一局不和 C 打”等临时任务记忆会随旧任务归档。
 
 因此，A 上午打完后下午再约一场，微信路由仍是同一个 `conversation_id`，但模型看到的是新 `task_context_id` 下的下午原始消息，不会继承上午的任务对话。
@@ -345,6 +346,7 @@ flowchart TB
   quote["quoted_message_context<br/>引用消息业务锚点"]
   recent["recent_conversation<br/>预算内最近对话"]
   checkpoint["conversation_checkpoint<br/>摘要后的长期上下文"]
+  recovered["recovered_task_contexts<br/>显式引用/预约恢复证据"]
   profile["sender_profile<br/>客户画像"]
   rel["sender_relationships<br/>关系画像"]
   task["task_memories<br/>当前任务约束"]
@@ -361,6 +363,7 @@ flowchart TB
   quote --> payload
   recent --> payload
   checkpoint --> payload
+  recovered --> payload
   profile --> payload
   rel --> payload
   task --> payload
@@ -375,7 +378,7 @@ flowchart TB
 
 ### 最近对话窗口
 
-`ContextPackingPolicy` 默认最多考虑最近 `60` 轮，最近对话预算约 `4000` tokens。它会从最新消息往前装，超过预算的旧 turn 被省略。
+`ContextPackingPolicy` 默认最多考虑当前任务的最近 `60` 轮，最近对话预算约 `4000` tokens。存储层先按 `(conversation_id, task_context_id)` 过滤，再做 60 轮和 token 限制，因此繁忙群聊中的其他消息不会把未来预约原文挤出当前任务窗口。它会从最新消息往前装，超过预算的旧 turn 被省略。
 
 如果已有 checkpoint，则 checkpoint 更新时间之前的 turn 会被认为已经被摘要覆盖，不再重复放进 `recent_conversation`。
 
@@ -392,9 +395,20 @@ flowchart TB
 
 如果 checkpoint 和当前消息、工具结果冲突，以当前消息和工具结果为准。
 
+### 显式恢复历史任务
+
+旧任务不会默认进入新任务上下文，只有两个可信入口可以恢复：
+
+1. 用户引用同一 `conversation_id` 内的历史消息，后端用 `source_message_id` 找到原 turn 和它的 `task_context_id`。
+2. 未来预约定时任务到期，任务 payload 携带创建预约时的 `task_context_id`。
+
+恢复时优先读取 `runtime_task_context_checkpoints`；该任务没有摘要时，才读取 `runtime_conversation_turns` 中同任务的受限原文。恢复内容写入 `recovered_task_contexts`，只用于理解旧目标；局、人数、房态和邀约仍以当前数据库与只读工具为准。引用声明了其他 conversation 时，后端拒绝恢复任何原文或摘要。
+
 ## 9. 上下文摘要什么时候触发
 
 摘要由 `ContextSummaryManager` 负责，默认策略：
+
+摘要的统计、输入裁剪和 checkpoint 写入都以 `task_context_id` 为作用域。普通用户消息使用 `TaskContextManager` 为本轮选出的任务；可信定时事件优先使用调度 payload 携带的来源任务 ID，因此后来开启的新任务不会吞掉或污染未来预约的摘要。没有任务上下文的旧调用才退回会话级摘要；旧 SQLite 会话投影在迁移时按 checkpoint 内的任务 ID 幂等回填到 `runtime_task_context_checkpoints`。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -702,6 +716,7 @@ conversation:{conversation_id}:sender:{sender_id}:message:{message_id}
 | `runtime_state_transitions` | 状态变更审计 |
 | `runtime_conversation_turns` | 用户、助手、工具多轮对话 |
 | `runtime_conversation_checkpoints` | 上下文摘要 checkpoint |
+| `runtime_task_context_checkpoints` | 按 `task_context_id` 归档的历史任务 checkpoint |
 | `runtime_conversation_versions` | 会话版本 |
 | `runtime_idempotency_ledger` | 工具幂等账本 |
 | `runtime_message_results` | 入站消息幂等结果 |

@@ -150,11 +150,13 @@ class SQLiteSchedulingStoreMixin:
                 trace_id,
             )
 
+        task_context = self.current_task_context(game.conversation_id, game.organizer_id)
         payload = {
             "event_type": "game_recruitment_window_opened",
             "game_id": game.game_id,
             "planned_start_at": game.planned_start_at.isoformat() if game.planned_start_at else None,
             "recruitment_opens_at": game.recruitment_opens_at.isoformat(),
+            "task_context_id": task_context.task_context_id if task_context else None,
         }
         idempotency_key = f"{GAME_RECRUITMENT_TASK_TYPE}:{game.game_id}:{game.recruitment_opens_at.isoformat()}"
         if existing is None:

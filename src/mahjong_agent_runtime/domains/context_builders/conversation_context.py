@@ -69,21 +69,36 @@ def build_conversation_context(
     """Apply task boundaries, checkpoints, de-duplication, and token packing."""
 
     task_context = store.current_task_context(message.conversation_id, message.sender_id)
-    checkpoint = store.get_conversation_checkpoint(message.conversation_id)
-    raw_turns = store.recent_turns(message.conversation_id, packing_policy.max_turns_considered)
+    conversation_checkpoint = store.get_conversation_checkpoint(message.conversation_id)
+    checkpoint = conversation_checkpoint
+    recent_conversation_turns = store.recent_turns(
+        message.conversation_id,
+        packing_policy.max_turns_considered,
+    )
+    raw_turns = recent_conversation_turns
     omitted_before_task_context = 0
     checkpoint_excluded_by_task_context = False
     if task_context is not None:
-        task_turns: list[ConversationTurn] = []
-        for turn in raw_turns:
+        # Query the task before applying a conversation-wide limit. Otherwise a
+        # busy group can evict a future appointment from the latest 60 messages.
+        task_turns = store.task_context_turns(
+            message.conversation_id,
+            task_context.task_context_id,
+            packing_policy.max_turns_considered,
+        )
+        known_turn_keys = {_turn_identity(turn) for turn in task_turns}
+        for turn in recent_conversation_turns:
             turn_task_context_id = str(turn.metadata.get("task_context_id") or "")
             belongs_to_current = turn_task_context_id == task_context.task_context_id
             legacy_inside_window = not turn_task_context_id and turn.occurred_at >= task_context.started_at
-            if belongs_to_current or legacy_inside_window:
+            if legacy_inside_window and _turn_identity(turn) not in known_turn_keys:
                 task_turns.append(turn)
-            else:
+                known_turn_keys.add(_turn_identity(turn))
+            elif not belongs_to_current:
                 omitted_before_task_context += 1
-        raw_turns = task_turns
+        raw_turns = sorted(task_turns, key=lambda turn: turn.occurred_at)
+        task_checkpoint = store.get_task_context_checkpoint(task_context.task_context_id)
+        checkpoint = task_checkpoint or conversation_checkpoint
         checkpoint_matches = checkpoint is not None and (
             checkpoint.task_context_id == task_context.task_context_id
             or (
@@ -137,6 +152,15 @@ def build_conversation_context(
         checkpoint=checkpoint,
         recent_conversation=recent_conversation,
         audit=audit,
+    )
+
+
+def _turn_identity(turn: ConversationTurn) -> tuple[str, str, str, str]:
+    return (
+        turn.trace_id,
+        turn.role.value,
+        turn.occurred_at.isoformat(),
+        turn.content,
     )
 
 

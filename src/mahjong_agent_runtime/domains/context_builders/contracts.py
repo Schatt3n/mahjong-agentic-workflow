@@ -126,6 +126,11 @@ def planning_contract() -> dict[str, Any]:
                 "下一步": "本轮以 waiting_user 结束；只有客户后续明确确认，普通用户消息才可调用 join_game。",
             }
         },
+        "historical_task_recovery": {
+            "source": "Only same-conversation quoted messages and trusted scheduled tasks may populate recovered_task_contexts.",
+            "evidence_order": "Use checkpoint first, then bounded raw task turns when no checkpoint exists.",
+            "state_boundary": "Recovered history explains intent but never replaces read tools for mutable game, room, participant, or invite state.",
+        },
         "do_not": [
             "不要只用一句自然语言承诺代替应执行的工具步骤",
             "不要在工具结果回来后丢掉上一轮已确认的计划和槽位",

@@ -162,6 +162,8 @@ handle user message
 - “这一局不和 C 打”等临时约束会归档，不再影响新任务的局和候选人搜索。
 - 客户画像和经审核的长期关系约束仍然保留，例如常打 0.5、长期无烟偏好。
 
+四小时只负责轮换普通的空闲任务，不会删除历史，也不会让未来预约失忆。未来局创建时，持久化调度任务会同时保存来源 `task_context_id`；调度器到期唤醒后，ContextBuilder 优先恢复该任务的 checkpoint，没有 checkpoint 才加载受 4000-token 预算限制的任务原文。用户明确引用同一会话中的旧消息时也走同一恢复机制。跨私聊/群聊的引用不会导入原始对话或摘要，防止上下文越权。
+
 每次调用主模型时，`AgentContextBuilder` 根据当前目标组装有限上下文：
 
 | 上下文 | 作用 |
@@ -170,6 +172,7 @@ handle user message
 | 当前任务窗口 | 限定本次组局的开始时间和 `task_context_id`，屏蔽历史已结束任务 |
 | 最近对话 | 提供短期语言上下文，保持业务与闲聊可穿插 |
 | 会话 checkpoint | 保存长对话压缩后的目标、事实、待办和待确认问题 |
+| 显式恢复的历史任务 | 仅对同会话引用或可信定时任务加载旧任务 checkpoint/受限原文 |
 | 用户画像与客户关系 | 提供稳定偏好、历史同桌关系和明确冲突 |
 | 当前任务记忆 | 保存“这一次不和 C 打”等尚未写入长期画像的约束 |
 | 当前局与房态 | 只加载与当前会话或用户相关的有界决策投影 |
@@ -180,6 +183,8 @@ handle user message
 
 - 最近对话达到 12 轮，且距离上次摘要至少 6 轮，并且粗估超过 3000 tokens。
 - 调用主模型前，上下文粗估超过单次预算的 85%。
+
+摘要阈值和摘要输入都按 `task_context_id` 计算，而不是按整个 `conversation_id` 混合统计。普通消息使用本轮已解析的当前任务；未来预约的可信定时事件显式使用任务 payload 中的来源任务 ID。SQLite 同时保留会话级最新投影和任务级历史归档，旧数据库启动时会把带任务 ID 的会话 checkpoint 幂等回填到任务归档表。
 
 摘要不会替代业务状态。局、人数、房间和邀约仍以数据库为准；checkpoint 只帮助模型恢复目标和对话事实。
 
@@ -237,13 +242,14 @@ PYTHONPATH=src python -m pytest -q tests/test_context_summary_quality.py
   -> Game 立即进入按 planned_start_at 排序的局列表
   -> recruitment_status=scheduled
   -> SQLite 写入 due_at=11:00 的 activate_game_recruitment 任务
+  -> 任务 payload 保存来源 task_context_id
   -> T-2h 前禁止 search_customers 后的私聊邀约草稿
   -> 调度器原子 claim 任务
   -> game_recruitment_window_opened 内部事件重新进入主 Agent
   -> 主 Agent 读取当时最新局况、画像和候选人，动态规划搜索与邀约
 ```
 
-定时任务 ID 和幂等键由 `game_id + recruitment_opens_at` 确定性生成。SQLite 使用 `BEGIN IMMEDIATE` 完成领取，同一共享数据库上的多个进程只能有一个节点获得 lease；节点领取后宕机，lease 到期后任务可再次领取。任务失败按配置重试，局已满、取消或结束时任务同步取消/完成。内部唤醒产生完整 trace，但内部摘要不会作为客户消息发送。
+定时任务 ID 和幂等键由 `game_id + recruitment_opens_at` 确定性生成。SQLite 使用 `BEGIN IMMEDIATE` 完成领取，同一共享数据库上的多个进程只能有一个节点获得 lease；节点领取后宕机，lease 到期后任务可再次领取。任务失败按配置重试，局已满、取消或结束时任务同步取消/完成。内部唤醒产生完整 trace，并按来源任务恢复摘要或原文，但内部摘要不会作为客户消息发送。
 
 持久化能保证任务不因进程重启丢失，但准时唤醒仍要求服务进程在运行、Mac 没有长时间休眠。服务恢复后，调度器会立即领取已过期但未完成的任务；真正多机生产部署则应由常驻服务或外部调度基础设施保证可用性。
 

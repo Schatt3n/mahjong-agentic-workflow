@@ -2277,6 +2277,7 @@ def handle_due_scheduled_agent_task(task: ScheduledAgentTask, trace_id: str) -> 
             "delivery_mode": "internal_only",
             "event_type": "game_recruitment_window_opened",
             "scheduled_task": task.to_dict(),
+            "task_context_id": task.payload.get("task_context_id"),
             "game_id": opened_game.game_id,
         },
     )

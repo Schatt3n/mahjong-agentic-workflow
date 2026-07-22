@@ -15,6 +15,8 @@ from mahjong_agent_runtime import (
     UserMessage,
 )
 from mahjong_agent_runtime.context import AgentContextBuilder
+from mahjong_agent_runtime.models import now
+from mahjong_agent_runtime.task_context import TaskContextManager
 from mahjong_agent_runtime.tracing import trace_steps
 
 
@@ -326,6 +328,152 @@ def test_context_summary_payload_uses_public_names_and_sanitized_draft_metadata(
     assert payload["outbound_message_drafts"][0]["metadata"] == {"source": "wechaty"}
 
 
+def test_context_summary_is_scoped_to_explicit_task_context() -> None:
+    store = InMemoryAgentStore()
+    conversation_id = "summary_task_scope"
+    manager = TaskContextManager(store)
+    future_message = UserMessage(
+        conversation_id=conversation_id,
+        sender_id="A",
+        sender_name="A",
+        text="明天晚上七点0.5无烟，帮我约一桌",
+        message_id="summary_future_source",
+    )
+    future_task = manager.prepare(future_message, trace_id="trace_summary_future")
+    store.append_user_turn(future_message, "trace_summary_future")
+    store.append_assistant_turn(conversation_id, "好，明天开局前我再问人。", "trace_summary_future")
+
+    current_task, _ = store.activate_task_context(
+        conversation_id=conversation_id,
+        customer_id="A",
+        trace_id="trace_summary_current",
+        activity_at=now(),
+        started_at=now(),
+        reason="test_new_task",
+        force_new=True,
+        archive_previous=False,
+    )
+    current_message = UserMessage(
+        conversation_id=conversation_id,
+        sender_id="A",
+        sender_name="A",
+        text="今天下午再帮我组一场1块的",
+        message_id="summary_current_source",
+    )
+    store.append_user_turn(current_message, "trace_summary_current")
+    store.append_assistant_turn(conversation_id, "好，我先看今天的。", "trace_summary_current")
+
+    summary_client = StaticAgentClient(
+        [
+            json.dumps(
+                {
+                    "summary": "明天晚上七点0.5无烟预约，尚未开始邀约。",
+                    "facts": {"stake": "0.5", "planned_start": "明天19:00"},
+                    "open_questions": [],
+                    "confidence": 0.95,
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    summary_manager = ContextSummaryManager(
+        store=store,
+        llm_client=summary_client,
+        trace_recorder=InMemoryTraceRecorder(),
+    )
+
+    result = summary_manager.summarize_for_quality_evaluation(
+        conversation_id=conversation_id,
+        trace_id="trace_summary_explicit_task",
+        task_context_id=future_task.context.task_context_id,
+    )
+
+    prompt_payload = json.loads(summary_client.calls[0]["messages"][1]["content"])
+    prompt_text = json.dumps(prompt_payload, ensure_ascii=False)
+    assert result.summarized is True
+    assert prompt_payload["task_context_id"] == future_task.context.task_context_id
+    assert "明天晚上七点0.5无烟" in prompt_text
+    assert "今天下午再帮我组一场1块的" not in prompt_text
+    assert store.get_task_context_checkpoint(future_task.context.task_context_id) is not None
+    assert store.get_task_context_checkpoint(current_task.task_context_id) is None
+
+
+def test_scheduled_system_event_summarizes_original_future_task_not_latest_task() -> None:
+    store = InMemoryAgentStore()
+    conversation_id = "summary_scheduled_scope"
+    manager = TaskContextManager(store)
+    appointment = UserMessage(
+        conversation_id=conversation_id,
+        sender_id="A",
+        sender_name="A",
+        text="明天晚上七点0.5无烟，帮我约一桌",
+        message_id="summary_scheduled_source",
+    )
+    original = manager.prepare(appointment, trace_id="trace_scheduled_summary_source")
+    store.append_user_turn(appointment, "trace_scheduled_summary_source")
+    latest, _ = store.activate_task_context(
+        conversation_id=conversation_id,
+        customer_id="A",
+        trace_id="trace_scheduled_summary_latest",
+        activity_at=now(),
+        started_at=now(),
+        reason="test_newer_task",
+        force_new=True,
+        archive_previous=False,
+    )
+    runtime = AgentRuntime(
+        llm_client=StaticAgentClient(
+            [
+                agent_action(
+                    objective_status="completed",
+                    reasoning_summary="预约招募任务本轮完成。",
+                    reply_to_user="已检查预约任务。",
+                )
+            ]
+        ),
+        store=store,
+        trace_recorder=InMemoryTraceRecorder(),
+        context_summary_manager=ContextSummaryManager(
+            store=store,
+            llm_client=StaticAgentClient(
+                [
+                    json.dumps(
+                        {
+                            "summary": "明天晚上七点0.5无烟预约进入招募窗口。",
+                            "facts": {"stake": "0.5", "planned_start": "明天19:00"},
+                            "open_questions": [],
+                            "confidence": 0.95,
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            ),
+            policy=ContextSummaryPolicy(
+                min_turns_before_summary=2,
+                min_turns_since_last_summary=1,
+                max_recent_tokens_before_summary=1,
+            ),
+        ),
+    )
+
+    runtime.handle_system_event(
+        UserMessage(
+            conversation_id=conversation_id,
+            sender_id="A",
+            sender_name="A",
+            text="预约局进入招募窗口",
+            message_id="summary_scheduled_wakeup",
+            metadata={"task_context_id": original.context.task_context_id},
+        ),
+        trace_id="trace_scheduled_summary_wakeup",
+    )
+
+    original_checkpoint = store.get_task_context_checkpoint(original.context.task_context_id)
+    assert original_checkpoint is not None
+    assert original_checkpoint.summary == "明天晚上七点0.5无烟预约进入招募窗口。"
+    assert store.get_task_context_checkpoint(latest.task_context_id) is None
+
+
 def test_runtime_summarizes_before_llm_when_context_nears_budget() -> None:
     store = InMemoryAgentStore()
     trace = InMemoryTraceRecorder()
@@ -380,9 +528,9 @@ def test_runtime_summarizes_before_llm_when_context_nears_budget() -> None:
         store=store,
         trace_recorder=trace,
         # The conservative multilingual estimator counts Chinese close to one
-        # Token per character; 23k still triggers preemptive summarization here
+        # Token per character; 24k still triggers preemptive summarization here
         # while leaving headroom for the current registered tool contracts.
-        token_budget=TokenBudget(max_tokens_per_call=23_000, max_calls_per_turn=4),
+        token_budget=TokenBudget(max_tokens_per_call=24_000, max_calls_per_turn=4),
         context_summary_manager=ContextSummaryManager(
             store=store,
             llm_client=summary_client,
@@ -416,8 +564,8 @@ def test_runtime_summarizes_before_llm_when_context_nears_budget() -> None:
     assert len(summary_client.calls) == 1
     assert "context_summary_budget_triggered" in steps
     assert "context_rebuilt_after_summary" in steps
-    assert rebuilt.content["previous_estimated_tokens"] >= int(23_000 * 0.85)
-    assert rebuilt.content["rebuilt_estimated_tokens"] < 23_000
+    assert rebuilt.content["previous_estimated_tokens"] >= int(24_000 * 0.85)
+    assert rebuilt.content["rebuilt_estimated_tokens"] < 24_000
     assert prompt_payload["conversation_checkpoint"]["summary"] == "张哥多轮表达想组杭麻，0.5或1块，人齐开，烟都可。"
     assert prompt_payload["context_budget"]["checkpoint_covered_turn_count"] >= 20
     assert prompt_payload["context_budget"]["included_turn_count"] == 0

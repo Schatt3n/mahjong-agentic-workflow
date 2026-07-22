@@ -651,6 +651,7 @@ return safe_stop("达到最大步骤，转人工或保守结束")</pre>
           <tr><td><code>current_message</code></td><td>本轮标准化消息</td><td>明确当前用户真正说了什么</td></tr>
           <tr><td><code>recent_conversation</code></td><td>按预算保留的 user/assistant/tool turns</td><td>理解“可以”“六点”等短回复</td></tr>
           <tr><td><code>conversation_checkpoint</code></td><td>旧对话摘要、事实和待办</td><td>长对话压缩后不丢目标</td></tr>
+          <tr><td><code>recovered_task_contexts</code></td><td>同会话引用或可信预约唤醒所指向任务的 checkpoint/受限原文</td><td>恢复旧目标但不污染当前任务</td></tr>
           <tr><td><code>conversation_state</code></td><td>run/version、会话运行状态</td><td>识别旧输出和当前任务阶段</td></tr>
           <tr><td><code>quoted_message_context</code></td><td>已解析的引用消息及业务绑定</td><td>知道“可以”是在回复哪条邀请</td></tr>
           <tr><td><code>message_reference_contract</code></td><td>引用绑定优先级和未解析状态</td><td>防止把闲聊短句错绑到活跃局</td></tr>
@@ -670,7 +671,7 @@ return safe_stop("达到最大步骤，转人工或保守结束")</pre>
         </table>
 
         <h3>8.3 近期对话如何裁剪</h3>
-        <p>系统最多考察最近 60 个 turn，并按从新到旧的顺序装入，直到估算达到约 4000 token 的近期对话预算。已被 checkpoint 覆盖的旧 turn 不再重复加入；当前 trace 已通过 <code>previous_tool_results</code> 提供的工具消息也不会重复塞入。</p>
+        <p>系统先按 <code>(conversation_id, task_context_id)</code> 筛选当前业务任务，再最多考察该任务最近 60 个 turn，并按从新到旧的顺序装入，直到估算达到约 4000 token 的近期对话预算。这样繁忙群聊不会把未来预约原文挤出任务窗口。已被 checkpoint 覆盖的旧 turn 不再重复加入；当前 trace 已通过 <code>previous_tool_results</code> 提供的工具消息也不会重复塞入。</p>
         <pre>selected = []
 used_tokens = 0
 for turn in reverse(recent_turns):
@@ -684,6 +685,8 @@ return reverse(selected)</pre>
         <h3>8.4 token 估算从哪里来</h3>
         <p><code>estimated_tokens</code> 是工程估算，不是供应商最终账单。实现会根据中文字符、英文片段、JSON 结构和固定消息开销估算；预算控制宁愿保守，也不应等 API 返回 context length error 才处理。真正模型响应中的 usage 若可用，会另外记录用于成本核算和校准估算器。</p>
         <div class="blue"><strong>关键区别：</strong>检索决定“取哪些事实”，裁剪决定“保留哪些原文”，摘要决定“旧信息如何压缩”。三者不是同一件事。</div>
+        <h3>8.5 未来预约与历史引用如何恢复</h3>
+        <p>四小时只轮换普通空闲任务，不删除历史。未来预约的定时任务持久化来源 <code>task_context_id</code>；用户引用同一会话的旧消息时，系统用 <code>source_message_id</code> 反查所属任务。恢复时优先读取任务 checkpoint，没有摘要才加载受预算限制的原始 turns。恢复证据只帮助理解目标，人数、房态、局状态和邀约结果仍需查数据库或调用工具。跨 conversation 引用不会导入原文或摘要。</p>
       </section>
 
       <section id="summary">
@@ -695,6 +698,7 @@ return reverse(selected)</pre>
           <li><strong>主模型调用前紧急触发：</strong>完整上下文估算达到主模型单次预算的 85%，不再等待 turn 数条件，先摘要并重建上下文。</li>
         </ol>
         <p>主模型默认单次上下文预算为 24000 estimated tokens。85% 阈值为系统留出了 system prompt、工具 schema、输出和估算误差的安全空间。</p>
+        <p>上述 turn 数、距上次摘要的轮数和 token 估算都先按 <code>task_context_id</code> 选定任务，再进行统计。普通消息使用本轮任务；可信的未来预约唤醒使用调度任务保存的来源任务 ID。这样同一个微信会话中上午、下午和未来预约的摘要不会互相污染。</p>
 
         <h3>9.2 摘要输入与输出</h3>
         <table>
@@ -714,7 +718,7 @@ return reverse(selected)</pre>
 }</pre>
 
         <h3>9.3 Checkpoint 存什么、不存什么</h3>
-        <p>Checkpoint 表中保存 <code>conversation_id</code>、摘要文本、结构化事实、未解决问题、来源 trace、更新时间和置信度。它是模型上下文的压缩产物，不是业务事实源。</p>
+        <p>Checkpoint 保存 <code>conversation_id</code>、<code>task_context_id</code>、摘要文本、结构化事实、未解决问题、来源 trace、更新时间和置信度。当前会话投影写入 <code>runtime_conversation_checkpoints</code>，历史任务归档写入 <code>runtime_task_context_checkpoints</code>；升级旧 SQLite 时会根据 checkpoint 内的任务 ID 幂等回填历史任务表。它是模型上下文的压缩产物，不是业务事实源。</p>
         <ul>
           <li>局状态、人数、房态必须继续查询数据库，不能以摘要为准。</li>
           <li>摘要中出现不存在或已归档的 game id 会被校验拒绝。</li>
@@ -946,12 +950,12 @@ return reverse(selected)</pre>
         <p>用户预约明天或更晚的固定时间时，系统当轮就创建 <code>Game</code>，并按 <code>planned_start_at</code> 放入今天/明天局列表；不会把“明天再处理”只存在对话记忆中。系统派生 <code>recruitment_opens_at = planned_start_at - 2h</code>，在此之前状态为 <code>scheduled</code>，允许公开展示和查询，但统一禁止主动私聊候选人。</p>
         <pre>create_game
   → persist Game
-  → persist activate_game_recruitment(due_at=T-2h)
+  → persist activate_game_recruitment(due_at=T-2h, task_context_id=source)
   → scheduler atomic claim + lease
   → game_recruitment_window_opened
   → re-enter main Agent with current state
   → search candidates / draft invites / stop dynamically</pre>
-        <p>任务保存在 SQLite，进程重启后仍可继续；多节点通过原子领取保证只有一个执行者；节点宕机后 lease 过期可重领，失败按上限重试。局已满、取消或结束时，关联任务同步完成或取消。内部唤醒保留完整 trace，但不会把内部执行摘要发给客户。</p>
+        <p>任务保存在 SQLite，进程重启后仍可继续；多节点通过原子领取保证只有一个执行者；节点宕机后 lease 过期可重领，失败按上限重试。局已满、取消或结束时，关联任务同步完成或取消。内部唤醒根据来源任务恢复 checkpoint 或受限原文并保留完整 trace，但不会把内部执行摘要发给客户。</p>
         <p>持久化保证重启后任务不丢失，但准时执行仍需要至少一个调度器实例常驻运行。本地 Mac 长时间休眠时不会轮询；恢复或重启后，已过期但未完成的任务会立即被原子领取。若要严格准点，应使用常驻服务或外部调度基础设施。</p>
 
         <h3>14.5 人数是派生事实</h3>
@@ -1766,6 +1770,7 @@ post_turn_summary_result</pre>
           <tr><td><code>runtime_rooms</code> / <code>runtime_room_reservations</code></td><td>房间库存和时间段预订</td></tr>
           <tr><td><code>runtime_conversation_turns</code></td><td>user/assistant/tool 多轮记录</td></tr>
           <tr><td><code>runtime_conversation_checkpoints</code></td><td>会话摘要 checkpoint</td></tr>
+          <tr><td><code>runtime_task_context_checkpoints</code></td><td>按 task context 归档的历史任务 checkpoint</td></tr>
           <tr><td><code>runtime_conversation_versions</code></td><td>新输入打断旧输出的版本号</td></tr>
           <tr><td><code>runtime_pending_input_batches</code></td><td>碎片聚合、静默截止时间和处理租约</td></tr>
           <tr><td><code>runtime_message_results</code></td><td>消息级幂等结果</td></tr>

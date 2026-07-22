@@ -34,7 +34,25 @@ class ConversationStore(Protocol):
 
     def recent_turns(self, conversation_id: str, limit: int = 30) -> list[ConversationTurn]: ...
 
+    def task_context_turns(
+        self,
+        conversation_id: str,
+        task_context_id: str,
+        limit: int = 60,
+    ) -> list[ConversationTurn]: ...
+
+    def find_conversation_turn(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str | None = None,
+        text: str | None = None,
+        sender_id: str | None = None,
+    ) -> ConversationTurn | None: ...
+
     def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpoint | None: ...
+
+    def get_task_context_checkpoint(self, task_context_id: str) -> ConversationCheckpoint | None: ...
 
     def upsert_conversation_checkpoint(
         self,
@@ -52,6 +70,8 @@ class ConversationStore(Protocol):
         conversation_id: str,
         customer_id: str,
     ) -> ConversationTaskContext | None: ...
+
+    def get_task_context(self, task_context_id: str) -> ConversationTaskContext | None: ...
 
     def latest_task_context(self, conversation_id: str) -> ConversationTaskContext | None: ...
 
@@ -108,4 +128,3 @@ class ConversationStore(Protocol):
         conversation_id: str,
         message_id: str,
     ) -> MessageReference | None: ...
-

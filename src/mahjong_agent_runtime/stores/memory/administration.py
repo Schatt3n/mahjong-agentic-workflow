@@ -25,6 +25,7 @@ class InMemoryAdministrationStoreMixin:
                 "state_transitions": len(self.transitions),
                 "conversation_turns": sum(len(items) for items in self.turns.values()),
                 "conversation_checkpoints": len(self.conversation_checkpoints),
+                "task_context_checkpoints": len(self.task_context_checkpoints),
                 "task_contexts": len(self.task_contexts),
                 "conversation_versions": len(self.conversation_versions),
                 "idempotency_ledger": len(self.idempotency_ledger),
@@ -46,6 +47,7 @@ class InMemoryAdministrationStoreMixin:
             self.transitions.clear()
             self.turns.clear()
             self.conversation_checkpoints.clear()
+            self.task_context_checkpoints.clear()
             self.task_contexts.clear()
             self.conversation_versions.clear()
             self.idempotency_ledger.clear()

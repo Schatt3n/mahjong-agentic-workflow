@@ -224,8 +224,8 @@ AgentLoop → Response → Channel
 | `MessageReference` | `models.py` | `message_id`, `conversation_id`, `business_ref_type`, `business_ref_id`, `metadata` | 持久化消息与业务实体的可追溯关联 |
 | `PendingInputBatch` | `models.py` | `batch_id`, `conversation_id`, `sender_id`, `fragments`, `version` | 保存碎片输入及其静默截止和并发版本 |
 | `ScheduledAgentTask` | `models.py` | `task_id`, `task_type`, `aggregate_id`, `due_at`, `status` | 表示可领取、可重试的未来 Agent 工作 |
-| `ConversationTurn` | `models.py` | `role`, `content`, `trace_id`, `sender_id`, `occurred_at` | 保存用户、助手和工具会话历史 |
-| `ConversationCheckpoint` | `models.py` | `conversation_id`, `task_context_id`, `summary`, `facts`, `open_questions` | 保存长对话压缩后的事实和待办 |
+| `ConversationTurn` | `models.py` | `role`, `content`, `trace_id`, `sender_id`, `occurred_at` | 保存会话历史；SQLite 额外索引 `task_context_id/source_message_id` 以支持任务级检索和引用恢复 |
+| `ConversationCheckpoint` | `models.py` | `conversation_id`, `task_context_id`, `summary`, `facts`, `open_questions` | 保存任务级长对话压缩后的事实和待办；会话表保留最新投影，任务表保留历史归档 |
 | `ConversationTaskContext` | `models.py` | `task_context_id`, `conversation_id`, `customer_id`, `status`, `previous_task_context_id` | 在稳定会话中隔离独立业务任务 |
 | `CustomerProfile` | `models.py` | `customer_id`, `display_name`, `preferred_games`, `preferred_stakes`, `smoke_preference` | 保存客户身份与稳定匹配画像 |
 | `CustomerRelationship` | `models.py` | `customer_a_id`, `customer_b_id`, `played_together_count`, `avoid_playing`, `updated_at` | 表示客户之间的同桌和回避关系 |
@@ -277,6 +277,11 @@ erDiagram
     CONVERSATION_CHECKPOINT {
         string conversation_id PK
         string task_context_id FK
+        json payload
+    }
+    TASK_CONTEXT_CHECKPOINT {
+        string task_context_id PK, FK
+        string conversation_id FK
         json payload
     }
     TASK_CONTEXT {

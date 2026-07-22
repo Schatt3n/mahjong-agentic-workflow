@@ -102,11 +102,19 @@ class SQLiteMigrationStoreMixin:
                 conversation_id TEXT NOT NULL,
                 trace_id TEXT NOT NULL,
                 role TEXT NOT NULL,
+                task_context_id TEXT NOT NULL DEFAULT '',
+                source_message_id TEXT NOT NULL DEFAULT '',
                 occurred_at TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS runtime_conversation_checkpoints(
                 conversation_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_task_context_checkpoints(
+                task_context_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -231,8 +239,92 @@ class SQLiteMigrationStoreMixin:
             CREATE INDEX IF NOT EXISTS idx_waiting_demands_sender ON waiting_demands(conversation_id, sender_id, status);
             """
         )
+        self._migrate_conversation_task_indexes()
         self._migrate_embedded_game_participants()
         self._connection.commit()
+
+    def _migrate_conversation_task_indexes(self) -> None:
+        """Add task/message lookup columns without breaking existing databases."""
+
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(runtime_conversation_turns)").fetchall()
+        }
+        if "task_context_id" not in columns:
+            self._connection.execute(
+                "ALTER TABLE runtime_conversation_turns ADD COLUMN task_context_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "source_message_id" not in columns:
+            self._connection.execute(
+                "ALTER TABLE runtime_conversation_turns ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''"
+            )
+
+        rows = self._connection.execute(
+            """
+            SELECT id, payload
+            FROM runtime_conversation_turns
+            WHERE task_context_id = '' OR source_message_id = ''
+            """
+        ).fetchall()
+        for row in rows:
+            payload = _loads(row["payload"])
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            self._connection.execute(
+                """
+                UPDATE runtime_conversation_turns
+                SET task_context_id = ?, source_message_id = ?
+                WHERE id = ?
+                """,
+                (
+                    str(metadata.get("task_context_id") or ""),
+                    str(metadata.get("source_message_id") or ""),
+                    int(row["id"]),
+                ),
+            )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_turns_task_context
+            ON runtime_conversation_turns(conversation_id, task_context_id, id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_turns_source_message
+            ON runtime_conversation_turns(conversation_id, source_message_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_task_checkpoints_conversation
+            ON runtime_task_context_checkpoints(conversation_id, updated_at)
+            """
+        )
+        legacy_checkpoints = self._connection.execute(
+            """
+            SELECT conversation_id, payload, updated_at
+            FROM runtime_conversation_checkpoints
+            """
+        ).fetchall()
+        for row in legacy_checkpoints:
+            payload = _loads(row["payload"])
+            task_context_id = str(payload.get("task_context_id") or "")
+            if not task_context_id:
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO runtime_task_context_checkpoints(
+                    task_context_id, conversation_id, payload, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_context_id) DO NOTHING
+                """,
+                (
+                    task_context_id,
+                    str(row["conversation_id"]),
+                    str(row["payload"]),
+                    str(row["updated_at"]),
+                ),
+            )
 
     def _migrate_embedded_game_participants(self) -> None:
         """Backfill legacy embedded participants and remove them from game JSON.

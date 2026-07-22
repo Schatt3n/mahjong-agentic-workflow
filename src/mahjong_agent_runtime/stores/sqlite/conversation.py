@@ -33,8 +33,14 @@ class SQLiteConversationStoreMixin:
     def append_user_turn(self, message, trace_id: str) -> None:
         task_context = self.current_task_context(message.conversation_id, message.sender_id)
         metadata = dict(getattr(message, "metadata", {}) or {})
-        if task_context is not None:
+        metadata.setdefault("source_message_id", str(getattr(message, "message_id", "") or ""))
+        trusted_task_context_id = str(metadata.pop("_trusted_source_task_context_id", "") or "")
+        if trusted_task_context_id:
+            metadata["task_context_id"] = trusted_task_context_id
+        elif task_context is not None:
             metadata["task_context_id"] = task_context.task_context_id
+        else:
+            metadata.pop("task_context_id", None)
         self.append_turn(
             message.conversation_id,
             ConversationTurn(
@@ -55,10 +61,14 @@ class SQLiteConversationStoreMixin:
         trace_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        task_context = self.latest_task_context(conversation_id)
         turn_metadata = dict(metadata or {})
-        if task_context is not None:
-            turn_metadata.setdefault("task_context_id", task_context.task_context_id)
+        task_context_id = self._task_context_id_for_trace(conversation_id, trace_id)
+        if task_context_id:
+            turn_metadata.setdefault("task_context_id", task_context_id)
+        else:
+            task_context = self.latest_task_context(conversation_id)
+            if task_context is not None:
+                turn_metadata.setdefault("task_context_id", task_context.task_context_id)
         self.append_turn(
             conversation_id,
             ConversationTurn(
@@ -70,8 +80,11 @@ class SQLiteConversationStoreMixin:
         )
 
     def append_tool_turn(self, conversation_id: str, text: str, trace_id: str) -> None:
-        task_context = self.latest_task_context(conversation_id)
-        metadata = {"task_context_id": task_context.task_context_id} if task_context else {}
+        task_context_id = self._task_context_id_for_trace(conversation_id, trace_id)
+        if not task_context_id:
+            task_context = self.latest_task_context(conversation_id)
+            task_context_id = task_context.task_context_id if task_context else ""
+        metadata = {"task_context_id": task_context_id} if task_context_id else {}
         self.append_turn(
             conversation_id,
             ConversationTurn(role=ConversationRole.TOOL, content=text, trace_id=trace_id, metadata=metadata),
@@ -81,10 +94,21 @@ class SQLiteConversationStoreMixin:
         with self._lock, self._connection:
             self._connection.execute(
                 """
-                INSERT INTO runtime_conversation_turns(conversation_id, trace_id, role, occurred_at, payload)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO runtime_conversation_turns(
+                    conversation_id, trace_id, role, task_context_id,
+                    source_message_id, occurred_at, payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (conversation_id, turn.trace_id, turn.role.value, turn.occurred_at.isoformat(), _dumps(turn.to_dict())),
+                (
+                    conversation_id,
+                    turn.trace_id,
+                    turn.role.value,
+                    str(turn.metadata.get("task_context_id") or ""),
+                    str(turn.metadata.get("source_message_id") or ""),
+                    turn.occurred_at.isoformat(),
+                    _dumps(turn.to_dict()),
+                ),
             )
 
     def recent_turns(self, conversation_id: str, limit: int = 30) -> list[ConversationTurn]:
@@ -102,6 +126,75 @@ class SQLiteConversationStoreMixin:
             turns = [_turn_from_payload(_loads(row["payload"])) for row in rows]
             return list(reversed(turns))
 
+    def task_context_turns(
+        self,
+        conversation_id: str,
+        task_context_id: str,
+        limit: int = 60,
+    ) -> list[ConversationTurn]:
+        """Filter by business episode before applying the history limit."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload
+                FROM runtime_conversation_turns
+                WHERE conversation_id = ? AND task_context_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (conversation_id, task_context_id, int(limit)),
+            ).fetchall()
+            return list(
+                reversed([_turn_from_payload(_loads(row["payload"])) for row in rows])
+            )
+
+    def find_conversation_turn(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str | None = None,
+        text: str | None = None,
+        sender_id: str | None = None,
+    ) -> ConversationTurn | None:
+        """Resolve quoted platform content inside the same conversation only."""
+
+        with self._lock:
+            if message_id:
+                row = self._connection.execute(
+                    """
+                    SELECT payload
+                    FROM runtime_conversation_turns
+                    WHERE conversation_id = ? AND source_message_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (conversation_id, message_id),
+                ).fetchone()
+                if row is not None:
+                    return _turn_from_payload(_loads(row["payload"]))
+
+            normalized_text = str(text or "").strip()
+            if not normalized_text:
+                return None
+            rows = self._connection.execute(
+                """
+                SELECT payload
+                FROM runtime_conversation_turns
+                WHERE conversation_id = ?
+                ORDER BY id DESC
+                """,
+                (conversation_id,),
+            ).fetchall()
+            for row in rows:
+                turn = _turn_from_payload(_loads(row["payload"]))
+                if turn.content != normalized_text:
+                    continue
+                if sender_id and turn.sender_id != sender_id:
+                    continue
+                return turn
+            return None
+
     def get_conversation_checkpoint(self, conversation_id: str) -> ConversationCheckpoint | None:
         with self._lock:
             row = self._connection.execute(
@@ -111,6 +204,22 @@ class SQLiteConversationStoreMixin:
             if row is None:
                 return None
             return _checkpoint_from_payload(_loads(row["payload"]))
+
+    def get_task_context_checkpoint(self, task_context_id: str) -> ConversationCheckpoint | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_task_context_checkpoints WHERE task_context_id = ?",
+                (task_context_id,),
+            ).fetchone()
+            return _checkpoint_from_payload(_loads(row["payload"])) if row else None
+
+    def get_task_context(self, task_context_id: str) -> ConversationTaskContext | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM runtime_task_contexts WHERE task_context_id = ?",
+                (task_context_id,),
+            ).fetchone()
+            return _task_context_from_payload(_loads(row["payload"])) if row else None
 
     def current_task_context(self, conversation_id: str, customer_id: str) -> ConversationTaskContext | None:
         with self._lock:
@@ -371,16 +480,20 @@ class SQLiteConversationStoreMixin:
         facts: dict[str, Any],
         open_questions: list[str],
         trace_id: str,
+        task_context_id: str | None = None,
     ) -> tuple[ConversationCheckpoint, StateTransition]:
         with self._lock, self._connection:
             previous = self.get_conversation_checkpoint(conversation_id)
             task_context = self.latest_task_context(conversation_id)
+            resolved_task_context_id = task_context_id or (
+                task_context.task_context_id if task_context else None
+            )
             checkpoint = ConversationCheckpoint(
                 conversation_id=conversation_id,
                 summary=summary,
                 facts=dict(facts),
                 open_questions=list(open_questions),
-                task_context_id=task_context.task_context_id if task_context else None,
+                task_context_id=resolved_task_context_id,
                 source_trace_id=trace_id,
             )
             transition = StateTransition(
@@ -401,5 +514,37 @@ class SQLiteConversationStoreMixin:
                 """,
                 (conversation_id, _dumps(checkpoint.to_dict()), checkpoint.updated_at.isoformat()),
             )
+            if checkpoint.task_context_id:
+                self._connection.execute(
+                    """
+                    INSERT INTO runtime_task_context_checkpoints(
+                        task_context_id, conversation_id, payload, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(task_context_id) DO UPDATE SET
+                        conversation_id=excluded.conversation_id,
+                        payload=excluded.payload,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        checkpoint.task_context_id,
+                        conversation_id,
+                        _dumps(checkpoint.to_dict()),
+                        checkpoint.updated_at.isoformat(),
+                    ),
+                )
             self._append_transition(transition)
             return checkpoint, transition
+
+    def _task_context_id_for_trace(self, conversation_id: str, trace_id: str) -> str:
+        row = self._connection.execute(
+            """
+            SELECT task_context_id
+            FROM runtime_conversation_turns
+            WHERE conversation_id = ? AND trace_id = ? AND role = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (conversation_id, trace_id, ConversationRole.USER.value),
+        ).fetchone()
+        return str(row["task_context_id"] or "") if row else ""
