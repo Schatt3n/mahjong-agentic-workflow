@@ -44,6 +44,7 @@ def main() -> int:
     run_command([sys.executable, "scripts/verify_customer_visible_contract.py"])
     run_command([sys.executable, "scripts/check_badcase_regression_coverage.py"])
     run_command([sys.executable, "scripts/validate_real_owner_chat_golden.py"])
+    run_command([sys.executable, "scripts/validate_real_group_chat_dataset.py"])
     run_command([sys.executable, "scripts/run_agent_runtime_eval.py"])
     run_command(
         [
@@ -62,6 +63,7 @@ def main() -> int:
     )
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_real_owner_chat_golden.py"])
+    run_command([sys.executable, "-m", "pytest", "-q", "tests/test_real_group_chat_dataset.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_context_summary.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_context_summary_quality.py"])
     run_command([sys.executable, "-m", "pytest", "-q", "tests/test_agent_runtime_eval.py"])

@@ -9,7 +9,9 @@
 - `golden/real_owner_chat_golden.jsonl`：真实老板聊天转写出的长对话 golden dataset，用于验证闲聊和业务组局穿插时上下文仍能接回。
 - `golden/real_owner_chat_transcript_20260704.md`：真实聊天截图的可读转写。
 - `golden/fragmented_input_golden.jsonl`：碎片化输入边界样本，验证等待、超时重触发、发送者隔离和聚合后一次处理。
+- `golden/real_group_chat_20260722.jsonl`：真实微信群观察数据清洗出的高置信群聊 Gold，覆盖看板解析、状态演进、碎片聚合、引用更新、撤回和确定性噪声过滤。
 - `adversarial/privacy_isolation.jsonl`：跨会话隐私对抗样本，一条一个攻击 case，与执行脚本解耦。
+- `adversarial/real_group_chat_20260722.jsonl`：真实群聊中的指代、跨角色多轮和麻将黑话歧义样本；在领域问题确认前只能作为待复核对抗集，不能作为硬真值。
 - `few_shot_examples.jsonl`：老板认可的话术样例，用于改善后续回复风格。
 - `tests/test_context_summary_quality.py`：上下文压缩决策一致性评测，比较完整历史与 checkpoint 路径的状态、工具调用和回复。
 
@@ -19,6 +21,8 @@
 - 修复 badcase 后，必须补 `regression_refs`，指向 `agent_runtime_regression`、`real_owner_chat_golden`、`live_eval` 或具体 `pytest` 用例。
 - 老板确认某句回复“像我会说的话”，写入 `few_shot_examples.jsonl`。
 - 真实长对话样本优先沉淀到 `real_owner_chat_golden.jsonl`，用于验证上下文、闲聊分流和多轮恢复。
+- 真实群聊数据必须先匿名化：房间和发送者使用别名，源消息仅保留截断 SHA-256；禁止提交微信 ID、昵称、头像、签名、完整 payload 和现有分类器标签。
+- 只有业务含义及期望动作都明确的群聊样本才能进入 Gold；“那个一”“3块是否等于368”等仍需老板确认的样本进入 Adversarial，并保留 `open_questions`。
 - 用户把一句需求拆成多条发送时，写入 `fragmented_input_golden.jsonl`；不能靠新增麻将关键词 `if-else` 修复，应由输入边界模型和通用并发合同解决。
 - Agent 重复调用同一工具、在短周期动作间来回切换或连续没有状态/信息进展时，必须补 `ProgressMonitor` 回归；检测器只比较动作、结果和状态变化，不写麻将业务 `if-else`。
 - 修改摘要提示词、checkpoint 合同或上下文裁剪逻辑时，必须运行压缩决策一致性评测；不能只断言摘要已生成。
@@ -30,6 +34,13 @@
 
 ```bash
 PYTHONPATH=src python scripts/run_evals.py
+```
+
+单独校验真实群聊数据的 JSON 合同、匿名化和分层状态：
+
+```bash
+python scripts/validate_real_group_chat_dataset.py
+PYTHONPATH=src python -m pytest -q tests/test_real_group_chat_dataset.py
 ```
 
 单独运行上下文压缩质量评测：
