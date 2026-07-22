@@ -1,0 +1,9 @@
+{
+  "room_ids": [],
+  "topic_keywords": [
+    "测试麻将群"
+  ],
+  "board_enabled": true,
+  "outbound_enabled": false,
+  "merge_window_seconds": 30
+}

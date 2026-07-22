@@ -66,6 +66,14 @@ flowchart LR
     Gate["业务 / 闲聊 / 等待 / 忽略"]
   end
 
+  subgraph GroupDomain["托管群聊域"]
+    GroupHandler["Group Message Handler"]
+    L1["L1 严格协议解析<br/>报局 / 编号认领"]
+    L2["L2 路由<br/>忽略 / 群内短答 / 切私聊"]
+    Board["Board Engine<br/>实时投影与不可变快照"]
+    Claim["Claim Handler<br/>原子占位"]
+  end
+
   subgraph Agent["目标驱动主 Agent"]
     Runtime["AgentRuntime<br/>锁、幂等、会话版本"]
     TaskContext["Task Context Manager<br/>任务分段与临时记忆归档"]
@@ -90,8 +98,16 @@ flowchart LR
 
   Web --> Buffer
   WeChaty --> Buffer
+  WeChaty --> GroupHandler
   Buffer --> Gate
   Gate --> Runtime
+  GroupHandler --> L1
+  L1 --> L2
+  L1 --> Board
+  L1 --> Claim
+  L2 --> Runtime
+  Claim --> SQLite
+  Claim --> Board
   Runtime --> TaskContext
   TaskContext --> Context
   Context --> Loop
@@ -100,6 +116,7 @@ flowchart LR
   Gateway --> SQLite
   Gateway --> Loop
   Gateway --> Match
+  Gateway --> Board
   Match --> Runtime
   Loop --> Progress
   Loop --> Visible
@@ -107,6 +124,7 @@ flowchart LR
   Scheduler --> Runtime
   Visible --> Web
   Visible --> WeChaty
+  Board --> WeChaty
   Runtime --> Trace
   Gateway --> Trace
   Trace --> Eval
@@ -399,6 +417,11 @@ pnpm start
 - 按 `conversation_id + sender_id` 聚合碎片输入。
 - 默认仅允许白名单或测试范围进入主 Agent。
 - 可为指定群聊配置“只读观察”模式：调用语义入口模型区分运营消息、闲聊和不确定消息，但不进入工具循环、不修改业务状态、不生成可外发回复。
+- 可为明确授权的群配置“托管看板”模式。托管群走独立三层入口：L1 处理严格报局/编号认领协议，L2 决定忽略、群内短答或切到私聊，只有需要语义决策时才进入主 Agent。
+- 托管群中的每位用户使用独立会话 `group:<room_id>:customer:<customer_id>`；不会把整个群聊记录当成一个共享上下文喂给模型。
+- 复杂组局请求在好友关系允许时由后端切换到私聊。模型只接收最小切换上下文，不决定发送通道，也看不到群内其他人的原始消息。
+- 看板由权威 Game 状态投影生成。普通变更在 30 秒窗口内合并，座位认领/释放等关键变更立即排队刷新；每次发布保存不可变的“编号 -> game_id”快照。
+- 引用某版看板时按该版本精确解析编号；不引用时只接受最新版编号，不猜测过期看板，避免把用户加错局。
 - 发送通道和自动回复默认关闭，需要分别显式开启。
 - 失败入站消息进入本地 spool，成功外发写入投递账本，避免重复发送。
 
@@ -407,6 +430,21 @@ pnpm start
 `room_ids` 使用精确匹配，`topic_keywords` 使用子串匹配，以容忍群名追加门店名或公告。
 识别结果记录为 `wechaty_observe_only_message_analyzed` trace 事件，并明确包含
 `state_mutation_allowed=false` 与 `outbound_allowed=false`。
+
+托管群通过环境变量或本地配置文件显式开启：
+
+```bash
+export MAHJONG_WECHATY_MANAGED_ROOM_IDS='@room-id-1'
+export MAHJONG_WECHATY_MANAGED_ROOM_TOPICS='测试麻将群'
+export MAHJONG_WECHATY_MANAGED_ROOM_BOARD_ENABLED=true
+# 默认必须保持关闭，完成白名单灰度后再单独放开。
+export MAHJONG_WECHATY_MANAGED_ROOM_OUTBOUND_ENABLED=false
+export MAHJONG_WECHATY_BOARD_MERGE_WINDOW_SECONDS=30
+```
+
+本地文件默认位置是 `data/wechaty_managed_rooms.local.json`，格式示例见
+[`integrations/wechaty/managed_rooms.example.json`](integrations/wechaty/managed_rooms.example.json)。
+“只读观察”与“托管看板”互相独立；只有显式进入托管列表的群才允许写业务状态，托管配置优先于只读观察配置。
 
 建议始终使用测试号、小范围白名单和人工审批。个人微信机器人存在账号风控，不应把非官方协议接入视为稳定 SLA 通道。
 
@@ -770,9 +808,15 @@ tests/                                    # 单元、边界和生产不变量测
 - 资金、优惠、纠纷和隐私敏感操作不应授权给模型自动执行。
 - 模型输出无法做到绝对确定，关键状态始终以工具结果和数据库为准。
 
-当前明确未实现的业务能力：
+群聊域当前已实现严格报局导入、编号认领、不可变看板快照、好友私聊优先、非好友最小群内通知、原子占位、并发抢位、通道切换和局状态驱动的看板刷新。实现与边界见 [群聊/私聊参与意向关联设计](docs/cross_channel_game_reference_todo.md)。
 
-- Agent 在群聊发布局信息后，用户可能在群聊或私聊表达“川麻那个我可以”等参与意向。系统尚未实现基于发布消息、好友关系和跨通道任务标识，将该意向安全关联到具体 `game_id` 并完成私聊确认。完整边界、状态设计和验收标准见 [群聊/私聊参与意向关联设计](docs/cross_channel_game_reference_todo.md)。
+当前仍未完成的外部与业务能力：
+
+- 尚未自动创建新的微信群或把已确认客户真正拉入局群；当前只完成业务状态与消息通知链路。
+- “川麻那个我可以”等没有编号、没有引用且可能对应多个局的开放式表达，仍需主 Agent 基于最小公开投影澄清，不能直接占位。
+- 非好友用户的自动加好友、好友请求状态恢复尚未接入微信真实通道。
+- 引用消息精确绑定依赖 WeChaty puppet 能稳定返回/回显平台消息 ID，已具备持久化关联能力，但仍需在目标微信版本和白名单群持续灰度验证。
+- 托管群自动外发默认关闭；个人微信协议稳定性、风控和休眠期间可用性不由本项目保证。
 
 ## 框架选型
 

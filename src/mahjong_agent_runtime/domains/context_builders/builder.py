@@ -9,6 +9,7 @@ from typing import Any
 
 from ...models import ToolResult, UserMessage
 from ...stores import AgentStore
+from ...group_chat.projections import public_group_game_summary
 from ..tools.gateway import ToolGateway
 from .contracts import output_contract, planning_contract
 from .conversation_context import (
@@ -101,6 +102,16 @@ class AgentContextBuilder:
             current_task_context_id=task_context.task_context_id if task_context else None,
             packing_policy=self.packing_policy,
         )
+        reply_constraints = _trusted_reply_constraints(message)
+        group_room_id = _trusted_group_room_id(message)
+        room_board_games = (
+            [
+                public_group_game_summary(game)
+                for game in self.store.get_board_eligible_games(group_room_id)
+            ]
+            if group_room_id
+            else []
+        )
 
         audit = {
             **conversation.audit,
@@ -124,6 +135,8 @@ class AgentContextBuilder:
             "task_context_started_at": task_context.started_at.isoformat() if task_context else None,
             "system_trigger_present": system_trigger is not None,
             "system_trigger_type": system_trigger.get("trigger_type") if system_trigger else None,
+            "reply_constraints_present": reply_constraints is not None,
+            "group_room_board_game_count": len(room_board_games),
             **recovered_tasks.audit,
         }
 
@@ -140,6 +153,8 @@ class AgentContextBuilder:
             ),
             "task_context_window": self._task_context_window(task_context),
             "current_message": current_message,
+            "reply_constraints": reply_constraints,
+            "group_room_board_games": room_board_games,
             "system_trigger": system_trigger,
             "message_reference_contract": message_reference_contract,
             "quoted_message_context": quoted_message_context,
@@ -164,11 +179,21 @@ class AgentContextBuilder:
             "planning_contract": planning_contract(),
             "output_contract": output_contract(),
         }
+        messages = [{"role": "system", "content": prompt}]
+        if reply_constraints is not None:
+            privacy = "且不得提及任何其他客户的身份、关系或私聊信息" if reply_constraints["no_private_info"] else ""
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "【本轮客户可见回复约束】只输出当前用户真正需要的最短回复；"
+                        f"回复不得超过 {reply_constraints['max_length']} 个中文字符{privacy}。"
+                    ),
+                }
+            )
+        messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)})
         return BuiltContext(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
-            ],
+            messages=messages,
             payload=payload,
             audit=audit,
         )
@@ -225,6 +250,35 @@ def _system_trigger_context(message: UserMessage) -> dict[str, Any] | None:
         return None
     trigger = metadata.get("system_trigger")
     return dict(trigger) if isinstance(trigger, dict) else None
+
+
+def _trusted_reply_constraints(message: UserMessage) -> dict[str, Any] | None:
+    """Accept output limits only from the backend-created group entry metadata."""
+
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    if metadata.get("source") != "group":
+        return None
+    raw = metadata.get("reply_constraints")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        max_length = max(1, min(100, int(raw.get("max_length") or 0)))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "max_length": max_length,
+        "no_private_info": bool(raw.get("no_private_info", True)),
+    }
+
+
+def _trusted_group_room_id(message: UserMessage) -> str | None:
+    """Read a room identifier only from the backend-created group envelope."""
+
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    if metadata.get("source") != "group":
+        return None
+    room_id = str(metadata.get("room_id") or "").strip()
+    return room_id or None
 
 
 __all__ = [

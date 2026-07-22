@@ -214,6 +214,76 @@ class SQLiteMigrationStoreMixin:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS runtime_channel_identities(
+                channel TEXT NOT NULL,
+                external_user_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                can_private_message INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(channel, external_user_id)
+            );
+            CREATE TABLE IF NOT EXISTS runtime_group_room_policies(
+                room_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                managed INTEGER NOT NULL DEFAULT 1,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_game_conversation_links(
+                link_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL DEFAULT '',
+                link_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(game_id, conversation_id, customer_id, link_type),
+                FOREIGN KEY(game_id) REFERENCES runtime_games(game_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS runtime_group_board_snapshots(
+                snapshot_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                external_message_id TEXT NOT NULL,
+                rendered_text TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(room_id, external_message_id)
+            );
+            CREATE TABLE IF NOT EXISTS runtime_group_board_items(
+                snapshot_id TEXT NOT NULL,
+                item_no INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                rendered_text TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, item_no),
+                FOREIGN KEY(snapshot_id) REFERENCES runtime_group_board_snapshots(snapshot_id) ON DELETE CASCADE,
+                FOREIGN KEY(game_id) REFERENCES runtime_games(game_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS runtime_group_game_claims(
+                claim_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                game_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(source_conversation_id, source_message_id),
+                FOREIGN KEY(game_id) REFERENCES runtime_games(game_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS runtime_channel_switches(
+                switch_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                private_conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_runtime_turns_conversation_id ON runtime_conversation_turns(conversation_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_a ON runtime_customer_relationships(customer_a_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_customer_relationships_b ON runtime_customer_relationships(customer_b_id);
@@ -237,6 +307,16 @@ class SQLiteMigrationStoreMixin:
             CREATE INDEX IF NOT EXISTS idx_runtime_scheduled_agent_aggregate ON runtime_scheduled_agent_tasks(task_type, aggregate_id);
             CREATE INDEX IF NOT EXISTS idx_waiting_demands_active_expiry ON waiting_demands(status, expires_at);
             CREATE INDEX IF NOT EXISTS idx_waiting_demands_sender ON waiting_demands(conversation_id, sender_id, status);
+            CREATE INDEX IF NOT EXISTS idx_runtime_channel_identity_customer
+                ON runtime_channel_identities(customer_id, channel, can_private_message);
+            CREATE INDEX IF NOT EXISTS idx_runtime_game_links_room
+                ON runtime_game_conversation_links(room_id, game_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_board_snapshots_room
+                ON runtime_group_board_snapshots(room_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_group_claims_game
+                ON runtime_group_game_claims(game_id, customer_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_channel_switch_active
+                ON runtime_channel_switches(customer_id, room_id, status, expires_at);
             """
         )
         self._migrate_conversation_task_indexes()

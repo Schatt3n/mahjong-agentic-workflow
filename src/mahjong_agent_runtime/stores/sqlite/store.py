@@ -16,6 +16,7 @@ from .drafts import SQLiteDraftsStoreMixin
 from .game_mutations import SQLiteGameMutationsStoreMixin
 from .game_persistence import SQLiteGamePersistenceStoreMixin
 from .game_queries import SQLiteGameQueriesStoreMixin
+from .group_chat import SQLiteGroupChatStoreMixin
 from .idempotency import SQLiteIdempotencyStoreMixin
 from .input_aggregation import SQLiteInputAggregationStoreMixin
 from .migration import SQLiteMigrationStoreMixin
@@ -40,6 +41,7 @@ class SQLiteAgentStore(
     SQLiteAdministrationStoreMixin,
     SQLiteGameQueriesStoreMixin,
     SQLiteGameMutationsStoreMixin,
+    SQLiteGroupChatStoreMixin,
     SQLiteDraftsStoreMixin,
     SQLiteWaitingDemandStoreMixin,
     SQLiteGamePersistenceStoreMixin,

@@ -198,7 +198,15 @@ class ToolExecutionService:
         self._emit(
             "after_tool_execute",
             trace_id=trace_id,
-            payload={"result": result.to_dict(), "step_index": step_index, "call_index": call_index},
+            payload={
+                "call": call.to_dict(),
+                "result": result.to_dict(),
+                "conversation_id": message.conversation_id,
+                "sender_id": message.sender_id,
+                "source_message_id": message.message_id,
+                "step_index": step_index,
+                "call_index": call_index,
+            },
         )
         for transition in result.state_transitions:
             event = "state_transition_replayed" if result.deduplicated else "state_transition"

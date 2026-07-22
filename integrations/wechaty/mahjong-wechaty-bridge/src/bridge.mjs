@@ -35,6 +35,7 @@ const forwardSelfMessages = process.env.MAHJONG_WECHATY_FORWARD_SELF
   ? truthy(process.env.MAHJONG_WECHATY_FORWARD_SELF)
   : true
 const knownContacts = new Map()
+const knownRooms = new Map()
 const recentOutboundSignatures = new Map()
 const deliveredReplyMessageIds = loadDeliveryLedger()
 const blockedCustomerVisibleTerms = [
@@ -232,6 +233,34 @@ function publicKnownContacts() {
   return contacts
 }
 
+function rememberRoom(room) {
+  if (!room || !room.id) {
+    return
+  }
+  const snapshot = {
+    id: cleanText(room.id),
+    topic: cleanText(room.topic),
+  }
+  knownRooms.set(snapshot.id, snapshot)
+  const topicKey = contactKey(snapshot.topic)
+  if (topicKey) {
+    knownRooms.set(topicKey, snapshot)
+  }
+}
+
+function publicKnownRooms() {
+  const seen = new Set()
+  const rooms = []
+  for (const item of knownRooms.values()) {
+    if (!item?.id || seen.has(item.id)) {
+      continue
+    }
+    seen.add(item.id)
+    rooms.push(item)
+  }
+  return rooms
+}
+
 function outboundSignature(conversationId, text) {
   return `${conversationId || '-'}\n${cleanText(text)}`
 }
@@ -263,7 +292,12 @@ function recentOutboundEchoRecord(payload) {
     return null
   }
   pruneOutboundSignatures()
-  return recentOutboundSignatures.get(outboundSignature(payload.conversation_id, payload.text || payload.raw_text || '')) || null
+  const key = outboundSignature(payload.conversation_id, payload.text || payload.raw_text || '')
+  const record = recentOutboundSignatures.get(key) || null
+  if (record) {
+    recentOutboundSignatures.delete(key)
+  }
+  return record
 }
 
 function isRecentOutboundEcho(payload) {
@@ -388,6 +422,7 @@ async function buildPayload(message) {
       topic: cleanText(await safeCall('room.topic', () => room.topic())),
       payload: jsonable(room.payload || {}),
     }
+    rememberRoom(roomPayload)
   }
 
   let talkerPayload = null
@@ -679,7 +714,76 @@ async function resolveContact(target) {
   throw new Error(`contact not found: ${requested}`)
 }
 
-async function sendContactText(target, text, options = {}) {
+async function resolveRoom(target) {
+  const requested = cleanText(target)
+  const requestedKey = contactKey(requested)
+  if (!requested) {
+    throw new Error('missing target room')
+  }
+  if (requested.startsWith('@@')) {
+    const room = bot.Room.load(requested)
+    await safeCall('room.ready', () => room.ready?.())
+    return room
+  }
+  const known = knownRooms.get(requested) || knownRooms.get(requestedKey)
+  if (known?.id) {
+    const room = bot.Room.load(known.id)
+    await safeCall('room.ready', () => room.ready?.())
+    return room
+  }
+  for (const query of [{ id: requested }, { topic: requested }]) {
+    try {
+      const room = await bot.Room.find(query)
+      if (room) {
+        await safeCall('room.ready', () => room.ready?.())
+        rememberRoom({
+          id: primitive(room.id),
+          topic: cleanText(await safeCall('room.topic', () => room.topic())),
+        })
+        return room
+      }
+    } catch {
+      // Puppet implementations support different Room.find query fields.
+    }
+  }
+  try {
+    const rooms = await bot.Room.findAll()
+    for (const room of rooms || []) {
+      await safeCall('room.ready', () => room.ready?.())
+      const snapshot = {
+        id: primitive(room.id),
+        topic: cleanText(await safeCall('room.topic', () => room.topic())),
+      }
+      rememberRoom(snapshot)
+      if ([snapshot.id, snapshot.topic].some((item) => contactKey(item) === requestedKey)) {
+        return room
+      }
+    }
+  } catch {
+    // Some puppets do not expose a full room list.
+  }
+  throw new Error(`room not found: ${requested}`)
+}
+
+function outboundDeliveryKey(options = {}) {
+  return cleanText(
+    options.draft_id || options.draftId || options.source_message_id || options.sourceMessageId || '',
+  )
+}
+
+function outboundReference(options, recipientId, recipientName, source) {
+  return {
+    source,
+    source_message_id:
+      options.source_message_id || options.sourceMessageId || options.draft_id || options.draftId || '',
+    business_ref_type: options.business_ref_type || options.businessRefType || '',
+    business_ref_id: options.business_ref_id || options.businessRefId || '',
+    recipient_id: recipientId,
+    recipient_name: recipientName,
+  }
+}
+
+function validateOutboundText(text) {
   if (!sendChannelEnabled) {
     throw new Error('wechat send channel is paused')
   }
@@ -687,33 +791,79 @@ async function sendContactText(target, text, options = {}) {
   if (!finalText) {
     throw new Error('missing text')
   }
-  const deliveryKey = cleanText(
-    options.draft_id || options.draftId || options.source_message_id || options.sourceMessageId || '',
-  )
+  if (customerVisibleTextViolations(finalText).length) {
+    throw new Error('customer visible text contains internal implementation terms')
+  }
+  return finalText
+}
+
+function sentMessageId(sent) {
+  return cleanText(sent?.id || sent?.payload?.id || sent?.payload?.msgId || '')
+}
+
+async function sendContactText(target, text, options = {}) {
+  const finalText = validateOutboundText(text)
+  const deliveryKey = outboundDeliveryKey(options)
   if (deliveryKey && deliveredReplyMessageIds.has(deliveryKey)) {
     return { ok: true, deduplicated: true, to: target, text: finalText }
   }
-  const violations = customerVisibleTextViolations(finalText)
-  if (violations.length) {
-    throw new Error('customer visible text contains internal implementation terms')
-  }
   const contact = await resolveContact(target)
-  await contact.say(finalText)
-  recordDeliveredReply(deliveryKey, options.source_trace_id || options.sourceTraceId || '')
   const contactId = primitive(contact.id)
-  markOutboundSignature(`wechaty:contact:${contactId}`, finalText, {
-    source: 'wechaty_send',
-    source_message_id:
-      options.source_message_id || options.sourceMessageId || options.draft_id || options.draftId || '',
-    business_ref_type: options.business_ref_type || options.businessRefType || '',
-    business_ref_id: options.business_ref_id || options.businessRefId || '',
-    recipient_id: contactId,
-    recipient_name: target,
-  })
+  const conversationId = `wechaty:contact:${contactId}`
+  markOutboundSignature(
+    conversationId,
+    finalText,
+    outboundReference(options, contactId, target, 'wechaty_send'),
+  )
+  let sent = null
+  try {
+    sent = await contact.say(finalText)
+  } catch (error) {
+    recentOutboundSignatures.delete(outboundSignature(conversationId, finalText))
+    throw error
+  }
+  recordDeliveredReply(deliveryKey, options.source_trace_id || options.sourceTraceId || '')
   return {
     ok: true,
     to: target,
     contact_id: contactId,
+    message_id: sentMessageId(sent),
+    text: finalText,
+    reference_pending: hasReferenceAnchor(options),
+  }
+}
+
+async function sendRoomText(target, text, options = {}) {
+  const finalText = validateOutboundText(text)
+  const deliveryKey = outboundDeliveryKey(options)
+  if (deliveryKey && deliveredReplyMessageIds.has(deliveryKey)) {
+    return { ok: true, deduplicated: true, to: target, target_type: 'room', text: finalText }
+  }
+  const room = await resolveRoom(target)
+  const roomId = primitive(room.id)
+  const topic = cleanText(await safeCall('room.topic', () => room.topic()))
+  rememberRoom({ id: roomId, topic })
+  const conversationId = `wechaty:room:${roomId}`
+  markOutboundSignature(
+    conversationId,
+    finalText,
+    outboundReference(options, roomId, topic || target, 'wechaty_room_send'),
+  )
+  let sent = null
+  try {
+    sent = await room.say(finalText)
+  } catch (error) {
+    recentOutboundSignatures.delete(outboundSignature(conversationId, finalText))
+    throw error
+  }
+  recordDeliveredReply(deliveryKey, options.source_trace_id || options.sourceTraceId || '')
+  return {
+    ok: true,
+    to: target,
+    target_type: 'room',
+    room_id: roomId,
+    room_topic: topic,
+    message_id: sentMessageId(sent),
     text: finalText,
     reference_pending: hasReferenceAnchor(options),
   }
@@ -758,6 +908,7 @@ function startOutboundServer() {
           auto_send_reply: autoSendReplyEnabled,
           auto_send_reply_updated_at: autoSendReplyUpdatedAt,
           known_contact_count: publicKnownContacts().length,
+          known_room_count: publicKnownRooms().length,
           contact_alias_count: contactAliases.size,
         })
         return
@@ -814,9 +965,16 @@ function startOutboundServer() {
         sendJson(response, 200, { ok: true, contacts: publicKnownContacts() })
         return
       }
+      if (request.method === 'GET' && request.url === '/rooms') {
+        sendJson(response, 200, { ok: true, rooms: publicKnownRooms() })
+        return
+      }
       if (request.method === 'POST' && request.url === '/send') {
         const payload = await readJsonRequest(request)
-        const result = await sendContactText(payload.to || payload.contact_id || payload.weixin, payload.text, payload)
+        const targetType = cleanText(payload.target_type || payload.targetType || '').toLowerCase()
+        const result = targetType === 'room' || payload.room_id || payload.roomId
+          ? await sendRoomText(payload.to || payload.room_id || payload.roomId, payload.text, payload)
+          : await sendContactText(payload.to || payload.contact_id || payload.weixin, payload.text, payload)
         sendJson(response, 200, result)
         return
       }
@@ -826,6 +984,7 @@ function startOutboundServer() {
         ok: false,
         error: error?.message || String(error),
         known_contacts: publicKnownContacts().slice(0, 20),
+        known_rooms: publicKnownRooms().slice(0, 20),
       })
     }
   })

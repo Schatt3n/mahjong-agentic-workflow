@@ -1,156 +1,202 @@
-# 群聊/私聊参与意向关联设计（未实现）
+# 群聊看板、私聊承接与跨通道局关联
 
 ## 状态
 
-**未实现，等待真实样本、评测集和方案评审后开发。**
+**核心领域能力已经实现；真实微信自动外发仍处于白名单灰度，默认关闭。**
 
-当前 WeChaty 只观察群已经能够接收真实消息，并使用模型判断消息是否属于麻将运营业务，但尚未实现：Agent 作为老板发布局信息后，将用户在群聊或私聊中的参与表达关联到正确的局，再完成好友关系检查、私聊确认和参与状态推进。
+当前实现覆盖：托管群三层分流、群友明确报局导入、不可变看板快照、编号认领、好友私聊优先、非好友最小群内通知、私聊切换上下文、原子占位、并发抢位和局状态驱动的看板刷新。
 
-## 业务场景
+它解决的是“业务引用与状态如何正确关联”，不代表个人微信协议、自动拉群或好友申请已经具备正式生产 SLA。
 
-Agent 在微信群发布：
+## 业务原则
 
-```text
-杭麻1块 371 无烟 人齐开
-川麻1-32 371 换三张
-```
+1. **群聊是公告板，不是多人共享的私聊会话。** 老板主要在群里维护当前缺人局，复杂确认优先转到私聊。
+2. **通道由后端选择。** 模型决定业务动作和说什么，后端根据好友关系、房间策略和外发权限决定在哪说。
+3. **Game 是事实，Board 是投影。** 看板编号可以变化，`game_id` 不变；编号必须通过具体看板版本解析。
+4. **跨通道共享业务标识，不共享原始会话。** 群聊与私聊通过 `customer_id + game_id + ChannelSwitch/GameConversationLink` 关联，不能互相复制原始聊天。
+5. **认领必须确认且原子落库。** 看到局、表达兴趣与已占座是不同状态；最后一个座位不能靠模型判断并发结果。
+6. **公开信息最小化。** 群聊和跨客户通知不得带微信备注、其他参与者私聊、画像、关系冲突原文或内部字段。
 
-随后可能出现：
-
-1. 用户在群里回复：“川麻那个我可以”。
-2. 用户看到群消息后，私聊 Agent：“川麻那个我可以”。
-3. 用户只回复“我来”或“可以”，但当前存在多个可参与的局。
-4. 用户不是 Agent 好友，无法直接进入私聊确认。
-5. 用户加好友后，需要恢复此前未完成的确认任务，不能要求用户重新描述全部条件。
-
-## 核心原则
-
-- `room_id` 和 `conversation_id` 只表示通信上下文，不等于具体业务局。
-- 群聊与私聊保持原始上下文隔离，通过 `customer_id + game_id + join_request_id` 推进同一业务任务。
-- 用户表达兴趣后不能直接计入已确认人数，必须经过局状态、好友关系、缺失信息和座位并发校验。
-- 低置信度或存在多个候选局时不得猜测，应向用户追问。
-- 已满、已取消、已过期的发布记录不得继续接受参与。
-- 不通过新增大量业务 `if-else` 处理引用歧义，应使用发布台账、候选召回、结构化语义判断和状态机共同完成。
-
-## 建议设计
-
-### 1. Agent 发布台账
-
-Agent 每次向微信群发布局信息后，保存通道返回的消息 ID，并将一条消息中的每个局独立关联到 `game_id`：
+## 三层入口
 
 ```text
-publication_id
-channel_message_id
-room_id
-published_at
-publication_items[]
-  - item_id
-  - game_id
-  - rendered_text
-  - item_position
-  - valid_until
+WeChaty room message
+  -> managed room allowlist
+  -> L1RuleEngine
+       explicit game post -> import Game + schedule board
+       numbered claim     -> ClaimHandler
+       trivial/self       -> ignore
+       otherwise          -> L2IntentRouter
+  -> L2IntentRouter
+       simple query       -> isolated group AgentLoop + short constraints
+       complex + friend   -> private switch
+       complex + no DM    -> isolated group AgentLoop
+       irrelevant         -> ignore
 ```
 
-即使多个局合并在一条微信消息中，也必须拥有不同的 `publication_item`。
+### L1 的边界
 
-### 2. 跨通道局引用解析
+L1 只处理稳定协议，不承担开放式语义理解：
 
-收到“川麻那个我可以”后，从以下范围召回候选局：
+- 明确报局，例如 `14:00 0.5 无烟 371`。
+- 明确编号认领，例如 `2来`、`2我打`。
+- 机器人自己的消息和纯噪声。
 
-- 当前群最近由 Agent 发布且仍有效的局；
-- 用户与 Agent 共同群聊中的近期有效发布；
-- Agent 最近私聊邀请过该用户的局；
-- 用户当前正在协商的局。
+“川麻那个我可以”“刚才无烟那个算我一个”等没有唯一引用的表达不靠新正则硬猜。它们需要进入主 Agent，基于当前公开看板召回候选局；存在多个候选时追问。
 
-关联证据优先级：
+## 身份、会话与局的建模
 
-1. 微信引用消息 ID；
-2. 邀约记录中的 `game_id`；
-3. 明确的玩法、档位、时间、烟况等条件；
-4. 用户近期参与任务与发布时间；
-5. 模型语义推断。
+| 对象 | 作用 |
+| --- | --- |
+| `ChannelIdentity` | 将 `(channel, external_user_id)` 映射到稳定 `customer_id`、公开昵称、私聊会话和好友能力 |
+| `conversation_id` | 消息顺序与隐私边界；群内每位客户也有独立会话 |
+| `game_id` | 组局聚合标识，可以被多个隔离会话共同引用 |
+| `GameConversationLink` | 只记录某个 Game 与房间/私聊任务的业务关联，不保存跨会话原文 |
+| `ChannelSwitch` | 10 分钟有效的群转私聊指针，用于续接当前用户自己的请求 |
 
-如果存在多个候选局，Agent 应使用能够区分候选项的最少问题追问，例如：
+群内 L3 会话使用：
 
 ```text
-你说的是人齐开的1-32，还是六点的2-16？
+group:<room_id>:customer:<customer_id>
 ```
 
-在用户确认前不得推进局状态。
+这意味着同一房间内 A 的最近对话不会进入 B 的上下文。B 能看到的局信息来自 `public_group_game_summary()` 公开投影，而不是 A 的原始消息。
 
-### 3. 好友关系与渠道身份
+## 看板是不可变版本映射
 
-群成员身份和私聊联系人身份需要映射到统一客户：
+`BoardEngine` 根据与房间关联的活跃、未满 Game 生成新看板：
 
 ```text
-customer_id
-wechat_contact_id
-wechat_room_member_id
-friend_status
+当前缺人局：
+1、13:00 杭麻 0.5 无烟 272
+2、人齐开 川麻 1-32 有烟 371
+
+回复编号即可认领，如"2来"
 ```
 
-好友状态至少包括：
-
-- `UNKNOWN`
-- `NOT_FRIEND`
-- `FRIEND_REQUESTED`
-- `FRIEND`
-- `BLOCKED`
-
-非好友用户先创建待处理 `join_request`。好友关系建立后，按 `join_request_id` 恢复私聊确认，不重新理解整段群聊。
-
-### 4. 参与状态
+每次成功发送后持久化：
 
 ```text
-INTERESTED
-WAITING_FRIEND
-CONFIRMING_DETAILS
-SEAT_HELD
-CONFIRMED
-REJECTED
-WITHDRAWN
-EXPIRED
+BoardSnapshot(snapshot_id, room_id, external_message_id, rendered_text, created_at)
+BoardItem(snapshot_id, item_no, game_id, rendered_text)
 ```
 
-只有进入 `CONFIRMED` 后，才更新局的已确认人数。最后一个座位必须通过数据库事务或乐观版本校验处理并发竞争。
+解析策略：
 
-### 5. 隐私边界
+1. 有引用消息 ID：精确读取被引用的 `BoardSnapshot`。
+2. 无引用：只读取该群最新版快照。
+3. 引用不存在、编号失效、局已满/取消/过期：拒绝认领。
 
-- 群聊仅回复必要内容，例如“好，我私聊你确认下”。
-- 用户私聊内容不得写回群聊上下文。
-- 不向参与者公开其他用户私聊、微信备注、画像或关系冲突原因。
-- 所有客户可见文本继续通过客户可见内容审查合同。
+设计明确不对“无引用旧编号”回退上一版。看板重新排序后，旧版 2 号可能已经变成另一局；猜测比追问危险。
 
-## 建议工具
+## 看板刷新
 
-- `search_recent_agent_publications`
-- `resolve_game_reference`
-- `get_contact_relationship`
-- `create_or_resume_join_request`
-- `request_friend_connection`
-- `get_game_availability`
-- `confirm_game_participant`
-- `send_channel_message`
+Game 状态是权威事实源。以下两条链路触发派生看板：
 
-模型负责决定调用顺序和处理歧义；后端继续负责工具参数合同、权限、幂等、并发、状态机合法性和落库。
+- 群友明确报局：`BoardEngine.import_game_from_post()` 创建 Game、写 `GameConversationLink`、排队刷新。
+- 主 Agent 工具修改 Game：`GroupBoardTrigger` 监听 `after_tool_execute` Hook，成功后查找房间关联并创建持久化 `publish_group_board` 任务。
 
-## 验收标准
+普通创建/条件修改在默认 30 秒窗口内合并，避免连续刷屏；认领、释放和状态变化立即调度。任务使用现有 `ScheduledAgentTask` lease/retry/restart recovery 机制，通道暂时失败时不会把 Game 状态回滚成旧值。
 
-- [ ] 群里只存在一个川麻局时，“川麻那个我可以”能关联正确 `game_id`。
-- [ ] 私聊表达相同意图时，能从用户可见的近期发布中关联正确局。
-- [ ] 同时存在多个川麻局时不误加人，必须追问区分条件。
-- [ ] 引用 Agent 发布消息回复“我来”时，能通过引用消息 ID 精确关联。
-- [ ] 非好友用户进入 `WAITING_FRIEND`，加好友后恢复同一 `join_request`。
-- [ ] 信息未确认前不增加已确认人数。
-- [ ] 两人并发抢最后一个位置时最多一人确认成功。
-- [ ] 局满、取消或过期后，旧发布引用不会继续加人。
-- [ ] 群聊与私聊原始上下文隔离，连续 10 轮隐私对抗测试无泄露。
-- [ ] 重复微信消息不会生成重复参与记录。
-- [ ] 全链路记录 `traceId、source_message_id、publication_id、game_id、join_request_id`。
-- [ ] 完成真实 DeepSeek 回归和 WeChaty 白名单灰度验证。
+## 群转私聊
 
-## 暂不包含
+当群友提出复杂请求且 `ChannelIdentity.can_private_message=true` 时：
 
-- 本设计记录不代表群聊自动外发已经开放。
-- 本阶段不修改主 Agent、游戏状态机或数据库结构。
-- 在真实群聊回复样本和评测集形成之前，不实现基于关键词的补丁式归属逻辑。
+1. 群内只回复“私聊回你”等最短确认。
+2. 写入 `ChannelSwitch`，记录该客户、来源房间、来源消息和私聊会话。
+3. 构造 `PrivateSwitchContext`：只含该用户原文、已解析需求、画像摘要、缺失字段和回复约束。
+4. 通过 `handle_system_trigger()` 在其私聊 `conversation_id` 运行同一个主 Agent。
+5. 若私聊中创建 Game，`GroupBoardTrigger` 会依据活动 `ChannelSwitch` 建立房间关联，后续自动进入看板。
+
+群里其他人的消息不会被复制到私聊。用户在短时间内把业务补充继续发到群里时，只提醒其查看私聊，避免双通道同时推进同一个任务。
+
+## 原子认领
+
+编号认领流程：
+
+```text
+resolve board version
+  -> resolve game_id
+  -> identity / game state / duplicate / time conflict validation
+  -> atomic_claim_seat()
+       write participant state
+       write GameClaim(source_conversation_id, source_message_id)
+       commit once
+  -> private notification for friend, minimal group @ for nonfriend
+  -> urgent board refresh
+```
+
+SQLite 使用 `BEGIN IMMEDIATE` 写事务。同一来源消息通过唯一认领记录幂等；两名用户并发抢最后一位时，第二个事务会在重新读取权威状态后失败，不会超卖。
+
+`371` 表示当前三座、还差一座，不代表只有三个已知微信联系人。若报局者一人代表三座，领域模型保留一名已知联系人及匿名席位数量；对外人数以权威席位计数为准。
+
+## 公开投影与隐私
+
+所有群聊域通知只能接收公开字段允许列表：
+
+- 玩法/变体。
+- 档位或底注/封顶。
+- 时间或人齐开。
+- 烟况。
+- 总座位、已占座、剩余座位。
+- 对当前接收者必要的状态。
+
+默认排除：
+
+- 参与者姓名、微信备注、外部账号 ID。
+- 其他客户原始消息和私聊内容。
+- 画像、关系冲突原文、候选排序理由。
+- `game_id`、内部枚举、trace、工具和审批细节。
+
+客户可见文本仍经过生成/审查/确定性末端过滤；通道层还要通过房间外发策略和发送幂等。
+
+## 持久化结构
+
+SQLite 新增以下领域表：
+
+| 表 | 作用 |
+| --- | --- |
+| `runtime_channel_identities` | 渠道账号与客户/私聊能力映射 |
+| `runtime_group_room_policies` | 房间是否托管、看板/外发开关、合并窗口 |
+| `runtime_game_conversation_links` | Game 与房间/私聊任务的关联 |
+| `runtime_group_board_snapshots` | 每次已发送看板的不可变版本 |
+| `runtime_group_board_items` | 某版编号到 `game_id` 的映射 |
+| `runtime_group_game_claims` | 来源消息幂等认领记录 |
+| `runtime_channel_switches` | 短期群转私聊续接指针 |
+
+内存 Store 与 SQLite Store 具有同一接口，专项测试同时覆盖逻辑与重启恢复。
+
+## 权限与配置
+
+房间分三类：
+
+- 普通房间：不进入业务入口。
+- 只读观察房间：允许语义观测，但禁止状态修改和外发。
+- 托管房间：允许三层群聊域处理；看板与外发再由独立开关控制。
+
+托管房间必须通过 `MAHJONG_WECHATY_MANAGED_ROOM_IDS/TOPICS` 或本地忽略文件显式授权。`MAHJONG_WECHATY_MANAGED_ROOM_OUTBOUND_ENABLED` 默认 `false`。
+
+## 已有测试证据
+
+专项测试覆盖：
+
+- 报局/认领协议及数字文本误判。
+- 简单查询、复杂请求、好友/非好友路由。
+- 看板合并、紧急刷新、重排、空看板和 SQLite 重启恢复。
+- 引用快照精确解析与无引用只认最新版。
+- 好友私聊、非好友群内最小通知。
+- 重复消息幂等、两人并发抢最后座、时间冲突、局满通知。
+- 群转私聊上下文最小化和群内续接检测。
+- 群内公开投影不包含参与者身份与内部席位结构。
+- 主 Agent 工具修改 Game 后自动建立房间关联并排队刷新。
+- WeChaty 托管入口、房间投递和外发关闭策略。
+
+## 仍需完成
+
+- 在目标微信版本与 puppet 上持续验证引用消息 ID、群消息回显和重启后的映射恢复。
+- 实现自动创建局群、拉人入群及其高风险人工审批。
+- 实现非好友的好友申请、申请状态持久化和通过后的任务恢复。
+- 为无编号自然语言引用建立真实样本评测；多个候选时必须澄清，不能牺牲正确性追求自动化。
+- 增加房间级频控、看板撤回/替换策略和长期灰度指标。
+
+这些限制必须继续写入 README 和发布说明，不能把非官方个人微信桥包装成稳定官方生产通道。

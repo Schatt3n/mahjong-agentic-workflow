@@ -71,6 +71,18 @@ from mahjong_agent_runtime import (  # noqa: E402
 )
 from mahjong_agent_runtime.summary import ContextSummaryManager, ContextSummaryPolicy  # noqa: E402
 from mahjong_agent_runtime.models import InviteStatus  # noqa: E402
+from mahjong_agent_runtime.group_chat import (  # noqa: E402
+    BOARD_TASK_TYPE,
+    BoardEngine,
+    ChannelIdentity,
+    ClaimHandler,
+    GroupMessage,
+    GroupMessageHandler,
+    GroupRoomPolicy,
+    L1RuleEngine,
+    L2IntentRouter,
+    NotifyDispatcher,
+)
 from mahjong_agent_runtime.tracing import validate_trace  # noqa: E402
 from test_observability import observability_payload, run_fixed_suite  # noqa: E402
 from simulation_observability import (  # noqa: E402
@@ -1038,11 +1050,55 @@ def configured_wechaty_observe_only_rooms() -> dict[str, set[str]]:
     return {"room_ids": room_ids, "topic_keywords": topic_keywords}
 
 
-def wechaty_observe_only_room_hits(payload: dict) -> list[str]:
-    """Return the configured IDs/topics matching one incoming group message."""
+def configured_wechaty_managed_rooms() -> dict[str, object]:
+    """Load rooms explicitly authorized for state mutation and board handling.
 
-    if not bool(payload.get("is_room")):
-        return []
+    Managed rooms are deliberately separate from observe-only rooms. Merely
+    observing a real group must never opt that group into state mutation or
+    outbound messages. The local JSON file is ignored by source control.
+    """
+
+    room_ids = set(split_env_list(os.getenv("MAHJONG_WECHATY_MANAGED_ROOM_IDS", "")))
+    topic_keywords = set(split_env_list(os.getenv("MAHJONG_WECHATY_MANAGED_ROOM_TOPICS", "")))
+    configured: dict[str, object] = {
+        "room_ids": room_ids,
+        "topic_keywords": topic_keywords,
+        "board_enabled": env_bool("MAHJONG_WECHATY_MANAGED_ROOM_BOARD_ENABLED", True),
+        "outbound_enabled": env_bool("MAHJONG_WECHATY_MANAGED_ROOM_OUTBOUND_ENABLED", False),
+        "merge_window_seconds": max(0, env_int("MAHJONG_WECHATY_BOARD_MERGE_WINDOW_SECONDS", 30)),
+    }
+    path = Path(
+        os.getenv("MAHJONG_WECHATY_MANAGED_ROOMS_PATH")
+        or ROOT / "data" / "wechaty_managed_rooms.local.json"
+    )
+    if not path.exists():
+        return configured
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return configured
+    if not isinstance(payload, dict):
+        return configured
+    room_ids.update(str(item).strip() for item in payload.get("room_ids", []) if str(item).strip())
+    topic_keywords.update(
+        str(item).strip() for item in payload.get("topic_keywords", []) if str(item).strip()
+    )
+    for key in ("board_enabled", "outbound_enabled"):
+        if isinstance(payload.get(key), bool):
+            configured[key] = payload[key]
+    try:
+        configured["merge_window_seconds"] = max(
+            0,
+            int(payload.get("merge_window_seconds", configured["merge_window_seconds"])),
+        )
+    except (TypeError, ValueError):
+        pass
+    return configured
+
+
+def _wechaty_room_identity(payload: dict) -> tuple[str, str]:
+    """Return the channel room ID and public topic from one raw payload."""
+
     room = payload.get("room") if isinstance(payload.get("room"), dict) else {}
     raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     room_id = str(
@@ -1052,6 +1108,38 @@ def wechaty_observe_only_room_hits(payload: dict) -> list[str]:
         or ""
     ).strip()
     topic = str(room.get("topic") or _wechaty_nested_text(room, "payload", "topic") or "").strip()
+    return room_id, topic
+
+
+def wechaty_managed_room_hits(payload: dict) -> list[str]:
+    """Return explicit managed-room matches for one incoming group message."""
+
+    if not bool(payload.get("is_room")):
+        return []
+    room_id, topic = _wechaty_room_identity(payload)
+    configured = configured_wechaty_managed_rooms()
+    room_ids = configured.get("room_ids") if isinstance(configured.get("room_ids"), set) else set()
+    topic_keywords = (
+        configured.get("topic_keywords")
+        if isinstance(configured.get("topic_keywords"), set)
+        else set()
+    )
+    hits: list[str] = []
+    if room_id and room_id in room_ids:
+        hits.append(room_id)
+    topic_folded = topic.casefold()
+    for keyword in sorted(topic_keywords):
+        if keyword and keyword.casefold() in topic_folded:
+            hits.append(keyword)
+    return hits
+
+
+def wechaty_observe_only_room_hits(payload: dict) -> list[str]:
+    """Return the configured IDs/topics matching one incoming group message."""
+
+    if not bool(payload.get("is_room")):
+        return []
+    room_id, topic = _wechaty_room_identity(payload)
     configured = configured_wechaty_observe_only_rooms()
     hits: list[str] = []
     if room_id and room_id in configured["room_ids"]:
@@ -1654,8 +1742,10 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         route_scope = "self_only"
     whitelist_hits = wechaty_agent_whitelist_hits(payload)
     whitelisted = bool(whitelist_hits)
+    managed_room_hits = wechaty_managed_room_hits(payload)
+    managed_room = bool(managed_room_hits)
     observe_only_room_hits = wechaty_observe_only_room_hits(payload)
-    observe_only_room = bool(observe_only_room_hits)
+    observe_only_room = bool(observe_only_room_hits) and not managed_room
     audit = {
         "channel": "wechaty",
         "routed_to_agent": False,
@@ -1674,6 +1764,8 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         "route_scope": route_scope,
         "agent_whitelisted": whitelisted,
         "agent_whitelist_hits": whitelist_hits,
+        "managed_room": managed_room,
+        "managed_room_hits": managed_room_hits,
         "observe_only_room": observe_only_room,
         "observe_only_room_hits": observe_only_room_hits,
     }
@@ -1684,7 +1776,7 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
         audit["reason"] = "non_text_without_transcript_or_ocr" if message_metadata.get("modalities") else "empty_text"
         audit["metadata"] = message_metadata
         return None, audit
-    if route_scope == "self_only" and not self_message and not whitelisted and not observe_only_room:
+    if route_scope == "self_only" and not self_message and not whitelisted and not observe_only_room and not managed_room:
         audit["reason"] = "non_self_message_in_self_only_scope"
         return None, audit
     if route_scope == "incoming_only" and self_message:
@@ -1732,6 +1824,13 @@ def build_wechaty_user_message(payload: dict) -> tuple[UserMessage | None, dict]
             {
                 "observe_only_room": True,
                 "observe_only_room_hits": observe_only_room_hits,
+            }
+        )
+    if managed_room:
+        message.metadata.update(
+            {
+                "managed_room": True,
+                "managed_room_hits": managed_room_hits,
             }
         )
     audit.update(
@@ -2006,6 +2105,38 @@ def route_wechaty_raw_to_agent(payload: dict, *, trace_id: str) -> dict:
         trace_recorder.record(trace_id, "wechaty_raw_message_not_routed", audit)
         return {"routed_to_agent": False, "audit": audit, "agent_result": None}
     runtime = get_runtime()
+    if bool(audit.get("managed_room")):
+        if bool(audit.get("self_message")):
+            audit.update({"routed_to_agent": False, "reason": "managed_room_self_message_ignored"})
+            runtime.trace_recorder.record(trace_id, "wechaty_managed_group_message_ignored", audit)
+            return {
+                "routed_to_agent": False,
+                "managed_group": True,
+                "audit": audit,
+                "agent_result": None,
+            }
+        group_message = build_managed_group_message(runtime, payload, message)
+        handler = get_group_message_handler(runtime)
+        group_result = handler.handle(group_message, trace_id=trace_id)
+        result_payload = {
+            "action": group_result.action,
+            "game_id": group_result.game_id,
+            "reply": group_result.reply,
+            "detail": dict(group_result.detail),
+        }
+        audit.update({"routed_to_agent": group_result.action == "agent_loop", "reason": "managed_group_processed"})
+        runtime.trace_recorder.record(
+            trace_id,
+            "wechaty_managed_group_message_processed",
+            {"audit": audit, "group_message": group_message.metadata, "result": result_payload},
+        )
+        return {
+            "routed_to_agent": group_result.action == "agent_loop",
+            "managed_group": True,
+            "audit": audit,
+            "group_result": result_payload,
+            "agent_result": None,
+        }
     if bool(audit.get("observe_only_room")):
         decision = run_wechaty_input_gate(message, trace_id=trace_id, runtime=runtime)
         observation = {
@@ -2076,6 +2207,238 @@ def request_local_json(path: str, *, payload: dict | None = None, timeout_second
     with urlopen(request, timeout=max(0.1, timeout_seconds)) as response:
         parsed = json.loads(response.read().decode("utf-8"))
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+class WechatyGroupMessenger:
+    """Wechaty transport adapter with explicit room policy and bridge switches."""
+
+    def __init__(self, runtime: AgentRuntime) -> None:
+        self.runtime = runtime
+        self.store = runtime.store
+
+    def send_group_message(self, room_id: str, text: str, *, metadata: dict | None = None) -> str:
+        policy = self.store.get_group_room_policy(room_id)
+        if policy is None or not policy.managed or not policy.outbound_enabled:
+            return self._suppressed_id(
+                target=room_id,
+                text=text,
+                target_type="room",
+                reason="managed_room_outbound_disabled",
+                metadata=metadata,
+            )
+        return self._send(
+            target=room_id,
+            text=text,
+            target_type="room",
+            metadata=metadata,
+        )
+
+    def send_private_message(self, external_user_id: str, text: str, *, metadata: dict | None = None) -> str:
+        origin_room_id = str((metadata or {}).get("origin_room_id") or "").strip()
+        if origin_room_id:
+            policy = self.store.get_group_room_policy(origin_room_id)
+            if policy is not None and (not policy.managed or not policy.outbound_enabled):
+                return self._suppressed_id(
+                    target=external_user_id,
+                    text=text,
+                    target_type="contact",
+                    reason="origin_managed_room_outbound_disabled",
+                    metadata=metadata,
+                )
+        return self._send(
+            target=external_user_id,
+            text=text,
+            target_type="contact",
+            metadata=metadata,
+        )
+
+    def _send(self, *, target: str, text: str, target_type: str, metadata: dict | None) -> str:
+        trace_id = str((metadata or {}).get("trace_id") or f"trace_group_send_{secrets.token_hex(6)}")
+        try:
+            health = request_local_json(
+                "/health",
+                timeout_seconds=env_float("MAHJONG_WECHATY_OUTBOUND_TIMEOUT_SECONDS", 3.0),
+            )
+            if not bool(health.get("send_channel_enabled")) or not bool(health.get("auto_send_reply")):
+                return self._suppressed_id(
+                    target=target,
+                    text=text,
+                    target_type=target_type,
+                    reason="wechaty_outbound_switch_disabled",
+                    metadata=metadata,
+                )
+            response = request_local_json(
+                "/send",
+                payload={
+                    "to": target,
+                    "target_type": target_type,
+                    "text": text,
+                    "source": "managed_group_domain",
+                    "source_trace_id": trace_id,
+                    **{key: value for key, value in (metadata or {}).items() if key != "trace_id"},
+                },
+                timeout_seconds=env_float("MAHJONG_WECHATY_OUTBOUND_TIMEOUT_SECONDS", 5.0),
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            return self._suppressed_id(
+                target=target,
+                text=text,
+                target_type=target_type,
+                reason="wechaty_outbound_request_failed",
+                metadata={**dict(metadata or {}), "error_type": type(exc).__name__, "error": str(exc)},
+            )
+        if not bool(response.get("ok")):
+            return self._suppressed_id(
+                target=target,
+                text=text,
+                target_type=target_type,
+                reason="wechaty_outbound_rejected",
+                metadata={**dict(metadata or {}), "bridge_response": response},
+            )
+        message_id = str(
+            response.get("message_id")
+            or response.get("external_message_id")
+            or response.get("source_message_id")
+            or f"wechaty_out_{secrets.token_hex(8)}"
+        )
+        self.runtime.trace_recorder.record(
+            trace_id,
+            "managed_group_outbound_delivered",
+            {
+                "target": target,
+                "target_type": target_type,
+                "message_id": message_id,
+                "text": text,
+                "metadata": dict(metadata or {}),
+            },
+        )
+        return message_id
+
+    def _suppressed_id(
+        self,
+        *,
+        target: str,
+        text: str,
+        target_type: str,
+        reason: str,
+        metadata: dict | None,
+    ) -> str:
+        trace_id = str((metadata or {}).get("trace_id") or f"trace_group_send_{secrets.token_hex(6)}")
+        digest = hashlib.sha256(f"{target}\x1f{text}\x1f{trace_id}".encode("utf-8")).hexdigest()[:16]
+        self.runtime.trace_recorder.record(
+            trace_id,
+            "managed_group_outbound_suppressed",
+            {
+                "target": target,
+                "target_type": target_type,
+                "reason": reason,
+                "text": text,
+                "metadata": dict(metadata or {}),
+            },
+            level="WARN",
+        )
+        return f"suppressed:{digest}"
+
+
+def _wechaty_public_sender_name(payload: dict, fallback: str) -> str:
+    """Use the public WeChat nickname, never the owner's private alias."""
+
+    talker = payload.get("talker") if isinstance(payload.get("talker"), dict) else {}
+    return (
+        _wechaty_nested_text(talker, "name")
+        or _wechaty_nested_text(talker, "payload", "name")
+        or str(fallback or "").strip()
+    )
+
+
+def _wechaty_sender_is_friend(payload: dict) -> bool:
+    talker = payload.get("talker") if isinstance(payload.get("talker"), dict) else {}
+    value = talker.get("friend")
+    if value is None and isinstance(talker.get("payload"), dict):
+        value = talker["payload"].get("friend")
+    return bool(value)
+
+
+def build_managed_group_message(
+    runtime: AgentRuntime,
+    payload: dict,
+    message: UserMessage,
+) -> GroupMessage:
+    """Map one raw room event to public-safe identity and group-domain records."""
+
+    room_id, topic = _wechaty_room_identity(payload)
+    if not room_id:
+        raise ValueError("managed group message has no room_id")
+    configured = configured_wechaty_managed_rooms()
+    runtime.store.upsert_group_room_policy(
+        GroupRoomPolicy(
+            room_id=room_id,
+            board_enabled=bool(configured.get("board_enabled", True)),
+            outbound_enabled=bool(configured.get("outbound_enabled", False)),
+            merge_window_seconds=max(0, int(configured.get("merge_window_seconds", 30))),
+        )
+    )
+    existing = runtime.store.get_channel_identity("wechaty", message.sender_id)
+    public_name = _wechaty_public_sender_name(payload, message.sender_name or message.sender_id)
+    is_friend = _wechaty_sender_is_friend(payload)
+    identity = runtime.store.upsert_channel_identity(
+        ChannelIdentity(
+            channel="wechaty",
+            external_user_id=message.sender_id,
+            customer_id=existing.customer_id if existing is not None else message.sender_id,
+            public_name=public_name,
+            private_conversation_id=(
+                existing.private_conversation_id
+                if existing is not None
+                else f"wechaty:contact:{message.sender_id}"
+            ),
+            can_private_message=is_friend or bool(existing and existing.can_private_message),
+            is_friend=is_friend or bool(existing and existing.is_friend),
+            created_at=existing.created_at if existing is not None else message.sent_at,
+            updated_at=message.sent_at,
+        )
+    )
+    quoted_message_id = message.quoted_message.message_id if message.quoted_message else None
+    return GroupMessage(
+        room_id=room_id,
+        conversation_id=f"wechaty:room:{room_id}",
+        sender_external_id=identity.external_user_id,
+        sender_name=identity.public_name,
+        text=message.text,
+        message_id=message.message_id or str(payload.get("source_message_id") or ""),
+        sent_at=message.sent_at,
+        quoted_message_id=quoted_message_id,
+        metadata={
+            "channel": "wechaty",
+            "room_id": room_id,
+            "room_topic": topic,
+            "source_message_id": message.message_id,
+            "is_friend": identity.is_friend,
+            "can_private_message": identity.can_private_message,
+        },
+    )
+
+
+def get_group_message_handler(runtime: AgentRuntime) -> GroupMessageHandler:
+    """Compose the stateless group domain around the runtime's durable store."""
+
+    messenger = WechatyGroupMessenger(runtime)
+    board_engine = BoardEngine(store=runtime.store, messenger=messenger)
+    notify_dispatcher = NotifyDispatcher(store=runtime.store, messenger=messenger, runtime=runtime)
+    claim_handler = ClaimHandler(
+        board_engine=board_engine,
+        store=runtime.store,
+        notify_dispatcher=notify_dispatcher,
+    )
+    return GroupMessageHandler(
+        rule_engine=L1RuleEngine(bot_id=os.getenv("MAHJONG_WECHATY_BOT_ID", "").strip()),
+        intent_router=L2IntentRouter(runtime.store),
+        board_engine=board_engine,
+        claim_handler=claim_handler,
+        notify_dispatcher=notify_dispatcher,
+        messenger=messenger,
+        runtime=runtime,
+    )
 
 
 def handle_invite_draft_action(runtime: AgentRuntime, payload: dict) -> dict:
@@ -2242,6 +2605,35 @@ def handle_due_scheduled_agent_task(task: ScheduledAgentTask, trace_id: str) -> 
     """Open a due recruitment window and let the main Agent replan from current facts."""
 
     runtime = get_runtime()
+    if task.task_type == BOARD_TASK_TYPE and task.aggregate_type == "group_room":
+        policy = runtime.store.get_group_room_policy(task.aggregate_id)
+        if policy is not None and (not policy.managed or not policy.board_enabled or not policy.outbound_enabled):
+            runtime.trace_recorder.record(
+                trace_id,
+                "group_board_publish_skipped",
+                {
+                    "task_id": task.task_id,
+                    "room_id": task.aggregate_id,
+                    "managed": policy.managed,
+                    "board_enabled": policy.board_enabled,
+                    "outbound_enabled": policy.outbound_enabled,
+                },
+            )
+            return
+        snapshot = get_group_message_handler(runtime).board_engine.publish(
+            task.aggregate_id,
+            trace_id=trace_id,
+        )
+        runtime.trace_recorder.record(
+            trace_id,
+            "group_board_publish_completed",
+            {
+                "task_id": task.task_id,
+                "room_id": task.aggregate_id,
+                "snapshot": snapshot.to_dict() if snapshot is not None else None,
+            },
+        )
+        return
     if task.task_type == WAITING_DEMAND_EXPIRY_TASK_TYPE and task.aggregate_type == "waiting_list":
         handle_waiting_expiration_task(
             runtime.store,
@@ -2865,6 +3257,14 @@ def runtime_config(runtime: AgentRuntime) -> dict:
             "room_id_count": len(configured_wechaty_observe_only_rooms()["room_ids"]),
             "topic_keyword_count": len(configured_wechaty_observe_only_rooms()["topic_keywords"]),
             "execution_policy": "semantic_analysis_and_trace_only",
+        },
+        "wechaty_managed_rooms": {
+            "room_id_count": len(configured_wechaty_managed_rooms()["room_ids"]),
+            "topic_keyword_count": len(configured_wechaty_managed_rooms()["topic_keywords"]),
+            "board_enabled": bool(configured_wechaty_managed_rooms()["board_enabled"]),
+            "outbound_enabled": bool(configured_wechaty_managed_rooms()["outbound_enabled"]),
+            "merge_window_seconds": int(configured_wechaty_managed_rooms()["merge_window_seconds"]),
+            "execution_policy": "three_layer_group_router",
         },
         "wechaty_input_gate_enabled": env_bool("MAHJONG_WECHATY_INPUT_GATE_ENABLED", True),
         "wechaty_input_gate_model": os.getenv("MAHJONG_WECHATY_INPUT_GATE_LLM_MODEL")

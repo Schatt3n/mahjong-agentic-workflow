@@ -19,6 +19,7 @@ from .context import AgentContextBuilder
 from .coordination import CoordinationManager, default_coordination_manager
 from .copywriting import DEFAULT_CUSTOMER_VISIBLE_TEXT_PROMPT_PATH
 from .hooks import HookManager
+from .group_chat import GroupBoardTrigger
 from .llm import AgentLLMClient
 from .matching import MatchTrigger, OutboundDispatcher
 from .models import AgentRuntimeResult, SystemTriggerMessage, UserMessage
@@ -70,6 +71,7 @@ class AgentRuntime(RuntimeCompatibilityMixin):
     agent_loop: AgentLoop = field(init=False)
     outbound_dispatcher: OutboundDispatcher = field(init=False)
     match_trigger: MatchTrigger = field(init=False)
+    group_board_trigger: GroupBoardTrigger = field(init=False)
     _conversation_locks: dict[str, threading.RLock] = field(default_factory=dict, init=False, repr=False)
     _conversation_locks_guard: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -139,7 +141,12 @@ class AgentRuntime(RuntimeCompatibilityMixin):
             dispatcher=self.outbound_dispatcher,
             trace_recorder=self.trace_recorder,
         )
+        self.group_board_trigger = GroupBoardTrigger(
+            store=self.store,
+            trace_recorder=self.trace_recorder,
+        )
         self.hook_manager.register("after_tool_execute", self.match_trigger)
+        self.hook_manager.register("after_tool_execute", self.group_board_trigger)
 
     def handle_user_message(self, message: UserMessage, *, trace_id: str | None = None) -> AgentRuntimeResult:
         """Handle one user message with per-conversation ordering and idempotency."""

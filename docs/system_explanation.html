@@ -1642,20 +1642,25 @@ call_provider(timeout=remaining)</pre>
   → raw JSONL audit
   → normalize envelope
   → self/room/whitelist filter
-  → input aggregation & gate
-  → main Agent
+  ├─ private → input aggregation & gate → main Agent
+  └─ managed room → L1 protocol → L2 route → optional main Agent/private switch
   → reviewed outbound
   → WeChaty precise talker/room target</pre>
 
         <h3>18.2 精准回复给谁</h3>
         <ul>
           <li>私聊使用 talker contact id 作为 <code>sender_id</code> 和目标地址。</li>
-          <li>群聊使用 room id 作为 <code>conversation_id</code>，talker id 区分群成员。</li>
+          <li>room id 标识公开房间和看板；进入主 Agent 时，每位群成员使用 <code>group:&lt;room_id&gt;:customer:&lt;customer_id&gt;</code> 独立会话，不能共享整段群聊上下文。</li>
           <li>引用回复保存 source message id 到业务对象的 reference，避免只靠昵称定位。</li>
           <li>公开昵称用于客户可见文本，稳定 channel id 用于路由；昵称或备注都不是主键。</li>
         </ul>
 
-        <h3>18.3 灰度策略</h3>
+        <h3>18.3 群聊三层处理和看板</h3>
+        <p>显式托管群先经过独立群聊域：L1 只处理严格报局和编号认领协议；L2 选择忽略、群内短答或切私聊；只有需要自然语言决策时才进入主 Agent。复杂请求且双方是好友时，后端写入短期 <code>ChannelSwitch</code>，只把该客户原文、画像摘要、解析需求和缺失字段送入私聊，不复制房间其他人的消息。</p>
+        <p>看板不是聊天摘要，而是权威 Game 状态的实时投影。普通变更在 30 秒内合并，座位变化立即排队刷新；每次成功发布保存不可变 <code>BoardSnapshot</code> 和编号到 <code>game_id</code> 的映射。有引用时按被引用版本精确解析，无引用时只接受最新版，禁止猜测旧编号。</p>
+        <p>认领在 SQLite 同一写事务中更新参与者并写 <code>GameClaim</code> 幂等记录。好友优先私聊结果，非好友只在群里发送最小确认；公开投影不包含参与者身份、微信备注、关系冲突原文或内部席位结构。</p>
+
+        <h3>18.4 灰度策略</h3>
         <table>
           <tr><th>阶段</th><th>输入</th><th>输出</th></tr>
           <tr><td>本机自测</td><td>只允许 self message</td><td>关闭外发或只发给自己的测试账号</td></tr>
@@ -1664,10 +1669,10 @@ call_provider(timeout=remaining)</pre>
           <tr><td>扩大灰度</td><td>按群、好友、消息类型放量</td><td>基于 eval 和线上指标逐步放开</td></tr>
         </table>
 
-        <h3>18.4 外发开关</h3>
+        <h3>18.5 外发开关</h3>
         <p>页面提供通道开关。关闭时仍可采集、推理、生成和审查，但 outbox 不会调用 WeChaty。重新开启前应检查待发草稿是否仍在有效版本，避免把几小时前的回复补发给客户。</p>
 
-        <h3>18.5 图片和语音</h3>
+        <h3>18.6 图片和语音</h3>
         <p>渠道层应先完成多模态预处理：语音下载后经 ASR 得到文本和置信度；图片/表情包经视觉模型得到描述或业务字段。主 Agent 继续接收统一消息信封，并保留原媒体引用。低置信转写不能直接触发高风险副作用。</p>
       </section>
 
@@ -1773,6 +1778,12 @@ post_turn_summary_result</pre>
           <tr><td><code>runtime_task_context_checkpoints</code></td><td>按 task context 归档的历史任务 checkpoint</td></tr>
           <tr><td><code>runtime_conversation_versions</code></td><td>新输入打断旧输出的版本号</td></tr>
           <tr><td><code>runtime_pending_input_batches</code></td><td>碎片聚合、静默截止时间和处理租约</td></tr>
+          <tr><td><code>runtime_channel_identities</code></td><td>渠道账号、稳定客户和私聊能力映射</td></tr>
+          <tr><td><code>runtime_group_room_policies</code></td><td>托管群、看板/外发开关和合并窗口</td></tr>
+          <tr><td><code>runtime_game_conversation_links</code></td><td>Game 与房间/私聊任务的业务关联</td></tr>
+          <tr><td><code>runtime_group_board_snapshots</code> / <code>runtime_group_board_items</code></td><td>已发送看板版本及编号到 game_id 的不可变映射</td></tr>
+          <tr><td><code>runtime_group_game_claims</code></td><td>群内认领和来源消息幂等记录</td></tr>
+          <tr><td><code>runtime_channel_switches</code></td><td>短期群转私聊续接指针</td></tr>
           <tr><td><code>runtime_message_results</code></td><td>消息级幂等结果</td></tr>
           <tr><td><code>runtime_message_references</code></td><td>渠道消息到 invite/game 等业务对象的引用</td></tr>
           <tr><td><code>runtime_idempotency_ledger</code></td><td>工具调用幂等账本</td></tr>

@@ -32,6 +32,7 @@ from .conversation import InMemoryConversationStoreMixin
 from .customer import InMemoryCustomerStoreMixin
 from .drafts import InMemoryDraftsStoreMixin
 from .games import InMemoryGamesStoreMixin
+from .group_chat import InMemoryGroupChatStoreMixin
 from .idempotency import InMemoryIdempotencyStoreMixin
 from .input_aggregation import InMemoryInputAggregationStoreMixin
 from .references import InMemoryReferencesStoreMixin
@@ -52,6 +53,7 @@ class InMemoryAgentStore(
     InMemoryReferencesStoreMixin,
     InMemoryAdministrationStoreMixin,
     InMemoryGamesStoreMixin,
+    InMemoryGroupChatStoreMixin,
     InMemoryDraftsStoreMixin,
     InMemoryWaitingDemandStoreMixin,
     InMemoryIdempotencyStoreMixin,
@@ -80,6 +82,12 @@ class InMemoryAgentStore(
     pending_input_batches: dict[str, PendingInputBatch] = field(default_factory=dict)
     scheduled_tasks: dict[str, ScheduledAgentTask] = field(default_factory=dict)
     waiting_demands: dict[str, WaitingDemand] = field(default_factory=dict)
+    channel_identities: dict[str, Any] = field(default_factory=dict)
+    group_room_policies: dict[str, Any] = field(default_factory=dict)
+    game_conversation_link_records: dict[str, Any] = field(default_factory=dict)
+    board_snapshots: dict[str, Any] = field(default_factory=dict)
+    game_claims: dict[str, Any] = field(default_factory=dict)
+    channel_switches: dict[str, Any] = field(default_factory=dict)
     badcases: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
