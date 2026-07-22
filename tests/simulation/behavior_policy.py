@@ -145,6 +145,7 @@ class MessageGenerationResult:
     trace_id: str | None = None
     latency_ms: float | None = None
     error: str | None = None
+    reference_case_ids: tuple[str, ...] = ()
 
 
 class SimulationMessageGenerator(Protocol):
@@ -173,6 +174,7 @@ class SimulationAction:
     generation_trace_id: str | None = field(default=None, compare=False)
     generation_latency_ms: float | None = field(default=None, compare=False)
     generation_error: str | None = field(default=None, compare=False)
+    generation_reference_case_ids: tuple[str, ...] = field(default=(), compare=False)
     dialog_phase: str = field(default=DIALOG_PHASE_BUSINESS, compare=False)
 
     @property
@@ -217,6 +219,7 @@ class SimulationAction:
                     "trace_id": self.generation_trace_id,
                     "latency_ms": self.generation_latency_ms,
                     "error": self.generation_error,
+                    "reference_case_ids": list(self.generation_reference_case_ids),
                 },
                 "simulation_dialog_phase": self.dialog_phase,
                 "simulation_thread_id": self.thread_id,
@@ -477,6 +480,7 @@ class BehaviorPolicy:
             generation_trace_id=generation.trace_id,
             generation_latency_ms=generation.latency_ms,
             generation_error=generation.error,
+            generation_reference_case_ids=generation.reference_case_ids,
         )
         if materialized.event_type == "text":
             self._last_text_message[user.customer_id] = materialized

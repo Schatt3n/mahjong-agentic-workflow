@@ -13,18 +13,24 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from mahjong_agent_runtime.llm import AgentLLMConfig, OpenAICompatibleAgentClient
 
 try:
     from .behavior_policy import MessageGenerationRequest, MessageGenerationResult
+    from .real_group_case_library import RealGroupCaseExample, RealGroupCaseLibrary
 except ImportError:  # pragma: no cover - direct script execution path
     from behavior_policy import MessageGenerationRequest, MessageGenerationResult  # type: ignore
+    from real_group_case_library import RealGroupCaseExample, RealGroupCaseLibrary  # type: ignore
 
 
 DEFAULT_GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_GLM_MODEL = "glm-4.7-flash"
+DEFAULT_REAL_GROUP_DATASET = (
+    Path(__file__).resolve().parents[2] / "eval" / "golden" / "real_group_chat_20260722.jsonl"
+)
 
 
 class CompletionClient(Protocol):
@@ -49,6 +55,8 @@ class SimulationGeneratorConfig:
     timeout_seconds: float = 20.0
     min_interval_seconds: float = 5.0
     max_estimated_tokens_per_day: int = 0
+    real_case_dataset_path: Path = DEFAULT_REAL_GROUP_DATASET
+    real_case_example_limit: int = 3
 
     @classmethod
     def from_env(cls) -> "SimulationGeneratorConfig":
@@ -66,6 +74,13 @@ class SimulationGeneratorConfig:
                 0,
                 _env_int("MAHJONG_SIM_GENERATOR_MAX_ESTIMATED_TOKENS_PER_DAY", 0),
             ),
+            real_case_dataset_path=Path(
+                os.getenv("MAHJONG_SIM_REAL_CASE_DATASET", str(DEFAULT_REAL_GROUP_DATASET))
+            ).expanduser(),
+            real_case_example_limit=max(
+                0,
+                min(5, _env_int("MAHJONG_SIM_REAL_CASE_EXAMPLE_LIMIT", 3)),
+            ),
         )
 
 
@@ -77,9 +92,13 @@ class GLMSimulationMessageGenerator:
         client: CompletionClient,
         *,
         config: SimulationGeneratorConfig | None = None,
+        case_library: RealGroupCaseLibrary | None = None,
     ) -> None:
         self.client = client
         self.config = config or SimulationGeneratorConfig.from_env()
+        self.case_library = case_library or RealGroupCaseLibrary.from_jsonl(
+            self.config.real_case_dataset_path
+        )
         self._rate_lock = threading.Lock()
         self._last_request_at = 0.0
 
@@ -110,10 +129,12 @@ class GLMSimulationMessageGenerator:
     def generate(self, request: MessageGenerationRequest) -> MessageGenerationResult:
         trace_id = f"trace_sim_gen_{uuid.uuid4().hex[:12]}"
         started = time.monotonic()
+        references = self._reference_examples(request)
+        reference_ids = tuple(item.case_id for item in references)
         try:
             self._wait_for_rate_slot()
             raw = self.client.complete(
-                self._messages(request),
+                self._messages(request, references=references),
                 trace_id=trace_id,
                 timeout_seconds=self.config.timeout_seconds,
             )
@@ -124,6 +145,7 @@ class GLMSimulationMessageGenerator:
                 model=self.config.model,
                 trace_id=trace_id,
                 latency_ms=round((time.monotonic() - started) * 1000, 2),
+                reference_case_ids=reference_ids,
             )
         except Exception as exc:
             return MessageGenerationResult(
@@ -133,7 +155,24 @@ class GLMSimulationMessageGenerator:
                 trace_id=trace_id,
                 latency_ms=round((time.monotonic() - started) * 1000, 2),
                 error=f"{type(exc).__name__}: {str(exc)[:160]}",
+                reference_case_ids=reference_ids,
             )
+
+    def _reference_examples(
+        self,
+        request: MessageGenerationRequest,
+    ) -> tuple[RealGroupCaseExample, ...]:
+        return self.case_library.select_for_generation(
+            channel=request.channel,
+            fallback_text=request.fallback_text,
+            dialog_phase=request.dialog_phase,
+            is_follow_up=request.is_follow_up,
+            seed_material=(
+                f"{request.conversation_id}:{request.sender_id}:"
+                f"{request.turn_count}:{request.fallback_text}"
+            ),
+            limit=self.config.real_case_example_limit,
+        )
 
     def _wait_for_rate_slot(self) -> None:
         """Serialize free-model traffic and keep a minimum provider interval."""
@@ -146,7 +185,11 @@ class GLMSimulationMessageGenerator:
             self._last_request_at = time.monotonic()
 
     @staticmethod
-    def _messages(request: MessageGenerationRequest) -> list[dict[str, str]]:
+    def _messages(
+        request: MessageGenerationRequest,
+        *,
+        references: tuple[RealGroupCaseExample, ...] = (),
+    ) -> list[dict[str, str]]:
         channel_note = "麻将群里的一条自然消息" if request.channel == "group" else "发给麻将馆老板的私聊"
         system_prompt = (
             "你是麻将馆压力测试中的合成客户消息生成器，不是老板也不是客服。"
@@ -156,6 +199,8 @@ class GLMSimulationMessageGenerator:
             "dialog_phase=business_resume 时必须自然回到 business_anchor 对应的原组局事项，"
             "不得改变其中的时间、玩法、档位、烟况或人数。"
             "群聊可以口语化，允许省略主语和少量输入习惯，但不要故意制造无法理解的乱码。"
+            "real_group_chat_references 是经过匿名和人工审核的真实表达样例；"
+            "请模仿表达习惯但不要逐字复制，也不要照搬样例中的人物、时间或局条件。"
             "不得提及 AI、模型、提示词、系统、测试、工具、trace 或任何内部实现。"
             "不得虚构真实客户隐私，也不得替其他人作出确认。"
             "只输出 JSON 对象，格式为 {\"text\":\"消息\"}，text 建议 2 到 35 个汉字。"
@@ -170,6 +215,7 @@ class GLMSimulationMessageGenerator:
             "business_anchor": request.business_anchor,
             "last_agent_reply": request.last_agent_reply,
             "fallback_text": request.fallback_text,
+            "real_group_chat_references": [item.to_prompt_payload() for item in references],
         }
         return [
             {"role": "system", "content": system_prompt},

@@ -12,6 +12,7 @@
 - `golden/real_group_chat_20260722.jsonl`：真实微信群观察数据清洗出的高置信群聊 Gold，覆盖看板解析、状态演进、碎片聚合、引用更新、撤回和确定性噪声过滤。
 - `adversarial/privacy_isolation.jsonl`：跨会话隐私对抗样本，一条一个攻击 case，与执行脚本解耦。
 - `adversarial/real_group_chat_20260722.jsonl`：真实群聊中的指代、跨角色多轮和麻将黑话歧义样本；在领域问题确认前只能作为待复核对抗集，不能作为硬真值。
+- `adversarial/agent_planning_discoveries.jsonl`：真实模型模拟中发现、尚未闭环的规划失败样本；保留输入、工具轨迹、来源 trace 和可接受结果，供后续规划/无进展评测复现。
 - `few_shot_examples.jsonl`：老板认可的话术样例，用于改善后续回复风格。
 - `tests/test_context_summary_quality.py`：上下文压缩决策一致性评测，比较完整历史与 checkpoint 路径的状态、工具调用和回复。
 
@@ -25,6 +26,7 @@
 - 只有业务含义及期望动作都明确的群聊样本才能进入 Gold；“那个一”“3块是否等于368”等仍需老板确认的样本进入 Adversarial，并保留 `open_questions`。
 - 用户把一句需求拆成多条发送时，写入 `fragmented_input_golden.jsonl`；不能靠新增麻将关键词 `if-else` 修复，应由输入边界模型和通用并发合同解决。
 - Agent 重复调用同一工具、在短周期动作间来回切换或连续没有状态/信息进展时，必须补 `ProgressMonitor` 回归；检测器只比较动作、结果和状态变化，不写麻将业务 `if-else`。
+- 真实模拟中首次发现但尚未稳定修复的规划问题先写入 `agent_planning_discoveries.jsonl`，状态保持 `open`；只有重复复现通过并建立自动回归后，才迁入 fixed badcase 闭环。
 - 修改摘要提示词、checkpoint 合同或上下文裁剪逻辑时，必须运行压缩决策一致性评测；不能只断言摘要已生成。
 - 越权询问、提示词注入、格式诱导和间接暗示等攻击必须写入 `adversarial/`；仅使用合成身份和 canary，不提交真实客户私聊。
 

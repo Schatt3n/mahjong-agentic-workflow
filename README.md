@@ -617,9 +617,11 @@ SIM_LLM_MODE=mock PYTHONPATH=src \
 
 `scripts/run_periodic_chat_simulator.py` 在百人模拟引擎之上增加了可恢复的周期调度。当前本机配置使用两套彼此隔离的模型职责：GLM-4.7-Flash 只生成模拟用户与群成员的自然消息，DeepSeek 运行被测主 Agent、工具规划、话术生成和客户可见内容审查。模拟角色没有工具权限，不能直接改业务状态。
 
+群聊业务消息的生成不是凭空采样。生成器会从 `eval/golden/real_group_chat_20260722.jsonl` 中只读取同时满足 `quality_tier=gold`、`review_status=approved`、`source.anonymized=true` 的案例，按“查询、碎片补充、人数短码”等语义形态稳定选择最多 3 条作为表达参考。提示词要求 GLM 只模仿真实群聊的短句、遗漏和补充习惯，不得逐字复制人物、时间或局条件；私聊和闲聊不注入这些群聊样例，避免业务意图污染。每轮报告中的 `user.generation.reference_case_ids` 会记录实际参考的 case id，观测面板也可直接查看，便于追溯某条模拟消息是依据哪些真实资产生成的。原始线上日志不会进入提示词。
+
 调度器启动后立即执行一轮，之后每隔随机的 1～2 小时执行一轮；每轮随机选择种子和 6～12 条消息。周期场景默认只启动 3 个初始会话，并保证其中至少一个用户具备闲聊插入特征；首个线程进入共享群聊，其余线程进入独立私聊，避免群聊内正确的 `@` 发言锁耗尽全部小场景消息预算。百人压力入口仍会启动全部发言用户。可通过 `--initial-dialogs` 或 `MAHJONG_PERIODIC_SIM_INITIAL_DIALOGS` 调整场景并行度。模型生成失败时保留规则样本继续执行，并在单轮记录中标记 `rule_fallback`、错误与耗时，不会伪装成模型成功。同一随机种子仍可复现行为调度，便于把失败轮次转成回归样本。
 
-周期测试始终使用 `runtime_data/periodic_chat_simulation/runs/<run_id>/test_sim.db`，不会读写开发数据库。消息真正发送时才调用 GLM，不会为尚未调度的虚拟用户提前消耗模型请求。每个已完成回合先追加到 `live_events.jsonl`，整轮结束后再生成 `report.json`；两者都包含用户输入及其生成模型/trace/耗时、Agent 输出及 traceId、工具名称、HTTP 状态和单轮耗时，但不保存 API Key。报告会区分进程 `status` 与结果 `quality_status`：前者表示调度是否正常结束，后者以 `passed/degraded/failed` 暴露 HTTP 超时、空回复和观测错误，避免“运行完成”掩盖模型链路失败。
+周期测试始终使用 `runtime_data/periodic_chat_simulation/runs/<run_id>/test_sim.db`，不会读写开发数据库。消息真正发送时才调用 GLM，不会为尚未调度的虚拟用户提前消耗模型请求。每个已完成回合先追加到 `live_events.jsonl`，整轮结束后再生成 `report.json`；两者都包含用户输入及其生成模型/trace/耗时、Agent 输出及 traceId、工具名称、工具是否执行/放行/去重及错误、HTTP 状态和单轮耗时，但不保存 API Key。报告会区分进程 `status` 与结果 `quality_status`：前者表示调度是否正常结束，后者以 `passed/degraded/failed` 暴露 HTTP 超时、空回复、观测错误，以及主循环退出时仍停留在 `needs_tool` 的未完成目标，避免“运行完成”掩盖模型链路失败。
 
 ```bash
 # 本机私密配置（.env.simulation.local 已被 gitignore）
@@ -629,6 +631,8 @@ MAHJONG_PERIODIC_SIM_STATE_BACKEND=redis
 MAHJONG_PERIODIC_SIM_REDIS_URL=redis://127.0.0.1:6379/0
 MAHJONG_SIM_GENERATOR_MODEL=glm-4.7-flash
 MAHJONG_SIM_GENERATOR_API_KEY=***
+MAHJONG_SIM_REAL_CASE_DATASET=eval/golden/real_group_chat_20260722.jsonl
+MAHJONG_SIM_REAL_CASE_EXAMPLE_LIMIT=3
 MAHJONG_LLM_PROVIDER=deepseek
 MAHJONG_LLM_MODEL=deepseek-v4-flash
 DEEPSEEK_API_KEY=***

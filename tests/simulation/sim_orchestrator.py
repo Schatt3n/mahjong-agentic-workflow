@@ -720,6 +720,19 @@ def percentile(values: list[float], ratio: float) -> float:
     return round(ordered[index], 2)
 
 
+def _final_objective_status(response: dict[str, Any]) -> str:
+    """Return the last structured Agent status from one runtime response."""
+
+    return next(
+        (
+            str(action.get("objective_status") or "")
+            for action in reversed(response.get("actions") or [])
+            if isinstance(action, dict)
+        ),
+        "",
+    )
+
+
 def build_report(
     outcomes: list[RequestOutcome],
     *,
@@ -760,12 +773,19 @@ def build_report(
     empty_replies = [
         item for item in successful_http if not str(item.response.get("final_reply") or "").strip()
     ]
+    unresolved_agent_outputs = [
+        item
+        for item in successful_http
+        if _final_objective_status(item.response) == "needs_tool"
+    ]
     failed_http_count = len(outcomes) - len(successful_http)
     quality_issues: list[str] = []
     if failed_http_count:
         quality_issues.append(f"failed_http_requests:{failed_http_count}")
     if empty_replies:
         quality_issues.append(f"empty_final_replies:{len(empty_replies)}")
+    if unresolved_agent_outputs:
+        quality_issues.append(f"unresolved_agent_outputs:{len(unresolved_agent_outputs)}")
     if observer_errors:
         quality_issues.append(f"observer_errors:{len(observer_errors)}")
     if stop_reason == "sqlite_lock_failure":
@@ -857,6 +877,7 @@ def build_report(
         "observer_errors": list(observer_errors),
         "has_empty_final_reply": bool(empty_replies),
         "empty_final_reply_count": len(empty_replies),
+        "unresolved_agent_output_count": len(unresolved_agent_outputs),
         "inbox_delivery_count": sum(item.inbox_deliveries for item in outcomes),
         "users_with_inbox_messages": sum(size > 0 for size in inbox_sizes.values()),
         "inbox_sizes": inbox_sizes,
@@ -927,22 +948,32 @@ def outcome_to_transcript_entry(item: RequestOutcome) -> dict[str, Any]:
                 "trace_id": item.action.generation_trace_id,
                 "latency_ms": item.action.generation_latency_ms,
                 "error": item.action.generation_error,
+                "reference_case_ids": list(item.action.generation_reference_case_ids),
             },
         },
         "agent": {
             "reply": str(item.response.get("final_reply") or ""),
             "trace_id": str(item.response.get("trace_id") or ""),
-            "objective_status": next(
-                (
-                    str(action.get("objective_status") or "")
-                    for action in reversed(item.response.get("actions") or [])
-                    if isinstance(action, dict)
-                ),
-                "",
-            ),
+            "objective_status": _final_objective_status(item.response),
         },
         "tool_calls": [
             str(tool.get("name") or "")
+            for tool in item.response.get("tool_results") or []
+            if isinstance(tool, dict)
+        ],
+        "tool_results": [
+            {
+                "name": str(tool.get("name") or ""),
+                "called": tool.get("called") is True,
+                "allowed": tool.get("allowed") is True,
+                "deduplicated": tool.get("deduplicated") is True,
+                "error": str(tool.get("error") or ""),
+                "classification": str(
+                    (tool.get("result") or {}).get("classification") or ""
+                )
+                if isinstance(tool.get("result"), dict)
+                else "",
+            }
             for tool in item.response.get("tool_results") or []
             if isinstance(tool, dict)
         ],

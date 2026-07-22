@@ -44,7 +44,12 @@ from sim_factory import (  # noqa: E402
     build_population,
     ensure_isolated_database,
 )
-from sim_orchestrator import DialogState, RateLimiter, SimulationOrchestrator  # noqa: E402
+from sim_orchestrator import (  # noqa: E402
+    DialogState,
+    RateLimiter,
+    SimulationOrchestrator,
+    outcome_to_transcript_entry,
+)
 from sim_state import ReplyGate  # noqa: E402
 
 
@@ -119,6 +124,35 @@ class _RepeatedReplyAdapter(_ProgressingDialogAdapter):
             sent=True,
             status_code=200,
             response={"trace_id": "trace_repeat", "final_reply": "你几点方便？"},
+            sent_at=time.monotonic(),
+        )
+
+
+class _UnresolvedAgentAdapter(_ProgressingDialogAdapter):
+    """Return a response that escaped the runtime while still requiring a tool."""
+
+    def send(self, action: SimulationAction, *, deadline: float) -> RequestOutcome:
+        del deadline
+        self.sent_actions.append(action)
+        return RequestOutcome(
+            action=action,
+            sent=True,
+            status_code=200,
+            response={
+                "trace_id": "trace_unresolved",
+                "final_reply": "这个我先转人工确认一下。",
+                "actions": [{"objective_status": "needs_tool"}],
+                "tool_results": [
+                    {
+                        "name": "agent_progress_guard",
+                        "called": False,
+                        "allowed": False,
+                        "deduplicated": False,
+                        "error": "agent loop made no material progress",
+                        "result": {"classification": "agent_loop_or_no_progress"},
+                    }
+                ],
+            },
             sent_at=time.monotonic(),
         )
 
@@ -840,6 +874,66 @@ def test_single_http_failure_marks_completed_run_as_degraded(tmp_path: Path) -> 
     assert report["status"] == "completed"
     assert report["quality_status"] == "degraded"
     assert report["quality_issues"] == ["failed_http_requests:1"]
+
+
+def test_unresolved_agent_output_marks_run_degraded_and_preserves_tool_diagnostics(
+    tmp_path: Path,
+) -> None:
+    users = _users()
+    adapter = _UnresolvedAgentAdapter(users)
+    orchestrator = SimulationOrchestrator(
+        users=users,
+        behavior_policy=BehaviorPolicy(users, seed=42),
+        adapter=adapter,  # type: ignore[arg-type]
+        max_messages=1,
+        max_duration_seconds=2,
+        speed=1000,
+        report_path=tmp_path / "unresolved_report.json",
+    )
+
+    report = orchestrator.run()
+
+    assert report["status"] == "completed"
+    assert report["quality_status"] == "degraded"
+    assert report["quality_issues"] == ["unresolved_agent_outputs:1"]
+    assert report["unresolved_agent_output_count"] == 1
+    tool_result = report["transcript"][0]["tool_results"][0]
+    assert tool_result == {
+        "name": "agent_progress_guard",
+        "called": False,
+        "allowed": False,
+        "deduplicated": False,
+        "error": "agent loop made no material progress",
+        "classification": "agent_loop_or_no_progress",
+    }
+
+
+def test_transcript_entry_records_real_case_provenance() -> None:
+    action = SimulationAction(
+        due_simulated_seconds=0.0,
+        sequence=1,
+        channel="group",
+        conversation_id="sim:group:room",
+        sender_id="customer_a",
+        sender_name="客户甲",
+        text="一块还有吗",
+        generation_reference_case_ids=("real_query_001", "real_fragment_001"),
+    )
+
+    entry = outcome_to_transcript_entry(
+        RequestOutcome(
+            action=action,
+            sent=True,
+            status_code=200,
+            response={"final_reply": "有一个。", "actions": [{"objective_status": "completed"}]},
+        )
+    )
+
+    assert entry["user"]["generation"]["reference_case_ids"] == [
+        "real_query_001",
+        "real_fragment_001",
+    ]
+    assert entry["agent"]["objective_status"] == "completed"
 
 
 def test_orchestrator_stops_at_duration_before_first_scheduled_event(tmp_path: Path) -> None:
