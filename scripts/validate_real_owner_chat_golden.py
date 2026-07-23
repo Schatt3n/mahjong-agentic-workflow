@@ -18,6 +18,7 @@ from mahjong_agent_runtime.copywriting import REAL_OWNER_WECHAT_STYLE_EXAMPLES  
 
 DEFAULT_DATASET_PATH = ROOT / "eval" / "golden" / "real_owner_chat_golden.jsonl"
 DEFAULT_TIMELINE_PATH = ROOT / "eval" / "golden" / "real_owner_chat_timeline_20260705_20260718.json"
+DEFAULT_TIMELINE_PATHS = tuple(sorted((ROOT / "eval" / "golden").glob("real_owner_chat_timeline_*.json")))
 REQUIRED_EVAL_CASE_IDS = {
     "initial_request_uses_profile_defaults_and_searches_pool",
     "who_are_the_players_can_show_public_nickname_only",
@@ -54,7 +55,10 @@ def read_json_document(path: Path) -> dict[str, Any]:
 
 
 def read_default_records() -> list[dict[str, Any]]:
-    return [*read_jsonl(DEFAULT_DATASET_PATH), read_json_document(DEFAULT_TIMELINE_PATH)]
+    return [
+        *read_jsonl(DEFAULT_DATASET_PATH),
+        *(read_json_document(path) for path in DEFAULT_TIMELINE_PATHS),
+    ]
 
 
 def validate_dataset(records: list[dict[str, Any]]) -> list[str]:
@@ -101,6 +105,7 @@ def _validate_transcript_record(record: dict[str, Any]) -> list[str]:
     valid_turns = set(expected_turns)
     errors.extend(_validate_business_facts(record, valid_turns))
     errors.extend(_validate_eval_case_turn_refs(record, valid_turns))
+    errors.extend(_validate_source_events(record, source_files))
     errors.extend(_validate_timeline_extensions(record, messages, expected_turns))
     return errors
 
@@ -184,6 +189,52 @@ def _validate_eval_case_turn_refs(record: dict[str, Any], valid_turns: set[int])
         input_turn = case.get("input_turn")
         if input_turn is not None and input_turn not in valid_turns:
             errors.append(_record_error(record, f"eval case {case_id}: invalid input_turn {input_turn}"))
+    return errors
+
+
+def _validate_source_events(record: dict[str, Any], source_files: set[str]) -> list[str]:
+    """Validate non-message events and references such as a recalled message."""
+
+    errors: list[str] = []
+    source_events = record.get("source_events")
+    event_items = source_events if isinstance(source_events, list) else []
+    event_ids: set[str] = set()
+    for event in event_items:
+        if not isinstance(event, dict):
+            errors.append(_record_error(record, "source event must be an object"))
+            continue
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            errors.append(_record_error(record, "source event id is required"))
+        elif event_id in event_ids:
+            errors.append(_record_error(record, f"duplicate source event id: {event_id}"))
+        event_ids.add(event_id)
+        if not str(event.get("event_type") or "").strip():
+            errors.append(_record_error(record, f"source event {event_id}: event_type is required"))
+        if event.get("actor") not in {"customer", "boss", "system"}:
+            errors.append(_record_error(record, f"source event {event_id}: invalid actor"))
+        if not isinstance(event.get("content_available"), bool):
+            errors.append(_record_error(record, f"source event {event_id}: content_available must be boolean"))
+        source_image = str(event.get("source_image") or "")
+        if source_files and source_image not in source_files:
+            errors.append(_record_error(record, f"source event {event_id}: source_image not listed"))
+
+    for fact in record.get("business_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        for event_id in fact.get("source_event_ids") or []:
+            if event_id not in event_ids:
+                errors.append(
+                    _record_error(record, f"business fact {fact.get('id')}: source_event_id not found: {event_id}")
+                )
+    for case in record.get("eval_cases") or []:
+        if not isinstance(case, dict):
+            continue
+        for event_id in case.get("source_event_refs") or []:
+            if event_id not in event_ids:
+                errors.append(
+                    _record_error(record, f"eval case {case.get('id')}: source_event_ref not found: {event_id}")
+                )
     return errors
 
 
@@ -400,14 +451,18 @@ def main(argv: list[str] | None = None) -> int:
         "--dataset",
         type=Path,
         default=None,
-        help="Validate one JSONL dataset. By default validates the base JSONL and the multi-day timeline JSON.",
+        help="Validate one JSONL dataset. By default validates the base JSONL and every multi-day timeline JSON.",
     )
     args = parser.parse_args(argv)
 
     records = read_jsonl(args.dataset) if args.dataset else read_default_records()
     errors = validate_dataset(records)
     payload = {
-        "dataset": str(args.dataset) if args.dataset else [str(DEFAULT_DATASET_PATH), str(DEFAULT_TIMELINE_PATH)],
+        "dataset": (
+            str(args.dataset)
+            if args.dataset
+            else [str(DEFAULT_DATASET_PATH), *(str(path) for path in DEFAULT_TIMELINE_PATHS)]
+        ),
         "record_count": len(records),
         "error_count": len(errors),
         "errors": errors,

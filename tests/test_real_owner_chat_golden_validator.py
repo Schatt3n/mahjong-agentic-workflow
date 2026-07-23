@@ -26,6 +26,11 @@ def test_real_owner_chat_golden_dataset_validator_passes_current_dataset() -> No
     errors = module.validate_dataset(records)
 
     assert errors == []
+    assert {
+        "owner_chat_multi_episode_timeline_20260705_20260718_001",
+        "owner_b_chat_multi_episode_timeline_20260627_20260719_001",
+    }.issubset({record["id"] for record in records})
+    assert len(module.DEFAULT_TIMELINE_PATHS) >= 2
 
 
 def test_real_owner_chat_golden_validator_rejects_broken_turn_references() -> None:
@@ -98,6 +103,44 @@ def test_real_owner_chat_golden_validator_rejects_broken_timeline_metadata() -> 
     assert "timeline_metrics.round_definition is required" in text
     assert "source_turn not found: 9" in text
     assert "expected is required" in text
+
+
+def test_real_owner_chat_golden_validator_rejects_broken_source_event_references() -> None:
+    module = load_validator_module()
+    transcript = {
+        "kind": "real_owner_chat_golden",
+        "id": "broken_source_event",
+        "source": {"source_image_files": ["one.png"]},
+        "messages": [{"turn": 1, "role": "customer", "text": "有五毛的吗", "source_image": "one.png"}],
+        "source_events": [
+            {
+                "id": "recalled_1",
+                "event_type": "message_recalled",
+                "actor": "customer",
+                "content_available": "false",
+                "source_image": "missing.png",
+            }
+        ],
+        "business_facts": [
+            {"id": "fact", "evidence_turns": [1], "fact": "ok", "source_event_ids": ["missing_event"]}
+        ],
+        "eval_cases": [
+            {
+                "id": "case",
+                "context_turns": [],
+                "input_turn": 1,
+                "source_event_refs": ["missing_event"],
+            }
+        ],
+    }
+
+    errors = module.validate_dataset([transcript])
+    text = "\n".join(errors)
+
+    assert "content_available must be boolean" in text
+    assert "source_image not listed" in text
+    assert "source_event_id not found: missing_event" in text
+    assert "source_event_ref not found: missing_event" in text
 
 
 def test_real_owner_chat_golden_validator_requires_supplement_contract() -> None:

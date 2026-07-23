@@ -10,6 +10,8 @@
 - `golden/real_owner_chat_transcript_20260704.md`：真实聊天截图的可读转写。
 - `golden/real_owner_chat_timeline_20260705_20260718.json`：12 张真实老板聊天截图清洗出的多日机器可读时间线，保留 86 条文本、7 个业务片段、时间、终态、业务轮次、事实、评测 case 和回放脚本；表情包及图片已排除。
 - `golden/real_owner_chat_transcript_20260705_20260718.md`：上述多日时间线的可读转写，说明简单/复杂场景所需轮次、取消边界和推荐测试输入。
+- `golden/real_owner_chat_timeline_20260627_20260719_owner_b.json`：第二组 11 张真实老板聊天截图清洗出的机器可读时间线，保留 80 条文本、7 个业务片段和 8 个评测 case，重点覆盖代约角色纠正、取消恢复、档位冲突及条件认领。
+- `golden/real_owner_chat_transcript_20260627_20260719_owner_b.md`：第二组时间线的可读转写；第三方昵称已匿名，表情包、图片和不可恢复的撤回内容不进入消息正文。
 - `golden/fragmented_input_golden.jsonl`：碎片化输入边界样本，验证等待、超时重触发、发送者隔离和聚合后一次处理。
 - `golden/real_group_chat_20260722.jsonl`：真实微信群观察数据清洗出的高置信群聊 Gold，覆盖看板解析、状态演进、碎片聚合、引用更新、撤回和确定性噪声过滤。
 - `adversarial/privacy_isolation.jsonl`：跨会话隐私对抗样本，一条一个攻击 case，与执行脚本解耦。
@@ -56,7 +58,8 @@ PYTHONPATH=src python scripts/validate_real_owner_chat_golden.py
 PYTHONPATH=src python -m pytest -q \
   tests/test_real_owner_chat_golden.py \
   tests/test_real_owner_chat_golden_validator.py \
-  tests/test_real_owner_chat_timeline.py
+  tests/test_real_owner_chat_timeline.py \
+  tests/test_real_owner_chat_timeline_owner_b.py
 ```
 
 校验器只负责数据格式与匿名化，不能证明 Agent 能正确处理样本。真实群聊 Gold 还必须回放到实际的 `OwnerMessageParser`、`QuickFilter`、`MessageAccumulator`、`SessionRouter` 和 `GroupSessionClassifier`：
